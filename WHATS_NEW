@@ -1,5 +1,7 @@
 Version 2.03.41 - 
 ==================
+  Support formatting vdo volumes with kernel vdo target (version >= 9.2).
+  Add vdo_format.c with pre-format logical size computation for kernel format.
   Fix gcd division-by-zero and lcm overflow in lvm-maths.
   Fix dual AUTOTYPE matching logic in lvmcmdline.
   Fix nr_dirty tracking, underflows and error-path leak in bcache.
