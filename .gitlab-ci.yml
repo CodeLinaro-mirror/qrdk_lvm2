@@ -93,6 +93,82 @@ make-all:
 # - spell checker
 # - autoformatter
 
+gccanalyze:
+  stage: test1
+  artifacts:
+    paths:
+      - gccanalyze.out
+  tags:
+    - cppcheck
+  timeout: 1h
+  script:
+    - if bash ci/dry-run.sh; then echo "# make gccanalyze"; exit 0; fi
+    - >
+      ./configure
+      --with-default-use-devices-file=1
+      --enable-app-machineid
+      --enable-editline
+      --disable-readline
+      --enable-lvmlockd-dlm
+      --enable-fsadm
+      --enable-write_install
+      --enable-pkgconfig
+      --enable-cmdlib
+      --enable-dmeventd
+      --enable-blkid_wiping
+      --enable-udev_sync
+      --enable-lvmpolld
+      --enable-lvmlockd-sanlock
+      --enable-dbus-service --enable-notify-dbus
+      --enable-dmfilemapd
+      --with-vdo-format=/usr/bin/vdoformat
+      --disable-silent-rules
+    - make gccanalyze &> gccanalyze.out
+  rules:
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^Draft:/
+      when: never
+    - if: $CI_MERGE_REQUEST_PROJECT_PATH == "lvmteam/lvm2"
+      when: on_success
+  allow_failure: true
+
+cppcheck:
+  stage: test1
+  artifacts:
+    paths:
+      - cppcheck.out
+  tags:
+    - cppcheck
+  timeout: 1h
+  script:
+    - if bash ci/dry-run.sh; then echo "# make cppcheck"; exit 0; fi
+    - >
+      ./configure
+      --with-default-use-devices-file=1
+      --enable-app-machineid
+      --enable-editline
+      --disable-readline
+      --enable-lvmlockd-dlm
+      --enable-fsadm
+      --enable-write_install
+      --enable-pkgconfig
+      --enable-cmdlib
+      --enable-dmeventd
+      --enable-blkid_wiping
+      --enable-udev_sync
+      --enable-lvmpolld
+      --enable-lvmlockd-sanlock
+      --enable-dbus-service --enable-notify-dbus
+      --enable-dmfilemapd
+      --with-vdo-format=/usr/bin/vdoformat
+      --disable-silent-rules
+    - make cppcheck &> cppcheck.out
+  rules:
+    - if: $CI_MERGE_REQUEST_TITLE =~ /^Draft:/
+      when: never
+    - if: $CI_MERGE_REQUEST_PROJECT_PATH == "lvmteam/lvm2"
+      when: on_success
+  allow_failure: true
+
 test-single:
   stage: test1
   artifacts:
