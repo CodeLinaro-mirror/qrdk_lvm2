@@ -13,6 +13,7 @@
 # Test integrity block sizes and read repair on scsi_debug
 # devices with LBS 512 and PBS 4K.
 
+. shell/integrity-basic.sh
 . lib/inittest --skip-with-lvmpolld
 
 test "${LVM_VALGRIND:-0}" -eq 0 || skip # too slow for valgrind
@@ -29,27 +30,7 @@ aux kernel_at_least  6 1 || skip
 mnt="mnt"
 mkdir -p "$mnt"
 
-awk 'BEGIN { while (z++ < 16384) printf "A" }' > fileA
-awk 'BEGIN { while (z++ < 4096) printf "B" ; while (z++ < 16384) printf "b" }' > fileB
-awk 'BEGIN { while (z++ < 16384) printf "C" }' > fileC
-
-_test_fs_with_read_repair() {
-	mount "$DM_DEV_DIR/$vg/$lv1" "$mnt"
-	cp fileA "$mnt"
-	cp fileB "$mnt"
-	cp fileC "$mnt"
-	umount "$mnt"
-	lvchange -an $vg/$lv1
-	for dev in "$@"; do
-		aux corrupt_dev "$dev" BBBBBBBBBBBBBBBBB BBBBBBBBCBBBBBBBB
-	done
-	lvchange -ay $vg/$lv1
-	mount "$DM_DEV_DIR/$vg/$lv1" "$mnt"
-	cmp -b "$mnt/fileA" fileA
-	cmp -b "$mnt/fileB" fileB
-	cmp -b "$mnt/fileC" fileC
-	umount "$mnt"
-}
+integrity_make_files 4096
 
 LVRAIDSIZE=${LVRAIDSIZE:-300}
 
@@ -77,7 +58,7 @@ pvck --dump metadata "$dev1" | grep 'block_size = 512'
 blockdev --getss "$DM_DEV_DIR/$vg/$lv1"
 blockdev --getpbsz "$DM_DEV_DIR/$vg/$lv1"
 test "$(blockdev --getss "$DM_DEV_DIR/$vg/$lv1")" -eq 512
-mkfs.ext4 -b 4096 "$DM_DEV_DIR/$vg/$lv1"
+integrity_mkfs_ext4
 blockdev --getss "$DM_DEV_DIR/$vg/$lv1"
 blockdev --getpbsz "$DM_DEV_DIR/$vg/$lv1"
 blkid -p "$DM_DEV_DIR/$vg/$lv1"
@@ -85,10 +66,9 @@ blkid -p "$DM_DEV_DIR/$vg/$lv1" | grep BLOCK_SIZE=\"4096\"
 mount "$DM_DEV_DIR/$vg/$lv1" "$mnt"
 umount "$mnt"
 lvchange $vg/$lv1 --writemostly "$dev2"
-_test_fs_with_read_repair "$dev1"
+integrity_test_read_repair 1 "$dev1"
 lvs -a -o+integritymismatches $vg
-lvs -o integritymismatches $vg/$lv1 |tee mismatch
-not grep 0 mismatch
+integrity_not_zero_mismatches $vg/$lv1
 lvchange -an $vg/$lv1
 lvremove $vg/$lv1
 
@@ -102,7 +82,7 @@ aux wait_recalc $vg/${lv1}_rimage_0
 aux wait_recalc $vg/${lv1}_rimage_1
 pvck --dump metadata "$dev1" | grep 'block_size = 512'
 test "$(blockdev --getss "$DM_DEV_DIR/$vg/$lv1")" -eq 512
-mkfs.ext4 -b 4096 "$DM_DEV_DIR/$vg/$lv1"
+integrity_mkfs_ext4
 blockdev --getss "$DM_DEV_DIR/$vg/$lv1"
 blockdev --getpbsz "$DM_DEV_DIR/$vg/$lv1"
 blkid -p "$DM_DEV_DIR/$vg/$lv1"
@@ -110,10 +90,9 @@ blkid -p "$DM_DEV_DIR/$vg/$lv1" | grep BLOCK_SIZE=\"4096\"
 mount "$DM_DEV_DIR/$vg/$lv1" "$mnt"
 umount "$mnt"
 lvchange $vg/$lv1 --writemostly "$dev2"
-_test_fs_with_read_repair "$dev1"
+integrity_test_read_repair 1 "$dev1"
 lvs -a -o+integritymismatches $vg
-lvs -o integritymismatches $vg/$lv1 |tee mismatch
-not grep 0 mismatch
+integrity_not_zero_mismatches $vg/$lv1
 lvchange -an $vg/$lv1
 lvremove $vg/$lv1
 
@@ -127,16 +106,15 @@ aux wait_recalc $vg/${lv1}_rimage_0
 aux wait_recalc $vg/${lv1}_rimage_1
 pvck --dump metadata "$dev1" | grep 'block_size = 4096'
 test "$(blockdev --getss "$DM_DEV_DIR/$vg/$lv1")" -eq 4096
-mkfs.ext4 -b 4096 "$DM_DEV_DIR/$vg/$lv1"
+integrity_mkfs_ext4
 blkid -p "$DM_DEV_DIR/$vg/$lv1"
 blkid -p "$DM_DEV_DIR/$vg/$lv1" | grep BLOCK_SIZE=\"4096\"
 mount "$DM_DEV_DIR/$vg/$lv1" "$mnt"
 umount "$mnt"
 lvchange $vg/$lv1 --writemostly "$dev2"
-_test_fs_with_read_repair "$dev1"
+integrity_test_read_repair 1 "$dev1"
 lvs -a -o+integritymismatches $vg
-lvs -o integritymismatches $vg/$lv1 |tee mismatch
-not grep 0 mismatch
+integrity_not_zero_mismatches $vg/$lv1
 lvchange -an $vg/$lv1
 lvremove $vg/$lv1
 
@@ -150,7 +128,7 @@ aux wait_recalc $vg/${lv1}_rimage_0
 aux wait_recalc $vg/${lv1}_rimage_1
 pvck --dump metadata "$dev1" | grep 'block_size = 512'
 test "$(blockdev --getss "$DM_DEV_DIR/$vg/$lv1")" -eq 512
-mkfs.xfs -f "$DM_DEV_DIR/$vg/$lv1"
+integrity_mkfs_xfs
 blockdev --getss "$DM_DEV_DIR/$vg/$lv1"
 blockdev --getpbsz "$DM_DEV_DIR/$vg/$lv1"
 blkid -p "$DM_DEV_DIR/$vg/$lv1"
@@ -158,10 +136,9 @@ blkid -p "$DM_DEV_DIR/$vg/$lv1" | grep BLOCK_SIZE=\"4096\"
 mount "$DM_DEV_DIR/$vg/$lv1" "$mnt"
 umount "$mnt"
 lvchange $vg/$lv1 --writemostly "$dev2"
-_test_fs_with_read_repair "$dev1"
+integrity_test_read_repair 1 "$dev1"
 lvs -a -o+integritymismatches $vg
-lvs -o integritymismatches $vg/$lv1 |tee mismatch
-not grep 0 mismatch
+integrity_not_zero_mismatches $vg/$lv1
 lvchange -an $vg/$lv1
 lvremove $vg/$lv1
 
@@ -175,7 +152,7 @@ aux wait_recalc $vg/${lv1}_rimage_0
 aux wait_recalc $vg/${lv1}_rimage_1
 pvck --dump metadata "$dev1" | grep 'block_size = 512'
 test "$(blockdev --getss "$DM_DEV_DIR/$vg/$lv1")" -eq 512
-mkfs.xfs -f "$DM_DEV_DIR/$vg/$lv1"
+integrity_mkfs_xfs
 blockdev --getss "$DM_DEV_DIR/$vg/$lv1"
 blockdev --getpbsz "$DM_DEV_DIR/$vg/$lv1"
 blkid -p "$DM_DEV_DIR/$vg/$lv1"
@@ -183,10 +160,9 @@ blkid -p "$DM_DEV_DIR/$vg/$lv1" | grep BLOCK_SIZE=\"4096\"
 mount "$DM_DEV_DIR/$vg/$lv1" "$mnt"
 umount "$mnt"
 lvchange $vg/$lv1 --writemostly "$dev2"
-_test_fs_with_read_repair "$dev1"
+integrity_test_read_repair 1 "$dev1"
 lvs -a -o+integritymismatches $vg
-lvs -o integritymismatches $vg/$lv1 |tee mismatch
-not grep 0 mismatch
+integrity_not_zero_mismatches $vg/$lv1
 lvchange -an $vg/$lv1
 lvremove $vg/$lv1
 
@@ -200,16 +176,15 @@ aux wait_recalc $vg/${lv1}_rimage_0
 aux wait_recalc $vg/${lv1}_rimage_1
 pvck --dump metadata "$dev1" | grep 'block_size = 4096'
 test "$(blockdev --getss "$DM_DEV_DIR/$vg/$lv1")" -eq 4096
-mkfs.xfs -f "$DM_DEV_DIR/$vg/$lv1"
+integrity_mkfs_xfs
 blkid -p "$DM_DEV_DIR/$vg/$lv1"
 blkid -p "$DM_DEV_DIR/$vg/$lv1" | grep BLOCK_SIZE=\"4096\"
 mount "$DM_DEV_DIR/$vg/$lv1" "$mnt"
 umount "$mnt"
 lvchange $vg/$lv1 --writemostly "$dev2"
-_test_fs_with_read_repair "$dev1"
+integrity_test_read_repair 1 "$dev1"
 lvs -a -o+integritymismatches $vg
-lvs -o integritymismatches $vg/$lv1 |tee mismatch
-not grep 0 mismatch
+integrity_not_zero_mismatches $vg/$lv1
 lvchange -an $vg/$lv1
 lvremove $vg/$lv1
 
