@@ -3282,7 +3282,6 @@ static int _raid_apply_recovering_image_rebuild_flags(struct logical_volume *lv,
 /*
  * _raid_extract_images
  * @lv
- * @force: force a replacement in case of primary mirror leg
  * @new_count:  The absolute count of images (e.g. '2' for a 2-way mirror)
  * @target_pvs:  The list of PVs that are candidates for removal
  * @shift:  If set, use _shift_and_rename_image_components().
@@ -3305,7 +3304,7 @@ static int _raid_apply_recovering_image_rebuild_flags(struct logical_volume *lv,
  * Returns: 1 on success, 0 on failure
  */
 static int _raid_extract_images(struct logical_volume *lv,
-				int force, uint32_t new_count,
+				uint32_t new_count,
 				struct dm_list *target_pvs, int shift,
 				int known_in_sync,
 				int *rebuild_flags_set,
@@ -3626,7 +3625,7 @@ static int _raid_remove_images(struct logical_volume *lv, int yes,
 	if (!archive(lv->vg))
 		return_0;
 
-	if (!_raid_extract_images(lv, 0, new_count, allocate_pvs, 1, 0,
+	if (!_raid_extract_images(lv, new_count, allocate_pvs, 1, 0,
 				 (commit && (new_count > 1)) ? &rebuild_flags_set : NULL,
 				 removal_lvs, removal_lvs)) {
 		log_error("Failed to extract images from %s.",
@@ -3881,7 +3880,7 @@ int lv_raid_split(struct logical_volume *lv, int yes, const char *split_name,
 			return_0;
 	}
 
-	if (!_raid_extract_images(lv, 0, new_count, splittable_pvs, 1, 1, NULL,
+	if (!_raid_extract_images(lv, new_count, splittable_pvs, 1, 1, NULL,
 				 &removal_lvs, &data_list)) {
 		log_error("Failed to extract images from %s.",
 			  display_lvname(lv));
@@ -7281,7 +7280,6 @@ has_enough_space:
  * new SubLVS are allocated on PVs on list @allocate_pvs.
  */
 static int _lv_raid_rebuild_or_replace(struct logical_volume *lv,
-				       int force,
 				       struct dm_list *remove_pvs,
 				       struct dm_list *allocate_pvs,
 				       int rebuild)
@@ -7553,8 +7551,7 @@ try_again:
 	 *   supplied - knowing that only the image with the error target
 	 *   will be affected.
 	 */
-	if (!_raid_extract_images(lv, force,
-				  raid_seg->area_count - match_count,
+	if (!_raid_extract_images(lv, raid_seg->area_count - match_count,
 				  (partial_segment_removed || dm_list_empty(remove_pvs)) ?
 				  &lv->vg->pvs : remove_pvs, 0, known_in_sync, NULL,
 				  &old_lvs, &old_lvs)) {
@@ -7709,7 +7706,7 @@ skip_alloc:
 int lv_raid_rebuild(struct logical_volume *lv,
 		    struct dm_list *rebuild_pvs)
 {
-	return _lv_raid_rebuild_or_replace(lv, 0, rebuild_pvs, NULL, 1);
+	return _lv_raid_rebuild_or_replace(lv, rebuild_pvs, NULL, 1);
 }
 
 /*
@@ -7722,11 +7719,10 @@ int lv_raid_rebuild(struct logical_volume *lv,
  * allocating new SubLVs from PVs on list @allocate_pvs.
  */
 int lv_raid_replace(struct logical_volume *lv,
-		    int force,
 		    struct dm_list *remove_pvs,
 		    struct dm_list *allocate_pvs)
 {
-	return _lv_raid_rebuild_or_replace(lv, force, remove_pvs, allocate_pvs, 0);
+	return _lv_raid_rebuild_or_replace(lv, remove_pvs, allocate_pvs, 0);
 }
 
 /*
