@@ -3279,6 +3279,317 @@ static int _raid_apply_recovering_image_rebuild_flags(struct logical_volume *lv,
 						      int *flags_set,
 						      struct lv_status_raid *raid_status);
 
+#define RAID_IMAGE_EXTRACT_PASSES 2
+
+static int _raid_image_scan_start(uint32_t area_count)
+{
+	return (int) (area_count * RAID_IMAGE_EXTRACT_PASSES) - 1;
+}
+
+static int _raid_image_scan_is_error_pass(int scan_pos, uint32_t area_count)
+{
+	return scan_pos >= (int) ((RAID_IMAGE_EXTRACT_PASSES - 1) * area_count);
+}
+
+/*
+ * _raid_image_is_error
+ * @seg: Top-level RAID segment
+ * @s: Area index
+ *
+ * Returns: 1 if the image at index @s, or its metadata, has an error
+ * segment and must therefore be extracted before any other image.
+ */
+static int _raid_image_is_error(struct lv_segment *seg, uint32_t s,
+				const struct segment_type *error_segtype)
+{
+	return (first_seg(seg_lv(seg, s))->segtype == error_segtype) ||
+	       (first_seg(seg_metalv(seg, s))->segtype == error_segtype);
+}
+
+static int _raid_image_extract_error_candidate(struct lv_segment *seg, uint32_t s,
+					       const struct segment_type *error_segtype)
+{
+	if (seg_type(seg, s) == AREA_UNASSIGNED)
+		return 0;
+
+	return _raid_image_is_error(seg, s, error_segtype);
+}
+
+static int _raid_image_extract_pv_candidate(struct lv_segment *seg, uint32_t s,
+					    struct dm_list *target_pvs)
+{
+	if (seg_type(seg, s) == AREA_UNASSIGNED)
+		return 0;
+
+	return lv_is_on_pvs(seg_lv(seg, s), target_pvs) ||
+	       lv_is_on_pvs(seg_metalv(seg, s), target_pvs);
+}
+
+/*
+ * _raid_image_extract_next
+ * @seg: Top-level RAID segment
+ * @scan_pos: Scan position, initialized with _raid_image_scan_start()
+ * @target_pvs: The list of PVs that are candidates for removal
+ * @error_segtype: The error segment type
+ * @taken: NULL, or one byte per area marking images already selected
+ *
+ * Advances the scan past images in @taken and returns the next candidate.
+ * Both the pre-check and the extraction loop use this, so they cannot
+ * disagree on which image comes next.
+ *
+ * Returns: the area index, or -1 when the scan is exhausted
+ */
+static int _raid_image_extract_next(struct lv_segment *seg, int *scan_pos,
+				    struct dm_list *target_pvs,
+				    const struct segment_type *error_segtype,
+				    const unsigned char *taken)
+{
+	uint32_t s;
+	int is_error_pass;
+
+	while (*scan_pos >= 0) {
+		s = (uint32_t) (*scan_pos % seg->area_count);
+		is_error_pass = _raid_image_scan_is_error_pass(*scan_pos, seg->area_count);
+		(*scan_pos)--;
+
+		if (taken && taken[s])
+			continue;
+
+		if (is_error_pass) {
+			if (_raid_image_extract_error_candidate(seg, s, error_segtype))
+				return (int) s;
+		} else if (_raid_image_extract_pv_candidate(seg, s, target_pvs))
+			return (int) s;
+	}
+
+	return -1;
+}
+
+static int _raid_enough_extractable_images(struct logical_volume *lv,
+					   uint32_t want,
+					   struct dm_list *target_pvs,
+					   const struct segment_type *error_segtype,
+					   unsigned char *taken)
+{
+	int scan_pos, s;
+	uint32_t found = 0;
+	struct lv_segment *seg = first_seg(lv);
+
+	if (!want)
+		return 1;
+
+	scan_pos = _raid_image_scan_start(seg->area_count);
+	while ((scan_pos >= 0) && (found < want)) {
+		if ((s = _raid_image_extract_next(seg, &scan_pos, target_pvs,
+						  error_segtype, taken)) < 0)
+			break;
+
+		taken[s] = 1;
+		found++;
+	}
+
+	return found >= want;
+}
+
+/*
+ * _raid_pvs_usable_with_error_images
+ * Images with error segments must be removed first, so a list of PVs
+ * requested by the user cannot be honoured while the array still has any.
+ *
+ * Returns: 1 if @target_pvs may be used, 0 (after logging) if not
+ */
+static int _raid_pvs_usable_with_error_images(struct logical_volume *lv,
+					       struct dm_list *target_pvs,
+					       const struct segment_type *error_segtype)
+{
+	struct lv_segment *seg = first_seg(lv);
+	uint32_t s;
+
+	if (dm_list_empty(target_pvs) || (target_pvs == &lv->vg->pvs))
+		return 1;
+
+	for (s = 0; s < seg->area_count; s++) {
+		if (seg_type(seg, s) == AREA_UNASSIGNED)
+			continue;
+
+		if (!_raid_image_is_error(seg, s, error_segtype))
+			continue;
+
+		log_error("%s has components with error targets"
+			  " that must be removed first: %s.",
+			  display_lvname(lv),
+			  display_lvname(seg_lv(seg, s)));
+
+		log_error("Try removing the PV list and rerun the command.");
+		return 0;
+	}
+
+	return 1;
+}
+
+/*
+ * _raid_validate_extraction
+ * @lv
+ * @extract:  The number of images to extract
+ * @target_pvs:  The list of PVs that are candidates for removal
+ * @error_segtype:  The error segment type
+ *
+ * Metadata-only checks that enough of the requested images can be
+ * extracted: enough PVs are given, a user PV list is usable while error
+ * images exist, and the extraction scan finds @extract images.
+ *
+ * Returns: 1 if the request can be satisfied, 0 (after logging) if not
+ */
+static int _raid_validate_extraction(struct logical_volume *lv, int extract,
+				     struct dm_list *target_pvs,
+				     const struct segment_type *error_segtype)
+{
+	unsigned pv_count = dm_list_size(target_pvs);
+	struct lv_segment *seg = first_seg(lv);
+	unsigned char *taken = NULL;
+
+	if ((int) pv_count < extract) {
+		log_error("Unable to remove %d images: Only %u device%s given.",
+			  extract, pv_count, (pv_count == 1) ? "" : "s");
+		return 0;
+	}
+
+	if (!_raid_pvs_usable_with_error_images(lv, target_pvs, error_segtype))
+		return_0;
+
+	if (extract &&
+	    !(taken = dm_pool_zalloc(lv->vg->vgmem, seg->area_count))) {
+		log_error("Memory allocation failed.");
+		return 0;
+	}
+
+	if (!_raid_enough_extractable_images(lv, (uint32_t) extract, target_pvs,
+					     error_segtype, taken)) {
+		log_error("Unable to extract enough images to satisfy request.");
+		return 0;
+	}
+
+	return 1;
+}
+
+/*
+ * _raid_check_images_impl
+ * @lv
+ * @new_count:  The absolute count of images (e.g. '2' for a 2-way mirror)
+ * @target_pvs:  The list of PVs that are candidates for removal
+ * @known_in_sync:  Passed to _raid_allow_extraction(); set when the caller
+ *		    has already established the array is fully in sync.
+ * @rebuild_flags_set:  If non-NULL, mark recovering RAID1 images after the
+ *		      request has been validated and return whether any
+ *		      LV_REBUILD flags were set.  The status snapshot read
+ *		      to validate the request is reused for the marking.
+ *
+ * Shared body of _raid_check_images() and _raid_check_images_in_sync().
+ * See _raid_check_images() for what is checked and why.
+ *
+ * Returns: 1 if the request can be satisfied, 0 if not
+ */
+static int _raid_check_images_impl(struct logical_volume *lv,
+				   uint32_t new_count,
+				   struct dm_list *target_pvs,
+				   int known_in_sync,
+				   int *rebuild_flags_set)
+{
+	int extract;
+	struct lv_status_raid *raid_status = NULL;
+	struct lv_segment *seg = first_seg(lv);
+	struct segment_type *error_segtype;
+
+	extract = seg->area_count - new_count;
+
+	if (rebuild_flags_set)
+		*rebuild_flags_set = 0;
+
+	if (!_raid_allow_extraction(lv, extract, target_pvs, known_in_sync,
+				    rebuild_flags_set ? &raid_status : NULL))
+		return_0;
+
+	if (!(error_segtype = get_segtype_from_string(lv->vg->cmd, SEG_TYPE_NAME_ERROR)))
+		goto_bad;
+
+	if (!_raid_validate_extraction(lv, extract, target_pvs, error_segtype))
+		goto_bad;
+
+	/*
+	 * Mark the recovering images from the same status snapshot that
+	 * accepted the request, so the check and the marking cannot
+	 * disagree about the array state.
+	 */
+	if (raid_status &&
+	    !_raid_apply_recovering_image_rebuild_flags(lv, rebuild_flags_set,
+						       raid_status))
+		goto_bad;
+
+	if (raid_status)
+		dm_pool_destroy(raid_status->mem);
+
+	return 1;
+
+bad:
+	if (raid_status)
+		dm_pool_destroy(raid_status->mem);
+
+	return 0;
+}
+
+/*
+ * _raid_check_images
+ * @lv
+ * @new_count:  The absolute count of images (e.g. '2' for a 2-way mirror)
+ * @target_pvs:  The list of PVs that are candidates for removal
+ * @rebuild_flags_set:  If non-NULL, mark recovering RAID1 images from the
+ *		      same status snapshot used to validate the request.
+ *
+ * Checks that enough images can be extracted to satisfy the request
+ * without touching the array, so an impossible request is rejected before
+ * any component gets renamed.  Images with error segments are extracted
+ * before any other image and are only counted once here.
+ *
+ * _raid_enough_extractable_images() and _raid_extract_images() share
+ * _raid_image_extract_next(), so the pre-check selects the same images
+ * the extraction loop will extract.
+ *
+ * Reads the array status, as _raid_allow_extraction() does.
+ *
+ * Caller: _raid_remove_images() (lvconvert -mN, shift).
+ *
+ * Returns: 1 if the request can be satisfied, 0 if not
+ */
+static int _raid_check_images(struct logical_volume *lv,
+			      uint32_t new_count,
+			      struct dm_list *target_pvs,
+			      int *rebuild_flags_set)
+{
+	return _raid_check_images_impl(lv, new_count, target_pvs, 0,
+				       rebuild_flags_set);
+}
+
+/*
+ * _raid_check_images_in_sync
+ * @lv
+ * @new_count:  The absolute count of images (e.g. '2' for a 2-way mirror)
+ * @target_pvs:  The list of PVs that are candidates for removal
+ *
+ * As _raid_check_images(), but for a caller that has already established
+ * the array is fully in sync (e.g. the split path called _raid_in_sync()),
+ * so the status read in _raid_allow_extraction() is skipped.
+ *
+ * Callers: lv_raid_split() and _lv_raid_rebuild_or_replace() (in-sync gate).
+ *
+ * Returns: 1 if the request can be satisfied, 0 if not
+ */
+static int _raid_check_images_in_sync(struct logical_volume *lv,
+				      uint32_t new_count,
+				      struct dm_list *target_pvs)
+{
+	return _raid_check_images_impl(lv, new_count, target_pvs, 1, NULL);
+}
+
 /*
  * _raid_extract_images
  * @lv
@@ -3287,117 +3598,59 @@ static int _raid_apply_recovering_image_rebuild_flags(struct logical_volume *lv,
  * @shift:  If set, use _shift_and_rename_image_components().
  *	  Otherwise, leave the [meta_]areas as AREA_UNASSIGNED and
  *	  seg->area_count unchanged.
- * @known_in_sync:  Passed to _raid_allow_extraction(); set when the caller
- *		    has already established the array is fully in sync.
- * @rebuild_flags_set:  If non-NULL, mark recovering RAID1 images after
- *		      extraction has been validated and return whether any
- *		      LV_REBUILD flags were set.  Also requests the status
- *		      snapshot from _raid_allow_extraction(), which this
- *		      function then owns and releases.
  * @extracted_[meta|data]_lvs:  The LVs removed from the array.  If 'shift'
  *			      is set, then there will likely be name conflicts.
  *
  * This function extracts _both_ portions of the indexed image.  It
  * does /not/ commit the results.  (IOW, erroring-out requires no unwinding
- * of operations.)
+ * of operations.)  The caller must call _raid_check_images() or
+ * _raid_check_images_in_sync() first: this function does not repeat the
+ * metadata scan or the array status and redundancy checks in
+ * _raid_allow_extraction(), so a caller that skips the pre-check
+ * bypasses them.
  *
  * Returns: 1 on success, 0 on failure
  */
 static int _raid_extract_images(struct logical_volume *lv,
 				uint32_t new_count,
 				struct dm_list *target_pvs, int shift,
-				int known_in_sync,
-				int *rebuild_flags_set,
 				struct dm_list *extracted_meta_lvs,
 				struct dm_list *extracted_data_lvs)
 {
-	int ss, s, extract, lvl_idx = 0;
-	int ok;
+	int scan_pos, s, extract, lvl_idx = 0;
 	struct lv_list *lvl_array;
-	struct lv_status_raid *raid_status = NULL;
 	struct lv_segment *seg = first_seg(lv);
 	struct logical_volume *rmeta_lv, *rimage_lv;
 	struct segment_type *error_segtype;
 
 	extract = seg->area_count - new_count;
-	if (rebuild_flags_set)
-		*rebuild_flags_set = 0;
-
-	if ((int) dm_list_size(target_pvs) < extract) {
-		log_error("Unable to remove %d images: Only %u device%s given.",
-			  extract, dm_list_size(target_pvs),
-			  (dm_list_size(target_pvs) == 1) ? "" : "s");
-		return 0;
-	}
-
-	if (!(lvl_array = dm_pool_alloc(lv->vg->vgmem,
-					sizeof(*lvl_array) * extract * 2)))
-		return_0;
 
 	if (!(error_segtype = get_segtype_from_string(lv->vg->cmd, SEG_TYPE_NAME_ERROR)))
-		return_0;
-
-	/*
-	 * _raid_allow_extraction() reads one status snapshot; hand it on so
-	 * the recovering-image rebuild marking below reuses the same view
-	 * instead of taking a second, possibly conflicting one.
-	 */
-	if (!_raid_allow_extraction(lv, extract, target_pvs, known_in_sync,
-				    rebuild_flags_set ? &raid_status : NULL))
 		return_0;
 
 	log_verbose("Extracting %d %s from %s.", extract,
 		    (extract > 1) ? "images" : "image",
 		    display_lvname(lv));
 
-	/* Reuse the snapshot taken during extraction validation. */
-	if (raid_status) {
-		ok = _raid_apply_recovering_image_rebuild_flags(lv, rebuild_flags_set,
-								raid_status);
-		dm_pool_destroy(raid_status->mem);
-		if (!ok)
-			return_0;
-	}
+	if (!(lvl_array = dm_pool_alloc(lv->vg->vgmem,
+					sizeof(*lvl_array) * extract * 2)))
+		return_0;
 
 	/*
-	 * We make two passes over the devices.
+	 * We make RAID_IMAGE_EXTRACT_PASSES over the devices.
 	 * - The first pass we look for error LVs
 	 * - The second pass we look for PVs that match target_pvs
 	 */
-	for (ss = (seg->area_count * 2) - 1; (ss >= 0) && extract; ss--) {
-		s = ss % seg->area_count;
+	for (scan_pos = _raid_image_scan_start(seg->area_count);
+	     (scan_pos >= 0) && extract; ) {
+		if ((s = _raid_image_extract_next(seg, &scan_pos, target_pvs,
+						  error_segtype, NULL)) < 0)
+			break;
 
-		if (ss / seg->area_count) {
-			/* Conditions for first pass */
-			if ((first_seg(seg_lv(seg, s))->segtype != error_segtype) &&
-			    (first_seg(seg_metalv(seg, s))->segtype != error_segtype))
-				continue;
-
-			if (!dm_list_empty(target_pvs) &&
-			    (target_pvs != &lv->vg->pvs)) {
-				/*
-				 * User has supplied a list of PVs, but we
-				 * cannot honor that list because error LVs
-				 * must come first.
-				 */
-				log_error("%s has components with error targets"
-					  " that must be removed first: %s.",
-					  display_lvname(lv),
-					  display_lvname(seg_lv(seg, s)));
-
-				log_error("Try removing the PV list and rerun."
-					  " the command.");
-				return 0;
-			}
+		if (_raid_image_is_error(seg, s, error_segtype))
 			log_debug("LVs with error segments to be removed: %s %s",
 				  display_lvname(seg_metalv(seg, s)),
 				  display_lvname(seg_lv(seg, s)));
-		} else {
-			/* Conditions for second pass */
-			if (!lv_is_on_pvs(seg_lv(seg, s), target_pvs) &&
-			    !lv_is_on_pvs(seg_metalv(seg, s), target_pvs))
-				continue;
-		}
 
 		if (!_extract_image_components(seg, s, &rmeta_lv, &rimage_lv)) {
 			log_error("Failed to extract %s from %s.",
@@ -3419,8 +3672,13 @@ static int _raid_extract_images(struct logical_volume *lv,
 		extract--;
 	}
 
+	/*
+	 * The pre-check and this loop share _raid_image_extract_next(),
+	 * so reaching here means they disagreed.
+	 */
 	if (extract) {
-		log_error("Unable to extract enough images to satisfy request.");
+		log_error(INTERNAL_ERROR "Extracted %d fewer image(s) than"
+			  " requested from %s.", extract, display_lvname(lv));
 		return 0;
 	}
 
@@ -3575,11 +3833,11 @@ static int _raid_probe_recovering_images(struct logical_volume *lv,
 	return _raid_recovering_images_rebuild_work(lv, 0, flags_set, sync_percent, NULL);
 }
 
+/* @raid_status is reused when non-NULL; the caller owns its pool. */
 static int _raid_apply_recovering_image_rebuild_flags(struct logical_volume *lv,
 						      int *flags_set,
 						      struct lv_status_raid *raid_status)
 {
-	/* Reuse @raid_status when the caller already read one; it owns the pool. */
 	return _raid_recovering_images_rebuild_work(lv, 1, flags_set, NULL, raid_status);
 }
 
@@ -3625,8 +3883,17 @@ static int _raid_remove_images(struct logical_volume *lv, int yes,
 	if (!archive(lv->vg))
 		return_0;
 
-	if (!_raid_extract_images(lv, new_count, allocate_pvs, 1, 0,
-				 (commit && (new_count > 1)) ? &rebuild_flags_set : NULL,
+	/*
+	 * The check has to run before the extraction, so it cannot be folded
+	 * into it.  It also marks the recovering images from the same status
+	 * snapshot, so the check and the marking cannot disagree about the
+	 * array state.
+	 */
+	if (!_raid_check_images(lv, new_count, allocate_pvs,
+				(commit && (new_count > 1)) ? &rebuild_flags_set : NULL))
+		return_0;
+
+	if (!_raid_extract_images(lv, new_count, allocate_pvs, 1,
 				 removal_lvs, removal_lvs)) {
 		log_error("Failed to extract images from %s.",
 			  display_lvname(lv));
@@ -3880,8 +4147,11 @@ int lv_raid_split(struct logical_volume *lv, int yes, const char *split_name,
 			return_0;
 	}
 
-	if (!_raid_extract_images(lv, new_count, splittable_pvs, 1, 1, NULL,
-				 &removal_lvs, &data_list)) {
+	if (!_raid_check_images_in_sync(lv, new_count, splittable_pvs))
+		return_0;
+
+	if (!_raid_extract_images(lv, new_count, splittable_pvs, 1,
+				  &removal_lvs, &data_list)) {
 		log_error("Failed to extract images from %s.",
 			  display_lvname(lv));
 		return 0;
@@ -7288,6 +7558,7 @@ static int _lv_raid_rebuild_or_replace(struct logical_volume *lv,
 	uint32_t s, sd, match_count = 0;
 	struct dm_list old_lvs;
 	struct dm_list new_meta_lvs, new_data_lvs;
+	struct dm_list *extract_pvs;
 	struct lv_segment *raid_seg = first_seg(lv);
 	struct lv_list *lvl;
 	char **tmp_names;
@@ -7295,7 +7566,6 @@ static int _lv_raid_rebuild_or_replace(struct logical_volume *lv,
 	char *tmp_name_dup;
 	const char *action_str = rebuild ? "rebuild" : "replace";
 	int has_integrity;
-	int known_in_sync;
 	enum raid_read_result read_result;
 	dm_percent_t sync_percent = DM_PERCENT_INVALID;
 
@@ -7378,14 +7648,14 @@ static int _lv_raid_rebuild_or_replace(struct logical_volume *lv,
 		 *        - 'handles_missing_pvs' is a broad "tolerate absent
 		 *          PVs" flag set by many commands.  Only lvconvert
 		 *          --repair sets it among the callers reaching here,
-		 *          so the effect is scoped to repair today, but the
-		 *          'force' argument is the real opt-in and the safer
-		 *          gate.
-		 *        - 'known_in_sync' passed to _raid_extract_images()
-		 *          below hard-codes that this gate proved the array
-		 *          in-sync.  With the gate relaxed that claim is no
-		 *          longer true, so it must be derived from
-		 *          'sync_percent' instead (and the comment above the
+		 *          so the effect is scoped to repair today, but a
+		 *          separate explicit opt-in is the safer gate.
+		 *        - _raid_check_images_in_sync() below hard-codes that
+		 *          this gate proved the array in-sync.  With the gate
+		 *          relaxed that claim is no longer true, so the
+		 *          in-sync variant must be replaced by a plain
+		 *          _raid_check_images() call derived from
+		 *          'sync_percent' (and the comment above the
 		 *          call updated).
 		 *        - the kernel refusal referenced here must be
 		 *          re-verified against the kernel in use first.
@@ -7397,12 +7667,11 @@ static int _lv_raid_rebuild_or_replace(struct logical_volume *lv,
 
 	/*
 	 * Reaching here means the in-sync gate above found the array fully
-	 * in sync, and the LV is not reloaded before _raid_extract_images(),
-	 * so the extraction path may skip its own status read.  If the gate
+	 * in sync, and the LV is not reloaded before _raid_check_images_in_sync(),
+	 * so its extraction check may skip the status read.  If the gate
 	 * is ever relaxed (see its FIXME), this must be derived from
 	 * 'sync_percent' instead of being hard-coded.
 	 */
-	known_in_sync = 1;
 
 	/*
 	 * How many sub-LVs are being removed?
@@ -7551,9 +7820,15 @@ try_again:
 	 *   supplied - knowing that only the image with the error target
 	 *   will be affected.
 	 */
+	extract_pvs = (partial_segment_removed || dm_list_empty(remove_pvs)) ?
+		      &lv->vg->pvs : remove_pvs;
+
+	if (!_raid_check_images_in_sync(lv, raid_seg->area_count - match_count,
+					extract_pvs))
+		return_0;
+
 	if (!_raid_extract_images(lv, raid_seg->area_count - match_count,
-				  (partial_segment_removed || dm_list_empty(remove_pvs)) ?
-				  &lv->vg->pvs : remove_pvs, 0, known_in_sync, NULL,
+				  extract_pvs, 0,
 				  &old_lvs, &old_lvs)) {
 		log_error("Failed to remove the specified images from %s.",
 			  display_lvname(lv));
