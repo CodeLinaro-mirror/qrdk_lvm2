@@ -845,8 +845,11 @@ convert2lvm_() {
 
 	# Select the exact service before normalizing YAML keys. Names such as
 	# foo-bar and foo_bar must never contribute settings to each other.
+	# Drop blank and comment lines, their indentation is arbitrary and cutting
+	# it could strip the leading '#' and expose a key outside of 'vdo:'.
 	awk -v name="$VDONAME:" '
-		/[^[:space:]]/ && !/^[[:space:]]*#/ {
+		!/[^[:space:]]/ || /^[[:space:]]*#/ { next }
+		{
 			indent = match($0, /[^ ]/) - 1
 			if (selected && indent <= base) selected = 0
 		}
