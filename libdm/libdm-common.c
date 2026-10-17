@@ -2016,6 +2016,11 @@ static void _unmangle_mountinfo_string(const char *src, char *buf)
 /* coverity[+tainted_string_sanitize_content:arg-0] */
 static int _sanitize_line(const char *line) { return 1; }
 
+/* Separator that ends the optional fields, after which the fs type comes */
+#define MOUNTINFO_SEP " - "
+/* Fs type and source prefix of a btrfs mount on a DM device */
+#define BTRFS_DM_SOURCE MOUNTINFO_SEP "btrfs /dev/mapper/"
+
 /* Parse one line of mountinfo and unmangled target line */
 static int _mountinfo_parse_line(const char *line, unsigned *maj, unsigned *min, char *buf)
 {
@@ -2035,13 +2040,18 @@ static int _mountinfo_parse_line(const char *line, unsigned *maj, unsigned *min,
 	}
 
 	/* btrfs fakes device numbers, but there is still /dev/mapper name
-	 * placed in mountinfo, so try to detect proper major:minor via this */
-	if (*maj == 0 && (devmapper = strstr(line, "/dev/mapper/"))) {
+	 * placed in mountinfo, so try to detect proper major:minor via this.
+	 * Trust only the source field of a btrfs mount - mount root, mount
+	 * point and the source of other fs types with major 0 (i.e. fuse)
+	 * can be set by an unprivileged user.  Kernel mangles blanks within
+	 * fields, so the first " - " is the separator preceding fs type. */
+	if (*maj == 0 && (devmapper = strstr(line, MOUNTINFO_SEP)) &&
+	    !strncmp(devmapper, BTRFS_DM_SOURCE, sizeof(BTRFS_DM_SOURCE) - 1)) {
 		if (!(dmt = dm_task_create(DM_DEVICE_INFO))) {
 			log_error("Mount info task creation failed.");
 			return 0;
 		}
-		devmapper += 12; /* skip fixed prefix */
+		devmapper += sizeof(BTRFS_DM_SOURCE) - 1; /* skip fixed prefix */
 		for (i = 0; devmapper[i] && devmapper[i] != ' ' && i < sizeof(root)-1; ++i)
 			root[i] = devmapper[i];
 		root[i] = 0;
