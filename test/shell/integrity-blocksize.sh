@@ -291,4 +291,18 @@ grep 'block_size = 4096' out
 lvchange -an $vg2/$lv1
 lvremove -y $vg2/$lv1
 
+# The metadata allocation list must not hide data PVs with a different
+# logical block size when each image spans both kinds of PV.
+vgremove -ff $vg2
+aux lvmconf 'devices/allow_mixed_block_sizes = 1'
+vgextend $vg1 "$LOOP3" "$LOOP4"
+lvcreate --type raid1 -m1 --nosync -l 8 -n $lv1 $vg1 "$LOOP1" "$LOOP2"
+lvextend -l +8 $vg1/$lv1 "$LOOP3" "$LOOP4"
+lvs -a -o lv_name,devices $vg1 > out
+grep "${lv1}_rimage_0" out | grep -F "$LOOP3"
+grep "${lv1}_rimage_1" out | grep -F "$LOOP4"
+not lvconvert -y --raidintegrity y $vg1/$lv1 "$LOOP1" "$LOOP2" > out 2>&1
+grep 'Integrity requires consistent logical block size' out
+lvremove -ff $vg1/$lv1
+
 # remove of $vg1, $vg2 and loops in cleanup_mounted_and_teardown()
