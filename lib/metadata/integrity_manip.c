@@ -675,7 +675,7 @@ int lv_add_integrity_to_raid(struct logical_volume *lv, struct dm_integrity_sett
 	struct volume_group *vg = lv->vg;
 	struct logical_volume *lv_image, *lv_imeta, *lv_iorig;
 	struct lv_segment *seg_top, *seg_image;
-	struct pv_list *pvl;
+	struct pv_list *pvl, *pvl_next, *requested_pvl;
 	const struct segment_type *segtype;
 	struct dm_integrity_settings *set = NULL;
 	struct dm_list *use_pvh = NULL;
@@ -770,6 +770,24 @@ int lv_add_integrity_to_raid(struct logical_volume *lv, struct dm_integrity_sett
 				pbs_4k++;
 			else if (pbs == 512)
 				pbs_512++;
+		}
+
+		/* Restrict metadata allocation without excluding data PVs above. */
+		if (pvh && (pvh != &vg->pvs)) {
+			dm_list_iterate_items_safe(pvl, pvl_next, &allocatable_pvs) {
+				if ((requested_pvl = find_pv_in_pv_list(pvh, pvl->pv))) {
+					pvl->pe_ranges = requested_pvl->pe_ranges;
+					continue;
+				}
+
+				dm_list_del(&pvl->list);
+			}
+
+			if (dm_list_empty(&allocatable_pvs)) {
+				log_error("No PVs for %s are in the requested allocation PV list.",
+					  display_lvname(lv_image));
+				goto bad;
+			}
 		}
 
 		use_pvh = &allocatable_pvs;

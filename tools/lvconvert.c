@@ -6558,6 +6558,16 @@ int lvconvert_to_cache_with_cachevol_cmd(struct cmd_context *cmd, int argc, char
 
 static int _lvconvert_integrity_remove(struct cmd_context *cmd, struct logical_volume *lv)
 {
+	/*
+	 * The positionals after the LV name only describe where integrity
+	 * metadata may be allocated, so they make no sense without it.
+	 */
+	if (cmd->position_argc > 1) {
+		log_error("Cannot specify PVs when removing integrity from %s.",
+			  display_lvname(lv));
+		return 0;
+	}
+
 	if (!lv_is_integrity(lv) && !lv_is_raid(lv)) {
 		log_error("LV %s does not have integrity.", display_lvname(lv));
 		return 0;
@@ -6659,7 +6669,12 @@ int lvconvert_integrity_cmd(struct cmd_context *cmd, int argc, char **argv)
 
 	cmd->get_vgname_from_options = 0;
 
-	ret = process_each_lv(cmd, cmd->position_argc, cmd->position_argv, NULL, NULL, READ_FOR_UPDATE, handle, NULL,
+	/*
+	 * Only the LV is a process_each_lv() positional; the remaining
+	 * positionals are the optional PV list used for allocations made
+	 * by the command.
+	 */
+	ret = process_each_lv(cmd, 1, cmd->position_argv, NULL, NULL, READ_FOR_UPDATE, handle, NULL,
 			      &_lvconvert_integrity_single);
 
 	destroy_processing_handle(cmd, handle);
