@@ -254,6 +254,52 @@ _test_recovery_rollback() {
 	lvremove -ff $vg/${lv1}_rimage__0_extracted $vg/$lv1
 }
 
+# Normal allocation keeps an image's rmeta on the same PV as the image.
+# Fabricate an rmeta-only partial image through metadata and make another
+# image partial so vgreduce reaches lv_raid_remove_missing().  The old
+# check looked at the image's integrity segment, which is never a raid
+# segment, and left the integrity wrapper behind.
+_test_rmeta_only_partial() {
+	_create_raid1_with_integrity
+
+	lvchange -an $vg/$lv1
+	vgcfgbackup -f backup $vg
+	pv4=$(get pv_field "$dev4" pv_uuid)
+	pv4_index=$(awk -v id="$pv4" '$0 ~ /^[[:space:]]*pv[0-9]+ \{/ { idx=$1 } $0 ~ "id = \"" id "\"" { gsub(/[^0-9]/, "", idx); print idx; exit }' backup)
+	awk -v lv="${lv1}_rmeta_0" -v new="pv$pv4_index" '
+	$0 ~ "^[[:space:]]*" lv " \\{" { inblock=1; depth=0 }
+	inblock {
+		n = gsub(/\{/, "{")
+		m = gsub(/\}/, "}")
+		depth += n - m
+		if ($0 ~ /"pv[0-9]+"/)
+			sub(/"pv[0-9]+"/, "\"" new "\"")
+		if (depth <= 0)
+			inblock=0
+	}
+	{ print }
+	' backup > backupnew
+	not diff -q backup backupnew
+	vgcfgrestore -f backupnew $vg
+
+	aux disable_dev "$dev4"
+	aux disable_dev "$dev2"
+	lvs -a -o+devices,segtype $vg > out
+	vgreduce --removemissing --force $vg
+	lvs -a -o+devices,segtype $vg > out
+	not grep "$dev4" out
+	grep error out
+	lvs -a --noheadings -o lv_name $vg > names
+	not grep -q "${lv1}_rimage_0_iorig" names
+	not grep -q "${lv1}_rimage_0_imeta" names
+	not grep -q "${lv1}_rimage_1_iorig" names
+	not grep -q "${lv1}_rimage_1_imeta" names
+	grep -q "${lv1}_rimage_2_iorig" names
+	grep -q "${lv1}_rimage_2_imeta" names
+	aux enable_dev "$dev2"
+	aux enable_dev "$dev4"
+}
+
 # Reduce raid image count on raid1 with integrity (RHEL-242389)
 # vgreduce --removemissing removed dev2 from the previous VG while the
 # device was disabled, so vgremove could not clear its PV label; wipe it
@@ -301,4 +347,10 @@ for remove_dev in "$dev1" "$dev2" "$dev3"; do
 	lvchange -ay $vg/$lv1
 	lvremove -ff $vg/$lv1
 done
+vgremove -ff $vg
+
+# rmeta-only partial image
+_prepare_vg
+_test_rmeta_only_partial
+lvremove -ff $vg/$lv1
 vgremove -ff $vg
