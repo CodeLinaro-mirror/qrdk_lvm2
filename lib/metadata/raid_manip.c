@@ -8046,7 +8046,8 @@ int lv_raid_remove_missing(struct logical_volume *lv)
 			if (!(lv_iorig = seg_lv(seg_image, 0)))
 				continue;
 
-			lv_rmeta = seg_is_raid_with_meta(seg_image) ? seg_metalv(seg_image, s) : NULL;
+			lv_rmeta = seg_is_raid_with_meta(seg) && seg->meta_areas ?
+				   seg_metalv(seg, s) : NULL;
 
 			/*
 			 * Remove integrity from this image if any of the LVs
