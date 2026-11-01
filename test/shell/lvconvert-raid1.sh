@@ -26,24 +26,6 @@ delay_pv_pe_area() {
 	aux delay_dev "$dev" 0 100 "$(get first_extent_sector "$dev"):"
 }
 
-wait_for_raid1_recovery() {
-	local i
-	local expected_health=$1
-	local -a status
-
-	for i in {1..100}; do
-		status=( $(dmsetup status --noflush "$vg-$lv1") ) || die "Unable to get status of $vg/$lv1"
-		if [[ "${status[5]}" = "$expected_health" &&
-		      ( "${status[7]}" = "recover" || "${status[7]}" = "rebuild" ) ]]; then
-			echo "Observed active RAID1 recovery: ${status[*]}"
-			return 0
-		fi
-		sleep .1
-	done
-
-	die "RAID1 did not enter recovery with health $expected_health: ${status[*]}"
-}
-
 lvcreate --type raid1 -m 1 -aey -l 2 -n "$lv1" "$vg" "$dev1" "$dev2"
 aux wait_for_sync "$vg" "$lv1"
 
@@ -59,7 +41,7 @@ aux delay_dev "$dev3" 0 100 "$first_data_extent:$(( 2 * extent_size ))"
 lvconvert --yes -m +1 "$vg/$lv1" "$dev3"
 
 # Do not let the reduction below pass unless it runs during active recovery.
-wait_for_raid1_recovery AAa
+check raid_leg_status "$vg" "$lv1" AAa
 
 # Legacy dm-raid restarts recovery on rebuild; newer targets retain progress.
 printf 'y\n' | lvconvert -m -1 "$vg/$lv1" "$dev1" >lvconvert-raid1.out 2>&1
