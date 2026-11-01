@@ -1,0 +1,397 @@
+diff --git a/lib/metadata/raid_manip.c b/lib/metadata/raid_manip.c
+index 4c69e94f2..21e52a8ba 100644
+--- a/lib/metadata/raid_manip.c
++++ b/lib/metadata/raid_manip.c
+@@ -4059,28 +4059,14 @@ static struct logical_volume *_raid_prepare_integrity_reduction(struct logical_v
+ {
+ 	struct logical_volume *rollback_lv;
+ 
+-	/* Preserve metadata for rollback after the temporary commit. */
++	/*
++	 * Experiment: skip the pre-flight temporary rename; the dtree
++	 * rename resolver handles the cross-parent chain in one commit.
++	 */
+ 	if (!(rollback_lv = _raid_copy_lv_for_rollback(lv)))
+ 		return_NULL;
+ 
+-	if (!_rename_area_lvs(lv, "_"))
+-		goto_bad;
+-
+-	if (!lv_update_and_reload(lv)) {
+-		/*
+-		 * The temporary names may have reached the kernel. A failed
+-		 * restore is reported by _raid_restore_rollback_copy() itself,
+-		 * and this path fails either way.
+-		 */
+-		_raid_restore_rollback_copy(rollback_lv, lv);
+-		goto_bad;
+-	}
+-
+ 	return rollback_lv;
+-
+-bad:
+-	release_vg(rollback_lv->vg);
+-	return NULL;
+ }
+ 
+ /*
+diff --git a/lib/activate/dev_manager.c b/lib/activate/dev_manager.c
+index ad3fb10e4..e49548179 100644
+--- a/lib/activate/dev_manager.c
++++ b/lib/activate/dev_manager.c
+@@ -2530,6 +2530,10 @@ static int _add_dev_to_dtree(struct dev_manager *dm, struct dm_tree *dtree,
+ 			  name, dlid, info.major, info.minor);
+ 	} else if (!_info(dm->cmd, name, dlid, 0, 0, 0, &info, NULL, NULL))
+ 		return_0;
++
++	log_debug_activation("_add_dev_to_dtree %s dlid=%s exists=%d (%u:%u).",
++			     name, dlid, info.exists, info.major, info.minor);
++
+ 	/*
+ 	 * For top level volumes verify that existing device match
+ 	 * requested major/minor and that major/minor pair is available for use
+@@ -3725,6 +3729,7 @@ static int _lv_adjust_real_uuid(struct dev_manager *dm,	struct dm_tree *dtree,
+ 	if (!lv_is_linear(lv) &&
+ 	    !lv_is_striped(lv) &&
+ 	    !lv_is_mirrored(lv) &&
++	    !lv_is_integrity(lv) &&
+ 	    !lv_is_error(lv) &&
+ 	    !lv_is_zero(lv))
+ 		return 1;
+@@ -3881,6 +3886,7 @@ static int _add_new_lv_to_dtree(struct dev_manager *dm, struct dm_tree *dtree,
+ 	/* Use UUID with -real private suffix for such active LV. */
+ 	if (!layer && !_lv_adjust_real_uuid(dm, dtree, lv, &dlid))
+ 		return_0;
++
+ 	/*
+ 	 * Add LV to dtree.
+ 	 * If we're working with precommitted metadata, clear any
+diff --git a/libdm/libdm-deptree.c b/libdm/libdm-deptree.c
+index 8332975d7..831a9d88c 100644
+--- a/libdm/libdm-deptree.c
++++ b/libdm/libdm-deptree.c
+@@ -346,6 +346,7 @@ struct dm_tree_node {
+ 
+ 	int activated;                  /* tracks activation during preload */
+ 	int suspended_locally;		/* suspended by this tree operation */
++	int rename_in_progress;		/* rename dependency walk guard */
+ };
+ 
+ struct dm_tree {
+@@ -1201,6 +1202,7 @@ struct dm_tree_node *dm_tree_add_new_dev_with_udev_flags(struct dm_tree *dtree,
+ 
+ 	/* Do we need to add node to tree? */
+ 	if (!(dnode = dm_tree_find_node_by_uuid(dtree, uuid))) {
++		log_debug_activation("Creating new dtree node %s (%s).", name, uuid);
+ 		if (!(dnode = _create_dm_tree_node(dtree, name, uuid, &info,
+ 						   context, 0)))
+ 			return_NULL;
+@@ -1212,12 +1214,16 @@ struct dm_tree_node *dm_tree_add_new_dev_with_udev_flags(struct dm_tree *dtree,
+ 		dnode->props.major = major;
+ 		dnode->props.minor = minor;
+ 	} else if (strcmp(name, dnode->name)) {
++		log_debug_activation("Queued rename of dtree node %s to %s (%s).",
++				     dnode->name, name, uuid);
+ 		/* Do we need to rename node? */
+ 		if (!(dnode->props.new_name = dm_pool_strdup(dtree->mem, name))) {
+ 			log_error("name pool_strdup failed");
+ 			return NULL;
+ 		}
+-	}
++	} else
++		log_debug_activation("Dtree node %s already has requested name (%s).",
++				     dnode->name, uuid);
+ 
+ 	dnode->props.read_only = read_only ? 1 : 0;
+ 	dnode->props.read_ahead = DM_READ_AHEAD_AUTO;
+@@ -2026,49 +2032,103 @@ int dm_tree_suspend_children(struct dm_tree_node *dnode,
+ }
+ 
+ /*
+- * _rename_conflict_exists
++ * _find_rename_conflict
+  * @dnode
+  * @node
+- * @resolvable
++ * @new_name
++ * @conflict
+  *
+- * Check if there is a rename conflict with existing peers in
+- * this tree.  'resolvable' is set if the conflicting node will
+- * also be undergoing a rename.  (Allowing that node to rename
+- * first would clear the conflict.)
++ * Find a node in the tree whose current name is @new_name.  The rename
++ * resolver has to see the whole tree: the node holding the name may be
++ * a child of a different parent.
+  *
+- * Returns: 1 if conflict, 0 otherwise
++ * Returns: 1 if a conflicting node was found, 0 otherwise
+  */
+-static int _rename_conflict_exists(struct dm_tree_node *parent,
+-				 struct dm_tree_node *node,
+-				 int *resolvable)
++static int _find_rename_conflict(const struct dm_tree_node *dnode,
++				 const struct dm_tree_node *node,
++				 const char *new_name,
++				 struct dm_tree_node **conflict)
+ {
+ 	void *handle = NULL;
+-	const char *name = dm_tree_node_get_name(node);
+-	const char *sibling_name;
+-	struct dm_tree_node *sibling;
++	struct dm_tree_node *child;
++	const char *name;
+ 
+-	*resolvable = 0;
++	while ((child = dm_tree_next_child(&handle, dnode, 0))) {
++		if ((child != node) &&
++		    (name = dm_tree_node_get_name(child)) &&
++		    !strcmp(name, new_name)) {
++			*conflict = child;
++			return 1;
++		}
+ 
+-	if (!name)
+-		return_0;
++		if (dm_tree_node_num_children(child, 0) &&
++		    _find_rename_conflict(child, node, new_name, conflict))
++			return 1;
++	}
+ 
+-	while ((sibling = dm_tree_next_child(&handle, parent, 0))) {
+-		if (sibling == node)
+-			continue;
++	return 0;
++}
+ 
+-		if (!(sibling_name = dm_tree_node_get_name(sibling))) {
+-			stack;
+-			continue;
+-		}
++/*
++ * _rename_node_with_deps
++ * @node
++ *
++ * Rename @node after renaming any node that currently holds its target
++ * name.  The conflicting node must be renamed first, even when it is
++ * not a sibling; a true cycle cannot be resolved without a temporary
++ * name and is reported as an error.
++ *
++ * Returns: 1 on success, 0 on failure
++ */
++static int _rename_node_with_deps(struct dm_tree_node *node)
++{
++	struct dm_tree_node *conflict;
++	const char *name;
++	int r = 0;
+ 
+-		if (!strcmp(node->props.new_name, sibling_name)) {
+-			if (sibling->props.new_name)
+-				*resolvable = 1;
+-			return 1;
++	if (!node->props.new_name)
++		return 1;
++
++	if (node->rename_in_progress) {
++		log_error("Rename cycle detected for %s.", _node_name(node));
++		return 0;
++	}
++
++	node->rename_in_progress = 1;
++
++	while (_find_rename_conflict(&node->dtree->root, node,
++				     node->props.new_name, &conflict)) {
++		if (!conflict->props.new_name) {
++			log_error("Cannot rename %s to %s: name is already in use by %s.",
++				  node->name, node->props.new_name, conflict->name);
++			goto out;
+ 		}
++		if (!_rename_node_with_deps(conflict))
++			goto out;
+ 	}
+ 
+-	return 0;
++	if (!(name = dm_tree_node_get_name(node))) {
++		log_error(INTERNAL_ERROR "Cannot determine name of %s.",
++			  _node_name(node));
++		goto out;
++	}
++
++	if (!_rename_node(name, node->props.new_name, node->info.major,
++			  node->info.minor, &node->dtree->cookie,
++			  node->udev_flags)) {
++		log_error("Failed to rename %s (%" PRIu32 ":%" PRIu32 ") to %s.",
++			  name, node->info.major, node->info.minor,
++			  node->props.new_name);
++		goto out;
++	}
++
++	node->name = node->props.new_name;
++	node->props.new_name = NULL;
++	r = 1;
++
++out:
++	node->rename_in_progress = 0;
++	return r;
+ }
+ 
+ /*
+@@ -2139,10 +2199,8 @@ int dm_tree_activate_children(struct dm_tree_node *dnode,
+ 				 size_t uuid_prefix_len)
+ {
+ 	int r = 1;
+-	int resolvable_name_conflict, awaiting_peer_rename = 0;
+ 	void *handle = NULL;
+ 	struct dm_tree_node *child;
+-	const char *name;
+ 	const char *uuid;
+ 	int priority, next_priority;
+ 
+@@ -2164,7 +2222,6 @@ int dm_tree_activate_children(struct dm_tree_node *dnode,
+ 	handle = NULL;
+ 
+ 	for (priority = 0; priority < 3; priority++) {
+-		awaiting_peer_rename = 0;
+ 		next_priority = 0;
+ 		while ((child = dm_tree_next_child(&handle, dnode, 0))) {
+ 			if (priority != child->activation_priority) {
+@@ -2182,29 +2239,10 @@ int dm_tree_activate_children(struct dm_tree_node *dnode,
+ 			if (!_uuid_prefix_matches(uuid, uuid_prefix, uuid_prefix_len))
+ 				continue;
+ 
+-			if (!(name = dm_tree_node_get_name(child))) {
+-				stack;
+-				continue;
+-			}
+-
+ 			/* Rename? */
+-			if (child->props.new_name) {
+-				if (_rename_conflict_exists(dnode, child, &resolvable_name_conflict) &&
+-				    resolvable_name_conflict) {
+-					awaiting_peer_rename++;
+-					continue;
+-				}
+-				if (!_rename_node(name, child->props.new_name, child->info.major,
+-						  child->info.minor, &child->dtree->cookie,
+-						  child->udev_flags)) {
+-					log_error("Failed to rename %s (%" PRIu32
+-						  ":%" PRIu32 ") to %s", name, child->info.major,
+-						  child->info.minor, child->props.new_name);
+-					return 0;
+-				}
+-				child->name = child->props.new_name;
+-				child->props.new_name = NULL;
+-			}
++			if (child->props.new_name &&
++			    !_rename_node_with_deps(child))
++				return 0;
+ 
+ 			if (!child->info.inactive_table && !child->info.suspended)
+ 				continue;
+@@ -2234,9 +2272,7 @@ int dm_tree_activate_children(struct dm_tree_node *dnode,
+ 			    (!(r = _reactivate_siblings(dnode, uuid_prefix, uuid_prefix_len))))
+ 				stack;
+ 		}
+-		if (awaiting_peer_rename)
+-			priority--; /* redo priority level */
+-		else if (!next_priority)
++		if (!next_priority)
+ 			break;  /* no more work, higher priority was not found in the chain */
+ 	}
+ 
+diff --git a/test/shell/integrity-misc.sh b/test/shell/integrity-misc.sh
+index 2a7407cd5..e61c589c6 100644
+--- a/test/shell/integrity-misc.sh
++++ b/test/shell/integrity-misc.sh
+@@ -193,8 +193,8 @@ _test_extraction_name_collision() {
+ 	# where the LV name is the key of its block.
+ 	lvcreate -an -l 1 -n $lv2 $vg "$dev4"
+ 	vgcfgbackup -f backup $vg
+-	sed -e "s/^\(\t*\)$lv2 {/\1${lv1}_rimage__0_extracted {/" backup >backupnew
+-	grep "${lv1}_rimage__0_extracted {" backupnew
++	sed -e "s/^\(\t*\)$lv2 {/\1${lv1}_rimage_0_extracted {/" backup >backupnew
++	grep "${lv1}_rimage_0_extracted {" backupnew
+ 	not grep "$lv2 {" backupnew
+ 	lvchange -an $vg/$lv1
+ 	vgcfgrestore -f backupnew $vg
+@@ -208,17 +208,17 @@ _test_extraction_name_collision() {
+ 	vgs --noheadings -o vg_seqno $vg > after-seqno
+ 	dmsetup table -S "name=~^$vg-" | sort > after-table
+ 	diff before after
+-	# The temporary names were loaded into the kernel by the pre-flight,
++	# The failed reduction may have renamed devices before it failed,
+ 	# so the rollback has to reload the original names as well.
+ 	diff before-table after-table
+-	# The reduction failed after the pre-flight committed its temporary
+-	# names, so the rollback has to write the metadata back and the seqno
+-	# moves on. It must not be replayed from the rollback metadata copy, which
+-	# would put a lower seqno than the one already on disk.
++	# The reduction failed at the single commit, so the rollback may have
++	# written the metadata back and moved the seqno on. It must not be
++	# replayed from the rollback metadata copy, which would put a lower
++	# seqno than the one already on disk.
+ 	seqno_after=$(cat after-seqno)
+ 	seqno_before=$(cat before-seqno)
+-	test $seqno_after -gt $seqno_before
+-	lvremove -ff $vg/${lv1}_rimage__0_extracted
++	test $seqno_after -ge $seqno_before
++	lvremove -ff $vg/${lv1}_rimage_0_extracted
+ }
+ 
+ # Normal allocation keeps an image's rmeta on the same PV as the image.
+diff --git a/test/shell/integrity-onecommit.sh b/test/shell/integrity-onecommit.sh
+new file mode 100755
+index 000000000..663e5a70c
+--- /dev/null
++++ b/test/shell/integrity-onecommit.sh
+@@ -0,0 +1,50 @@
++#!/usr/bin/env bash
++
++# Copyright (C) 2026 Red Hat, Inc. All rights reserved.
++#
++# This copyrighted material is made available to anyone wishing to use,
++# modify, copy, or redistribute it subject to the terms and conditions
++# of the GNU General Public License v.2.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program; if not, write to the Free Software Foundation,
++# Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++
++. lib/inittest --skip-with-lvmpolld
++
++aux have_integrity 1 5 0 || skip
++
++aux prepare_devs 3 64
++aux clear_devs "$dev1" "$dev2" "$dev3"
++vgcreate $SHARED $vg "$dev1" "$dev2" "$dev3"
++
++lvcreate --yes --type raid1 -m 2 --nosync -l 8 --raidintegrity y -n $lv1 \
++	$vg "$dev1" "$dev2" "$dev3"
++aux wait_recalc $vg/${lv1}_rimage_0
++aux wait_recalc $vg/${lv1}_rimage_1
++aux wait_recalc $vg/${lv1}_rimage_2
++aux wait_recalc $vg/$lv1
++
++uuid1=$(get lv_field "$vg/${lv1}_rimage_1" lv_uuid -a)
++uuid2=$(get lv_field "$vg/${lv1}_rimage_2" lv_uuid -a)
++dd if=/dev/urandom of=expected bs=1M count=1
++dd if=expected of="$DM_DEV_DIR/$vg/$lv1" bs=1M conv=fsync
++
++if ! lvconvert --yes -m 1 $vg/$lv1 "$dev1"; then
++	dmsetup ls --tree
++	dmsetup info -c -o name,uuid,minor
++	die "one-commit integrity reduction failed"
++fi
++
++check lv_field "$vg/${lv1}_rimage_0" lv_uuid "$uuid1" -a
++check lv_field "$vg/${lv1}_rimage_1" lv_uuid "$uuid2" -a
++check lv_field "$vg/${lv1}_rimage_0" segtype integrity -a
++check lv_field "$vg/${lv1}_rimage_1" segtype integrity -a
++dmsetup info -c -o name > dm-info
++not grep "${vg}-${lv1}_rimage_.*extracted" dm-info
++lvchange -an "$vg/$lv1"
++lvchange -ay "$vg/$lv1"
++dd if="$DM_DEV_DIR/$vg/$lv1" of=actual bs=1M count=1
++cmp expected actual
++
++vgremove -ff $vg
