@@ -33,6 +33,8 @@ typedef int (*fn_on_lv_t)(struct logical_volume *lv, void *data);
 static int _eliminate_extracted_lvs_optional_write_vg(struct volume_group *vg,
 						      struct dm_list *removal_lvs,
 						      int vg_write_requested);
+static char *_format_raid_name(const struct logical_volume *lv,
+			       const char *suffix, int count);
 
 static int _check_restriping(uint32_t new_stripes, struct logical_volume *lv)
 {
@@ -1048,6 +1050,60 @@ static int _reorder_raid10_near_seg_areas(struct lv_segment *seg, enum raid0_rai
 }
 
 /*
+ * Set @sublv's name to the name of @lv_image with @suffix appended.
+ *
+ * The base name comes from @lv_image rather than @sublv because @sublv
+ * already carries @suffix, so deriving it from @sublv would append it twice.
+ */
+static int _set_sublv_name(struct logical_volume *lv_image,
+			   struct logical_volume *sublv, const char *suffix)
+{
+	char *name;
+
+	if (!(name = _format_raid_name(lv_image, suffix, -1)))
+		return_0;
+
+	if (!lv_set_name(sublv, name))
+		return_0;
+
+	return 1;
+}
+
+/*
+ * Set integrity iorig/imeta LV names to match the name of @lv_image.
+ *
+ * The iorig/imeta sub-LVs are named after their rimage and do not follow it
+ * when the rimage is renamed, so every place that renames an image that may
+ * carry integrity has to call this: _shift_and_rename_image_components(),
+ * _extract_image_components(), _rename_area_lvs() and
+ * _lv_raid_rebuild_or_replace().
+ */
+static int _set_integrity_sublv_names(struct logical_volume *lv_image)
+{
+	struct logical_volume *lv_imeta, *lv_iorig;
+	struct lv_segment *seg;
+
+	if (!lv_is_integrity(lv_image))
+		return 1;
+
+	if (!(seg = first_seg(lv_image)) ||
+	    !(lv_imeta = seg->integrity_meta_dev) ||
+	    !(lv_iorig = seg_lv(seg, 0))) {
+		log_error(INTERNAL_ERROR "Inconsistent LV structure in %s.",
+			  display_lvname(lv_image));
+		return 0;
+	}
+
+	if (!_set_sublv_name(lv_image, lv_imeta, "imeta"))
+		return_0;
+
+	if (!_set_sublv_name(lv_image, lv_iorig, "iorig"))
+		return_0;
+
+	return 1;
+}
+
+/*
  * _shift_and_rename_image_components
  * @seg: Top-level RAID segment
  *
@@ -1107,6 +1163,9 @@ static int _shift_and_rename_image_components(struct lv_segment *seg)
 			return 0;
 		}
 
+		if (!_set_integrity_sublv_names(seg_lv(seg, s)))
+			return_0;
+
 		seg->areas[s - missing] = seg->areas[s];
 		seg->meta_areas[s - missing] = seg->meta_areas[s];
 	}
@@ -1115,13 +1174,12 @@ static int _shift_and_rename_image_components(struct lv_segment *seg)
 	return 1;
 }
 
-/* Generate raid subvolume name and validate it */
-static char *_generate_raid_name(struct logical_volume *lv,
-				 const char *suffix, int count)
+/* Format raid subvolume name, without validating it */
+static char *_format_raid_name(const struct logical_volume *lv, const char *suffix,
+			       int count)
 {
-	char name[NAME_LEN], *lvname;
-	int historical;
-	char count_suffix[16] = { 0 };
+	char name[NAME_LEN], count_suffix[16] = { 0 };
+	char *name_dup;
 
 	if (count >= 0)
 		snprintf(count_suffix, sizeof(count_suffix), "_%u", (unsigned)count);
@@ -1133,23 +1191,53 @@ static char *_generate_raid_name(struct logical_volume *lv,
 		return NULL;
 	}
 
+	if (!(name_dup = dm_pool_strdup(lv->vg->vgmem, name))) {
+		log_error("Failed to allocate new name.");
+		return NULL;
+	}
+
+	return name_dup;
+}
+
+/*
+ * _validate_raid_name
+ * @lv: the VG @name has to be free in
+ * @name: a name returned by _format_raid_name()
+ *
+ * Returns: 1 if it is a valid and unused LV name, 0 (after logging)
+ *	    if it is not
+ */
+static int _validate_raid_name(struct logical_volume *lv, const char *name)
+{
+	int historical;
+
 	if (!validate_name(name)) {
 		log_error("New logical volume name \"%s\" is not valid.", name);
-		return NULL;
+		return 0;
 	}
 
 	if (lv_name_is_used_in_vg(lv->vg, name, &historical)) {
 		log_error("%sLogical Volume %s already exists in volume group %s.",
 			  historical ? "historical " : "", name, lv->vg->name);
-		return NULL;
+		return 0;
 	}
 
-	if (!(lvname = dm_pool_strdup(lv->vg->vgmem, name))) {
-		log_error("Failed to allocate new name.");
-		return NULL;
-	}
+	return 1;
+}
 
-	return lvname;
+/* Generate raid subvolume name and validate it */
+static char *_generate_raid_name(struct logical_volume *lv,
+				 const char *suffix, int count)
+{
+	char *name;
+
+	if (!(name = _format_raid_name(lv, suffix, count)))
+		return_NULL;
+
+	if (!_validate_raid_name(lv, name))
+		return_NULL;
+
+	return name;
 }
 
 /*
@@ -2890,6 +2978,9 @@ static int _raid_add_images_without_commit(struct logical_volume *lv,
 	 * because the linear volume hasn't taken its proper name of "_rimage_0"
 	 * yet.  This action must be done before '_clear_lvs' because it
 	 * commits the LVM metadata before clearing the LVs.
+	 *
+	 * A linear LV cannot carry integrity, so there are no _imeta/_iorig
+	 * names to update here.
 	 */
 	if (seg_is_linear(seg)) {
 		if (!(lv_name = _generate_raid_name(lv, "rimage", count)))
@@ -3092,7 +3183,6 @@ static int _raid_add_images(struct logical_volume *lv,
  *    1) shift the 'areas' or 'meta_areas' arrays.
  *       The '[meta_]areas' are left as AREA_UNASSIGNED.
  *    2) Adjust the seg->area_count
- *    3) Name the extracted LVs appropriately (appends '_extracted' to names)
  * These actions must be performed by the caller.
  *
  * Returns: 1 on success, 0 on failure
@@ -3129,6 +3219,9 @@ static int _extract_image_components(struct lv_segment *seg, uint32_t idx,
 
 	if (!lv_set_name(data_lv, data_lv_name) ||
 	    !lv_set_name(meta_lv, meta_lv_name))
+		return_0;
+
+	if (!_set_integrity_sublv_names(data_lv))
 		return_0;
 
 	*extracted_rmeta = meta_lv;
@@ -4917,6 +5010,10 @@ static int _convert_mirror_to_raid1(struct logical_volume *lv,
 		s++;
 	}
 
+	/*
+	 * The LV is still a mirror here, and a mirror cannot carry integrity:
+	 * lvconvert rejects converting a RAID LV with integrity to mirror.
+	 */
 	for (s = 0; s < seg->area_count; ++s) {
 		if (!(new_name = _generate_raid_name(lv, "rimage", s)))
 			return_0;
@@ -5848,27 +5945,44 @@ static int _clear_meta_lvs(struct logical_volume *lv)
 #define	SLV_COUNT	2
 static int _rename_area_lvs(struct logical_volume *lv, const char *suffix)
 {
-	uint32_t s;
-	size_t sz = sizeof("rimage") - 1 + (suffix ? strlen(suffix) : 0) + 1;
-	char *sfx[SLV_COUNT] = { NULL, NULL };
+	uint32_t s, t;
+	char sfx[SLV_COUNT][NAME_LEN];
 	struct lv_segment *seg = first_seg(lv);
+	struct logical_volume *slv;
 	const char *lv_name;
 
-	/* Create _generate_raid_name() suffixes w/ or w/o passed in @suffix */
+	/* Create _format_raid_name() suffixes w/ or w/o passed in @suffix */
 	for (s = 0; s < SLV_COUNT; s++)
-		if (!(sfx[s] = dm_pool_alloc(lv->vg->cmd->mem, sz)) ||
-		    dm_snprintf(sfx[s], sz, "%s%s", (s) ? "rmeta" : "rimage", (suffix) ? : "") < 0)
+		if (dm_snprintf(sfx[s], sizeof(sfx[s]), "%s%s",
+				(s) ? "rmeta" : "rimage", (suffix) ? : "") < 0)
 			return_0;
 
 	/* Change names (temporarily) to be able to shift numerical name suffixes */
 	for (s = 0; s < seg->area_count; s++) {
-		if (!(lv_name = _generate_raid_name(lv, sfx[0], s)) ||
-		    !lv_set_name(seg_lv(seg, s), lv_name))
-			return_0;
-		if (seg->meta_areas &&
-		    (!(lv_name = _generate_raid_name(lv, sfx[1], s)) ||
-		     !lv_set_name(seg_metalv(seg, s), lv_name)))
-			return_0;
+		for (t = 0; t < SLV_COUNT; t++) {
+			if (t && !seg->meta_areas)
+				continue;
+
+			slv = t ? seg_metalv(seg, s) : seg_lv(seg, s);
+			if (!(lv_name = _format_raid_name(lv, sfx[t], s)))
+				return_0;
+
+			/*
+			 * Shifting may already have assigned the final name.
+			 * The comparison has to happen before the validation,
+			 * which rejects a name that is still in use - which is
+			 * exactly the name slv already carries here.
+			 */
+			if (!strcmp(slv->name, lv_name))
+				continue;
+
+			if (!_validate_raid_name(lv, lv_name) ||
+			    !lv_set_name(slv, lv_name))
+				return_0;
+
+			if (!t && !_set_integrity_sublv_names(slv))
+				return_0;
+		}
 	}
 
 	return 1;
@@ -7562,8 +7676,6 @@ static int _lv_raid_rebuild_or_replace(struct logical_volume *lv,
 	struct lv_segment *raid_seg = first_seg(lv);
 	struct lv_list *lvl;
 	char **tmp_names;
-	char tmp_name_buf[NAME_LEN];
-	char *tmp_name_dup;
 	const char *action_str = rebuild ? "rebuild" : "replace";
 	int has_integrity;
 	enum raid_read_result read_result;
@@ -7929,39 +8041,8 @@ skip_alloc:
 				    !lv_set_name(lv_image, tmp_names[sd]))
 					return_0;
 
-				if (lv_is_integrity(lv_image)) {
-					struct logical_volume *lv_imeta;
-					struct logical_volume *lv_iorig;
-					struct lv_segment *seg_image;
-
-					seg_image = first_seg(lv_image);
-					lv_imeta = seg_image->integrity_meta_dev;
-					lv_iorig = seg_lv(seg_image, 0);
-
-					if (dm_snprintf(tmp_name_buf, NAME_LEN, "%s_imeta", lv_image->name) < 0) {
-						stack;
-						continue;
-					}
-					if (!(tmp_name_dup = dm_pool_strdup(lv->vg->vgmem, tmp_name_buf))) {
-						stack;
-						continue;
-					}
-
-					if (!lv_set_name(lv_imeta, tmp_name_dup))
-						return_0;
-
-					if (dm_snprintf(tmp_name_buf, NAME_LEN, "%s_iorig", lv_image->name) < 0) {
-						stack;
-						continue;
-					}
-					if (!(tmp_name_dup = dm_pool_strdup(lv->vg->vgmem, tmp_name_buf))) {
-						stack;
-						continue;
-					}
-
-					if (!lv_set_name(lv_iorig, tmp_name_dup))
-						return_0;
-				}
+				if (!_set_integrity_sublv_names(lv_image))
+					return_0;
 			}
 		}
 
