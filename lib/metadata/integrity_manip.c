@@ -981,10 +981,18 @@ bad:
 			if (!imeta_lvs[s])
 				continue;
 
-			lv_image = seg_lv(seg_top, s);
+			if (!(lv_image = seg_lv(seg_top, s))) {
+				log_error("Aborting. No image %u in LV %s.",
+					  s, display_lvname(lv));
+				return 0;
+			}
 			seg_image = first_seg(lv_image);
-			lv_iorig = seg_lv(seg_image, 0);
 			if (lv_image->status & INTEGRITY) {
+				if (!(lv_iorig = seg_lv(seg_image, 0))) {
+					log_error("Aborting. Integrity segment of LV %s has no origin.",
+						  display_lvname(lv_image));
+					return 0;
+				}
 				if (!remove_layer_from_lv(lv_image, lv_iorig) ||
 				    !remove_seg_from_segs_using_this_lv(imeta_lvs[s],
 									seg_image)) {
