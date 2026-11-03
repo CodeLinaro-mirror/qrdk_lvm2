@@ -1146,7 +1146,7 @@ static int _release_and_discard_lv_segment_area(struct lv_segment *seg, uint32_t
 						uint32_t area_reduction, int with_discard)
 {
 	struct lv_segment *cache_seg;
-	struct logical_volume *lv = seg_lv(seg, s);
+	struct logical_volume *lv;
 
 	if (seg_type(seg, s) == AREA_UNASSIGNED)
 		return 1;
@@ -1163,6 +1163,10 @@ static int _release_and_discard_lv_segment_area(struct lv_segment *seg, uint32_t
 
 		return 1;
 	}
+
+	/* Read the LV only once the area type says it holds one. */
+	if (!(lv = seg_lv(seg, s)))
+		return_0;
 
 	if (lv_is_mirror_image(lv) ||
 	    lv_is_thin_pool_data(lv) ||
