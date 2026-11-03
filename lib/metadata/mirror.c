@@ -761,12 +761,25 @@ static int _split_mirror_images(struct logical_volume *lv,
 	 */
 	dm_list_init(&split_images);
 	for (i = 0; i < split_count; i++) {
-		mirrored_seg->area_count--;
-		sub_lv = seg_lv(mirrored_seg, mirrored_seg->area_count);
+		uint32_t last_area = mirrored_seg->area_count - 1;
+
+		/*
+		 * The images to detach have been moved to the end of the
+		 * segment, so the last area is the one to take out.  Read
+		 * and release it while the index is still inside area_count,
+		 * then lower the count: the area accessors refuse an index
+		 * at or past area_count, and the slot must be released
+		 * before it stops being part of the segment.
+		 */
+		sub_lv = seg_lv(mirrored_seg, last_area);
+		if (!sub_lv)
+			return_0;
 
 		sub_lv->status &= ~MIRROR_IMAGE;
-		if (!release_lv_segment_area(mirrored_seg, mirrored_seg->area_count, mirrored_seg->area_len))
+		if (!release_lv_segment_area(mirrored_seg, last_area, mirrored_seg->area_len))
 			return_0;
+
+		mirrored_seg->area_count--;
 
 		log_very_verbose("LV %s assigned to be split.", display_lvname(sub_lv));
 
