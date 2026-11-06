@@ -97,6 +97,7 @@ FIELD_RESERVED_BINARY_VALUE(lv_initial_image_sync, lv_initial_image_sync, "", "i
 FIELD_RESERVED_BINARY_VALUE(lv_image_synced, lv_image_synced, "", "image synced", "synced")
 FIELD_RESERVED_BINARY_VALUE(lv_merging, lv_merging, "", "merging")
 FIELD_RESERVED_BINARY_VALUE(lv_converting, lv_converting, "", "converting")
+FIELD_RESERVED_BINARY_VALUE(lv_resync_pending, lv_resync_pending, "", "resync pending", "pending")
 FIELD_RESERVED_BINARY_VALUE(lv_allocation_locked, lv_allocation_locked, "", "allocation locked", "locked")
 FIELD_RESERVED_BINARY_VALUE(lv_fixed_minor, lv_fixed_minor, "", "fixed minor", "fixed")
 FIELD_RESERVED_BINARY_VALUE(lv_active, lv_active, "", "active")

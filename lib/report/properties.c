@@ -301,6 +301,8 @@ GET_PV_STR_PROPERTY_FN(pv_device_id_type, pv->device_id_type)
 #define _lv_merging_get prop_not_implemented_get
 #define _lv_converting_set prop_not_implemented_set
 #define _lv_converting_get prop_not_implemented_get
+#define _lv_resync_pending_set prop_not_implemented_set
+#define _lv_resync_pending_get prop_not_implemented_get
 #define _lv_permissions_set prop_not_implemented_set
 #define _lv_permissions_get prop_not_implemented_get
 #define _lv_allocation_policy_set prop_not_implemented_set

@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2002-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004-2019 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2026 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -3854,6 +3854,17 @@ static int _lvconverting_disp(struct dm_report *rh, struct dm_pool *mem,
 	int converting = lv_is_converting((const struct logical_volume *) data);
 
 	return _binary_disp(rh, mem, field, converting, "converting", private);
+}
+
+static int _lvresyncpending_disp(struct dm_report *rh, struct dm_pool *mem,
+				 struct dm_report_field *field,
+				 const void *data, void *private)
+{
+	const struct logical_volume *lv = (const struct logical_volume *) data;
+	int resync_pending = (lv->status & LV_RESYNC) ? 1 : 0;
+
+	return _binary_disp(rh, mem, field, resync_pending,
+			    GET_FIRST_RESERVED_NAME(lv_resync_pending_y), private);
 }
 
 static int _lvpermissions_disp(struct dm_report *rh, struct dm_pool *mem,

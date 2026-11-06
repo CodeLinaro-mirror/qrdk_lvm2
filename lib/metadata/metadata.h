@@ -56,7 +56,7 @@
 /* May any free extents on this PV be used or must they be left free? */
 
 //#define VIRTUAL			UINT64_C(0x00010000)	/* LV - internal use only */
-#define PRECOMMITTED		UINT64_C(0x00200000)	/* VG - internal use only */
+#define PRECOMMITTED		UINT64_C(0x00200000)	/* VG - internal use only, also LV_RESYNC */
 
 /*
  * Not real flags, reserved for temporary use inside _lv_postorder_visit().
