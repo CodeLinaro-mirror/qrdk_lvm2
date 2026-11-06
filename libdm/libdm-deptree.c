@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2005-2017 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2005-2026 Red Hat, Inc. All rights reserved.
  *
  * This file is part of the device-mapper userspace tools.
  *
@@ -3850,32 +3850,24 @@ int dm_tree_node_add_raid_target_with_params(struct dm_tree_node *node,
 					     uint64_t size,
 					     const struct dm_tree_node_raid_params *p)
 {
-	unsigned i;
-	struct load_segment *seg = NULL;
+	/* Version 1 carries only the first 64 legs. */
+	struct dm_tree_node_raid_params_v2 params = {
+		.raid_type = p->raid_type,
+		.stripes = p->stripes,
+		.mirrors = p->mirrors,
+		.region_size = p->region_size,
+		.stripe_size = p->stripe_size,
+		.rebuilds = { p->rebuilds },
+		.writemostly = { p->writemostly },
+		.writebehind = p->writebehind,
+		.sync_daemon_sleep = p->sync_daemon_sleep,
+		.max_recovery_rate = p->max_recovery_rate,
+		.min_recovery_rate = p->min_recovery_rate,
+		.stripe_cache = p->stripe_cache,
+		.flags = p->flags
+	};
 
-	for (i = 0; i < DM_ARRAY_SIZE(_dm_segtypes) && !seg; ++i)
-		if (!strcmp(p->raid_type, _dm_segtypes[i].target))
-			if (!(seg = _add_segment(node,
-						 _dm_segtypes[i].type, size)))
-				return_0;
-	if (!seg) {
-		log_error("Unsupported raid type %s.", p->raid_type);
-		return 0;
-	}
-
-	seg->region_size = p->region_size;
-	seg->stripe_size = p->stripe_size;
-	seg->area_count = 0;
-	memset(seg->rebuilds, 0, sizeof(seg->rebuilds));
-	seg->rebuilds[0] = p->rebuilds;
-	memset(seg->writemostly, 0, sizeof(seg->writemostly));
-	seg->writemostly[0] = p->writemostly;
-	seg->writebehind = p->writebehind;
-	seg->min_recovery_rate = p->min_recovery_rate;
-	seg->max_recovery_rate = p->max_recovery_rate;
-	seg->flags = p->flags;
-
-	return 1;
+	return dm_tree_node_add_raid_target_with_params_v2(node, size, &params);
 }
 
 int dm_tree_node_add_raid_target(struct dm_tree_node *node,
@@ -3886,15 +3878,15 @@ int dm_tree_node_add_raid_target(struct dm_tree_node *node,
 				 uint64_t rebuilds,
 				 uint64_t flags)
 {
-	struct dm_tree_node_raid_params params = {
+	struct dm_tree_node_raid_params_v2 params = {
 		.raid_type = raid_type,
 		.region_size = region_size,
 		.stripe_size = stripe_size,
-		.rebuilds = rebuilds,
+		.rebuilds = { rebuilds },
 		.flags = flags
 	};
 
-	return dm_tree_node_add_raid_target_with_params(node, size, &params);
+	return dm_tree_node_add_raid_target_with_params_v2(node, size, &params);
 }
 
 /*
