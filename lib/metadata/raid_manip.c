@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011-2017 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2011-2026 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -582,6 +582,329 @@ static int _raid_in_sync(const struct logical_volume *lv)
 int lv_raid_in_sync(const struct logical_volume *lv)
 {
 	return _raid_in_sync(lv);
+}
+
+/* The kernel is rebuilding or recovering a leg of the array. */
+static int _raid_sync_action_is_recovery(const char *sync_action)
+{
+	return sync_action &&
+	       (!strcmp(sync_action, "rebuild") || !strcmp(sync_action, "recover"));
+}
+
+/* Resizable: every leg alive and neither a rebuild nor a recovery running. */
+static int _raid_status_is_resizable(const struct lv_status_raid *status)
+{
+	const struct dm_status_raid *raid = status->raid;
+	uint32_t s;
+
+	for (s = 0; s < raid->dev_count; s++)
+		if (raid->dev_health[s] != 'A' && raid->dev_health[s] != 'a')
+			return 0;
+
+	return !_raid_sync_action_is_recovery(raid->sync_action);
+}
+
+/*
+ * Require a healthy active array before resizing or resynchronizing a
+ * RAID LV.
+ *
+ * A resize cannot wait for a rebuild or a recovery that is still
+ * running, so it refuses; synchronizing the array's own legs is fine.
+ * A table load may postpone a pending resync instead and serve it
+ * later, see lv_raid_has_pending_rebuild().
+ */
+int lv_raid_can_resize_or_resync(const struct logical_volume *lv)
+{
+	struct lv_segment *seg = first_seg(lv);
+	struct lv_status_raid *status;
+	struct dm_status_raid *raid;
+	enum raid_read_result read_result;
+	uint32_t s;
+	int r = 0;
+
+	if (!lv_is_active(lv)) {
+		log_error("Cannot resize or resynchronize inactive RAID LV %s; activate it first.",
+			  display_lvname(lv));
+		return 0;
+	}
+
+	if (lv_is_partial(lv)) {
+		log_error("Cannot resize or resynchronize partial RAID LV %s.", display_lvname(lv));
+		return 0;
+	}
+
+	for (s = 0; s < seg->area_count; s++) {
+		if (seg_type(seg, s) != AREA_LV || !seg_lv(seg, s)) {
+			log_error("Cannot determine RAID health of %s.", display_lvname(lv));
+			return 0;
+		}
+		/*
+		 * Only the image flag is passed to dm-raid as a rebuild
+		 * request.  The kernel may still report the array idle, so
+		 * name the request instead of the state it will produce.
+		 */
+		if (seg_lv(seg, s)->status & LV_REBUILD) {
+			log_error("Cannot resize or resynchronize RAID LV %s while a rebuild is pending.",
+				  display_lvname(lv));
+			return 0;
+		}
+	}
+
+	/*
+	 * One stable snapshot: the retry waits out the 0% in-sync a target
+	 * may report right after a reload with every leg already in sync,
+	 * so a transient is not mistaken for a degraded array.
+	 */
+	read_result = _raid_status_read_stable(lv, seg->area_count, &status);
+	if (read_result != RAID_READ_OK) {
+		if (read_result == RAID_READ_STUCK)
+			return_0;
+
+		/* RAID_READ_ERROR */
+		log_error("Cannot determine RAID status of %s.", display_lvname(lv));
+		return 0;
+	}
+
+	raid = status->raid;
+	if (!raid->sync_action || !raid->dev_health ||
+	    raid->advertised_dev_count != seg->area_count ||
+	    raid->dev_count != seg->area_count) {
+		log_error("Cannot determine RAID health of %s.", display_lvname(lv));
+		goto out;
+	}
+
+	/*
+	 * Only a healthy array can be resized or resynchronized: every leg
+	 * is alive and none is being rebuilt or recovered.  A resync, a
+	 * check or a repair rewrites the array's own data, so it does not
+	 * stand in the way.
+	 */
+	if (!(r = _raid_status_is_resizable(status)))
+		log_error("Cannot resize or resynchronize RAID LV %s while it is recovering or degraded.",
+			  display_lvname(lv));
+out:
+	dm_pool_destroy(status->mem);
+	return r;
+}
+
+/*
+ * Return 1 when the dm-raid target cannot synchronize the new space of a
+ * extended set, so the following table load has to resynchronize the whole
+ * LV.  A target whose features cannot be queried answers 1 as well: the
+ * resync is then attempted instead of silently skipped.  The extend path
+ * evaluates this twice, so it does not log; the user is warned there.
+ */
+int lv_raid_extend_needs_resync(const struct logical_volume *lv)
+{
+	unsigned attrs = 0;
+	const struct segment_type *segtype;
+
+	if (!lv_is_raid(lv) || seg_is_any_raid0(first_seg(lv)) ||
+	    lv_is_not_synced(lv))
+		return 0;
+
+	segtype = first_seg(lv)->segtype;
+	if (!segtype->ops->target_present ||
+	    !segtype->ops->target_present(lv->vg->cmd, NULL, &attrs))
+		return 1;
+
+	return !(attrs & RAID_FEATURE_EXTEND_RESYNC);
+}
+
+/*
+ * Two requests tell dm-raid that an array is not trustworthy, and they
+ * are not interchangeable.  Both describe the table that is about to be
+ * loaded; neither is a report of a running operation.
+ *
+ * LV_REBUILD is set on the image (and meta) LVs of one leg whose content
+ * was lost, as lv_raid_replace() does for the leg it puts in place.  It
+ * becomes the "rebuild <devs>" table argument, so md copies those legs
+ * from the remaining, trusted ones, and the rest of the array stays as
+ * it is.
+ *
+ * LV_RESYNC is set on the RAID LV itself when every leg is in place but
+ * the array as a whole may be inconsistent, as after extending it on a
+ * target that does not synchronize the new space.  It becomes the "sync"
+ * table argument: dm-raid loads no md superblock and initializes the
+ * array again, regenerating its redundancy from the data areas it finds.
+ * It carries no notion of a trustworthy leg, so it cannot repair a known
+ * bad one, and it is not sent together with "rebuild" (the kernel
+ * rejects that pair) or with a reshape (the skipped superblock load
+ * would discard the reshape state).  A load that rebuilds a leg
+ * therefore leaves the request for the load that follows the rebuild.
+ */
+void lv_raid_set_resync_on_extend(struct logical_volume *lv)
+{
+	if (lv_raid_extend_needs_resync(lv))
+		lv->status |= LV_RESYNC;
+}
+
+struct lv_status_lookup {
+	uint64_t mask;
+	int found;
+};
+
+static int _lv_has_status(struct logical_volume *slv, void *data)
+{
+	struct lv_status_lookup *lookup = data;
+
+	if (slv->status & lookup->mask)
+		lookup->found = 1;
+
+	return 1;
+}
+
+/* Check whether any status flag in @mask is set on @lv or on an LV below it. */
+static int _lv_status_found(const struct logical_volume *lv, uint64_t mask)
+{
+	struct lv_status_lookup lookup = { .mask = mask };
+
+	if (lv->status & mask)
+		return 1;
+
+	/*
+	 * A failed walk cannot rule the flag out, so answer 1: a health
+	 * gate then postpones the operation instead of clearing a request
+	 * it cannot see, as the walk in lv_raid_has_pending_rebuild() does.
+	 */
+	if (!for_each_sub_lv((struct logical_volume *) lv, _lv_has_status, &lookup))
+		return 1;
+
+	return lookup.found;
+}
+
+/* Check whether @lv or an LV below it still waits for a full resync. */
+int lv_raid_has_pending_resync(const struct logical_volume *lv)
+{
+	return _lv_status_found(lv, LV_RESYNC);
+}
+
+/*
+ * Return 1 while the kernel is rebuilding or recovering a leg of @lv.
+ * A repair clears LV_REBUILD from the metadata before its final load, so
+ * the live table is the only source for the rebuild it still runs.  An
+ * active RAID LV whose status cannot be read answers 1: the request must
+ * not be cleared on missing evidence.
+ */
+static int _raid_recovery_running(const struct logical_volume *lv)
+{
+	struct lv_status_raid *status;
+	int running = 0;
+
+	if (!lv_is_raid(lv) || !lv_is_active(lv))
+		return 0;
+
+	if (!lv_raid_status(lv, &status)) {
+		log_verbose("Cannot read the status of %s; keeping the resync pending.",
+			    display_lvname(lv));
+		return 1;
+	}
+
+	if (status->raid &&
+	    _raid_sync_action_is_recovery(status->raid->sync_action))
+		running = 1;
+
+	dm_pool_destroy(status->mem);
+	return running;
+}
+
+static int _recovery_running_lv(struct logical_volume *slv, void *data)
+{
+	int *running = data;
+
+	if (_raid_recovery_running(slv))
+		*running = 1;
+
+	return 1;
+}
+
+/*
+ * Return 1 when @lv or an LV below it has to finish a rebuild before a
+ * load can carry a pending full resync: a leg is still marked for a
+ * rebuild in the metadata, the LV is partial because a repair is
+ * replacing a leg, or the kernel is rebuilding or recovering one.  The
+ * request then waits for the load that follows the rebuild, so a load
+ * that returns success does not mean the request was served.
+ *
+ * The request and the RAID LV that serves it are not always the LV the
+ * command names: a thin pool keeps it on its data LV, which is why both
+ * halves walk the tree.  Asking the named LV for a dm-raid status would
+ * report a type mismatch instead of the rebuild it runs.
+ */
+int lv_raid_has_pending_rebuild(const struct logical_volume *lv)
+{
+	int running = 0;
+
+	if (_lv_status_found(lv, LV_REBUILD))
+		return 1;
+
+	/* A partial LV is being repaired, and that repair cannot wait. */
+	if (lv_is_partial(lv))
+		return 1;
+
+	if (_raid_recovery_running(lv))
+		return 1;
+
+	/* The walk only reads @lv, but for_each_sub_lv() has no const form. */
+	if (!for_each_sub_lv((struct logical_volume *) lv, _recovery_running_lv, &running))
+		return 1;
+
+	return running;
+}
+
+/*
+ * Clear the one-shot resync request from @lv and the LVs below it.  The
+ * caller must know that a table load served the request; a load that was
+ * not carried out, or that had to postpone the request, keeps it.  An LV
+ * outside the loaded tree keeps the request for its next activation.
+ */
+static int _clear_pending_resync_lv(struct logical_volume *slv, void *data)
+{
+	int *changed = data;
+
+	if (!(slv->status & LV_RESYNC))
+		return 1;
+
+	slv->status &= ~LV_RESYNC;
+	*changed = 1;
+	return 1;
+}
+
+int lv_raid_clear_pending_resync(struct logical_volume *lv)
+{
+	int changed = 0;
+
+	/* for_each_sub_lv() visits the LVs below @lv, not @lv itself. */
+	if (!_clear_pending_resync_lv(lv, &changed) ||
+	    !for_each_sub_lv(lv, _clear_pending_resync_lv, &changed))
+		return_0;
+
+	if (changed && (!vg_write(lv->vg) || !vg_commit(lv->vg)))
+		return_0;
+
+	return 1;
+}
+
+/*
+ * Retire the pending resynchronization after a table load.  A load that
+ * rebuilds a leg or waits for a recovery could not carry the request, and
+ * an inactive LV was not loaded at all, so a successful load does not by
+ * itself mean the request was served.  Keep it pending for the load that
+ * follows; leaving the flag behind is safe: it is replayed on every
+ * activation.
+ */
+int lv_raid_clear_resync_after_load(struct logical_volume *lv)
+{
+	if (!lv_raid_has_pending_resync(lv))
+		return 1;
+
+	if (!lv_is_active(lv) || lv_raid_has_pending_rebuild(lv)) {
+		log_verbose("Keeping the pending resynchronization of %s for the next load.",
+			    display_lvname(lv));
+		return 1;
+	}
+
+	return lv_raid_clear_pending_resync(lv);
 }
 
 /*
@@ -3275,8 +3598,7 @@ static int _extract_image_components(struct lv_segment *seg, uint32_t idx,
  */
 static int _raid_sync_action_allows_image_change(const char *sync_action)
 {
-	return !strcmp(sync_action, "recover") ||
-	       !strcmp(sync_action, "rebuild") ||
+	return _raid_sync_action_is_recovery(sync_action) ||
 	       !strcmp(sync_action, "idle");
 }
 
@@ -3664,8 +3986,7 @@ static int _raid_recovering_images_rebuild_work(struct logical_volume *lv,
 		goto bad;
 	}
 
-	if (!strcmp(raid->sync_action, "recover") ||
-	    !strcmp(raid->sync_action, "rebuild")) {
+	if (_raid_sync_action_is_recovery(raid->sync_action)) {
 		for (s = 0; s < seg->area_count; s++) {
 			if (raid->dev_health[s] !=
 			    RAID_DEV_HEALTH_ALIVE_NOT_IN_SYNC)
@@ -7006,6 +7327,13 @@ static int _region_size_change_requested(struct logical_volume *lv, int yes, con
 	/* CLI validation provides the check but be cautious... */
 	if (!lv_is_raid(lv) || !seg || seg_is_any_raid0(seg)) {
 		log_error(INTERNAL_ERROR "Cannot change region size of %s.",
+			  display_lvname(lv));
+		return 0;
+	}
+
+	/* Not combined with a pending full resync. */
+	if (lv->status & LV_RESYNC) {
+		log_error("Cannot change region size of %s with a pending resynchronization.",
 			  display_lvname(lv));
 		return 0;
 	}

@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2001-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004-2017 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2026 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -348,6 +348,17 @@ struct segment_type *init_unknown_segtype(struct cmd_context *cmd,
  * from user space; not worth the complexity.
  */
 #define RAID_FEATURE_REBUILD_KEEPS_RECOVERY	(1U << 8) /* version 1.14.0 */
+/*
+ * RAID_FEATURE_EXTEND_RESYNC
+ * dm-raid reliably synchronizes the new space of an extended raid set.
+ * Before 1.9.0 (upstream kernel commit 4dff2f1e26f2) it never does; up to
+ * 1.14.0 it silently skips the synchronization when the MD bitmap needs
+ * additional pages (upstream kernel commit 99273d9e6e19, version 1.15.0).
+ *
+ * Without this bit an extension of an active LV requests a complete
+ * synchronization instead.
+ */
+#define RAID_FEATURE_EXTEND_RESYNC		(1U << 9) /* version 1.15.0 */
 
 bool raid_is_available(const struct logical_volume *lv);
 #ifdef RAID_INTERNAL

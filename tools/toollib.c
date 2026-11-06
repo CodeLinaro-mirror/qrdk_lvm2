@@ -747,12 +747,95 @@ int vgcreate_params_set_from_args(struct cmd_context *cmd,
 	return 1;
 }
 
+enum resync_write {
+	RESYNC_WRITE_ERROR = -1,	/* cannot proceed */
+	RESYNC_WRITE_SKIP = 0,		/* leave the request to a later command */
+	RESYNC_WRITE_CLEAR = 1,		/* lock taken, clear after a successful load */
+	RESYNC_WRITE_CLEAR_ACTIVE = 2,	/* likewise, but the LV is already active */
+};
+
+/*
+ * A pending full resync is cleared by a metadata write once a table using
+ * it has been loaded, so the VG has to be writable before the load takes
+ * place.  Take the VG lock and report whether the request can be cleared
+ * afterwards, has to be left for a later command, or cannot be handled.
+ * The request can sit on a hidden LV of the tree, as it does on the data
+ * LV of a thin pool, so the tree of @lv is checked, not the whole VG.
+ */
+static enum resync_write _prepare_resync_write(struct cmd_context *cmd,
+					       struct logical_volume *lv)
+{
+	struct volume_group *vg = lv->vg;
+
+	if (!lv_raid_has_pending_resync(lv))
+		return RESYNC_WRITE_SKIP;
+
+	/*
+	 * A load that rebuilds a leg cannot carry the resync as well, so
+	 * the loader leaves the request for the load that follows the
+	 * rebuild.  Leave it here too, or a successful load would clear a
+	 * request that was never served.
+	 */
+	if (lv_raid_has_pending_rebuild(lv)) {
+		log_verbose("Waiting for the rebuild of %s before retiring its resynchronization.",
+			    display_lvname(lv));
+		return RESYNC_WRITE_SKIP;
+	}
+
+	/* Don't want pvscan to write VG while running from systemd service. */
+	if (!strcmp(cmd->name, "pvscan")) {
+		log_verbose("Not clearing pending RAID resynchronization of %s from pvscan.",
+			    display_lvname(lv));
+		return RESYNC_WRITE_SKIP;
+	}
+
+	if (cmd->metadata_read_only) {
+		log_warn("WARNING: Not clearing pending RAID resynchronization of %s with read-only metadata.",
+			 display_lvname(lv));
+		return RESYNC_WRITE_SKIP;
+	}
+
+	if (vg->status & PARTIAL_VG) {
+		log_verbose("Not clearing pending RAID resynchronization of %s in a partial VG.",
+			    display_lvname(lv));
+		return RESYNC_WRITE_SKIP;
+	}
+
+	if (vg_is_shared(vg)) {
+		struct lockd_state lks = {0};
+		if (!lockd_vg(cmd, vg->name, "ex", 0, &lks)) {
+			log_error("Cannot lock VG %s to clear a pending RAID resynchronization.",
+				  vg->name);
+			return RESYNC_WRITE_ERROR;
+		}
+	}
+
+	/*
+	 * An already running LV is not reloaded by an activation, so record
+	 * that state here: the caller decides whether to clear the request
+	 * after a load or to ask for a refresh.
+	 */
+	if (lv_is_active(lv))
+		return RESYNC_WRITE_CLEAR_ACTIVE;
+
+	return RESYNC_WRITE_CLEAR;
+}
+
+/* Clear the request from the tree that was just loaded. */
+static void _clear_resync(struct logical_volume *lv)
+{
+	if (!lv_raid_clear_pending_resync(lv))
+		log_warn("WARNING: Failed to clear pending RAID resynchronization of %s.",
+			 display_lvname(lv));
+}
+
 /* Shared code for changing activation state for vgchange/lvchange */
 int lv_change_activate(struct cmd_context *cmd, struct logical_volume *lv,
 		       activation_change_t activate)
 {
 	int r = 1;
 	int integrity_recalculate;
+	enum resync_write resync_write = RESYNC_WRITE_SKIP;
 	struct logical_volume *snapshot_lv;
 
 	if (lv_is_cache_pool(lv)) {
@@ -842,8 +925,26 @@ int lv_change_activate(struct cmd_context *cmd, struct logical_volume *lv,
 		}
 	}
 
+	if (is_change_activating(activate)) {
+		resync_write = _prepare_resync_write(cmd, lv);
+		if (resync_write == RESYNC_WRITE_ERROR)
+			return_0;
+	}
+
 	if (!lv_active_change(cmd, lv, activate))
 		return_0;
+
+	/*
+	 * A pending full resync is cleared only once a table using it has
+	 * been loaded, which needs a metadata write.  The VG lock was taken
+	 * before activation for that reason.  Activation of a running LV
+	 * does not reload it, so that state waits for a refresh.
+	 */
+	if (resync_write == RESYNC_WRITE_CLEAR_ACTIVE)
+		log_warn("WARNING: Pending resynchronization of %s needs \"lvchange --refresh\".",
+			 display_lvname(lv));
+	else if (resync_write == RESYNC_WRITE_CLEAR && lv_is_active(lv))
+		_clear_resync(lv);
 
 	/* Write VG metadata to clear the integrity recalculate flag. */
 	if (integrity_recalculate && lv_is_active(lv)) {
@@ -881,6 +982,12 @@ int lv_change_activate(struct cmd_context *cmd, struct logical_volume *lv,
 int lv_refresh(struct cmd_context *cmd, struct logical_volume *lv)
 {
 	struct logical_volume *snapshot_lv;
+	enum resync_write resync_write;
+
+	/* Refreshing replays a pending full resync and clears it. */
+	resync_write = _prepare_resync_write(cmd, lv);
+	if (resync_write == RESYNC_WRITE_ERROR)
+		return_0;
 
 	if (lv_is_merging_origin(lv)) {
 		snapshot_lv = find_snapshot(lv)->lv;
@@ -892,6 +999,10 @@ int lv_refresh(struct cmd_context *cmd, struct logical_volume *lv)
 
 	if (!lv_refresh_suspend_resume(lv))
 		return_0;
+
+	/* Refresh is a successful no-op when the LV is inactive. */
+	if (resync_write == RESYNC_WRITE_CLEAR_ACTIVE)
+		_clear_resync(lv);
 
 	/*
 	 * check if snapshot merge should be polled

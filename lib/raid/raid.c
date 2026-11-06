@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2011-2017 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2011-2026 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -304,12 +304,117 @@ static int _raid_target_present(struct cmd_context *cmd,
 				const struct lv_segment *seg __attribute__((unused)),
 				unsigned *attributes);
 
+/* Check that the running table is one raid target covering the device. */
+static int _raid_live_table_has_size(const struct dm_info *info, uint64_t size)
+{
+	struct dm_task *dmt;
+	uint64_t start, length;
+	char *type = NULL, *params = NULL;
+	void *next;
+	int one_target, whole_device;
+	int r = 0;
+
+	if (!(dmt = dm_task_create(DM_DEVICE_TABLE)))
+		return_0;
+	if (!dm_task_set_major(dmt, info->major) || !dm_task_set_minor(dmt, info->minor) ||
+	    !dm_task_no_flush(dmt) || !dm_task_run(dmt))
+		goto_out;
+
+	next = dm_get_next_target(dmt, NULL, &start, &length, &type, &params);
+	one_target = !next && type && !strcmp(type, TARGET_NAME_RAID);
+	whole_device = !start && length == size;
+	if (one_target && whole_device)
+		r = 1;
+out:
+	dm_task_destroy(dmt);
+	return r;
+}
+
+enum raid_resync {
+	RAID_RESYNC_ERROR = -1,		/* the table must not be loaded */
+	RAID_RESYNC_NONE = 0,		/* the table needs no sync argument */
+	RAID_RESYNC_SYNC = 1,		/* load the table with sync */
+};
+
+/*
+ * Decide whether the table being loaded has to carry the pending full
+ * resync, or why it must not be loaded at all.
+ */
+static enum raid_resync _raid_table_resync(struct lv_segment *seg,
+					   struct dm_tree_node *node,
+					   const struct lv_activate_opts *laopts,
+					   uint64_t len, int reshape)
+{
+	const struct dm_info *info;
+
+	if (lv_is_not_synced(seg->lv) || reshape) {
+		log_error("Cannot resynchronize %s with nosync or reshape.",
+			  display_lvname(seg->lv));
+		return RAID_RESYNC_ERROR;
+	}
+
+	/*
+	 * The kernel rejects "sync" together with "rebuild", and a rebuild
+	 * regenerates its legs from the remaining ones.  Postpone the full
+	 * resync to the load that follows the repair instead of refusing
+	 * this one: the request may have been committed by an interrupted
+	 * extend, and refusing would leave the array impossible to activate
+	 * or repair.
+	 */
+	if (lv_raid_has_pending_rebuild(seg->lv))
+		return RAID_RESYNC_NONE;
+
+	info = dm_tree_node_get_info(node);
+
+	/*
+	 * Activating a stopped array: its health cannot be queried, so let
+	 * the kernel resynchronize the whole set.  A set with a missing leg
+	 * is partial, and a load that could not carry the resync was
+	 * deferred above.
+	 */
+	if (!info->exists)
+		return RAID_RESYNC_SYNC;
+
+	/*
+	 * A RAID child can already have been resumed during its parent's
+	 * preload; its table is live, so only check that it is the one this
+	 * load would build.
+	 */
+	if (laopts->resuming && !info->inactive_table) {
+		if (!_raid_live_table_has_size(info, len)) {
+			log_error("Cannot verify preloaded RAID table for %s.",
+				  display_lvname(seg->lv));
+			return RAID_RESYNC_ERROR;
+		}
+		return RAID_RESYNC_NONE;
+	}
+
+	if (!laopts->resuming) {
+		if (info->suspended) {
+			log_error("Cannot check suspended RAID LV %s before resynchronization.",
+				  display_lvname(seg->lv));
+			return RAID_RESYNC_ERROR;
+		}
+		if (info->inactive_table) {
+			log_error("Cannot resynchronize %s with a pending table.",
+				  display_lvname(seg->lv));
+			return RAID_RESYNC_ERROR;
+		}
+		if (!lv_raid_can_resize_or_resync(seg->lv)) {
+			stack;
+			return RAID_RESYNC_ERROR;
+		}
+	}
+
+	return RAID_RESYNC_SYNC;
+}
+
 static int _raid_add_target_line(struct dev_manager *dm,
 				 struct dm_pool *mem __attribute__((unused)),
 				 struct cmd_context *cmd,
 				 void **target_state __attribute__((unused)),
 				 struct lv_segment *seg,
-				 const struct lv_activate_opts *laopts __attribute__((unused)),
+				 const struct lv_activate_opts *laopts,
 				 struct dm_tree_node *node, uint64_t len,
 				 uint32_t *pvmove_mirror_count __attribute__((unused)))
 {
@@ -378,7 +483,17 @@ static int _raid_add_target_line(struct dev_manager *dm,
 
 		data_offset = seg->data_offset;
 
-		if (mirror_in_sync())
+		if (seg->lv->status & LV_RESYNC) {
+			enum raid_resync resync;
+			int reshape = delta_disks ||
+				      (seg->lv->status & (LV_RESHAPE | LV_RESHAPE_DATA_OFFSET));
+
+			resync = _raid_table_resync(seg, node, laopts, len, reshape);
+			if (resync == RAID_RESYNC_ERROR)
+				return_0;
+			if (resync == RAID_RESYNC_SYNC)
+				flags = DM_FORCESYNC;
+		} else if (mirror_in_sync())
 			flags = DM_NOSYNC;
 	}
 
@@ -531,6 +646,7 @@ static int _raid_target_present(struct cmd_context *cmd,
 		{ 1, 9, 2, RAID_FEATURE_FIXED_HEALTH_CHARS, "fixedhealthchars" },
 		{ 1, 12, 0, RAID_FEATURE_RESHAPE, "reshaping" },
 		{ 1, 14, 0, RAID_FEATURE_REBUILD_KEEPS_RECOVERY, "rebuildkeepsrecovery" },
+		{ 1, 15, 0, RAID_FEATURE_EXTEND_RESYNC, "extendresync" },
 	};
 
 	static int _raid_checked = 0;

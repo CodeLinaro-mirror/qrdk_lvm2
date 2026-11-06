@@ -6001,7 +6001,7 @@ static int _lv_resize_check_cow_reduce(struct logical_volume *lv,
 	 */
 	if ((r = lv_snapshot_status(lv, 1, &snap_status))) {
 		/* merge_failed cannot occur here: merging snapshots are
-		 *   rejected earlier in _lv_resize_check_type(); kept as
+		 *   rejected earlier in _lv_resize_check_and_confirm_type(); kept as
 		 *   a defensive check.
 		 * overflow mode is currently not supported by lvm2
 		 *   kept as a defensive check. */
@@ -6024,8 +6024,8 @@ static int _lv_resize_check_cow_reduce(struct logical_volume *lv,
 	return r;
 }
 
-static int _lv_resize_check_type(struct logical_volume *lv,
-				 struct lvresize_params *lp)
+static int _lv_resize_check_and_confirm_type(struct logical_volume *lv,
+					     struct lvresize_params *lp)
 {
 	struct lv_segment *seg;
 
@@ -6106,6 +6106,37 @@ static int _lv_resize_check_type(struct logical_volume *lv,
 		    !_lv_resize_check_cow_reduce(lv, (uint64_t)lp->extents * lv->vg->extent_size))
 			return_0;
 	} else if (lp->resize == LV_EXTEND)  {
+		int extending = lp->extents > lv->le_count;
+
+		/*
+		 * A stopped array has no table to replace: the extend only
+		 * commits the new size, and a resync its target may need is
+		 * served by the activation that follows, which lets the
+		 * kernel synchronize a set whose health cannot be queried.
+		 * Only a running array is checked before its table changes.
+		 */
+		if (extending && lv_is_raid(lv) && !seg_is_any_raid0(seg) &&
+		    lv_is_active(lv) && !lv_raid_can_resize_or_resync(lv))
+			return_0;
+
+		/*
+		 * Without --nosync the new space has to be synchronized by
+		 * the following table load when the target cannot do it
+		 * itself.  That resynchronizes the whole LV and rewrites
+		 * all legs from the array's own data without comparing
+		 * them, so let the user decide whether to pay for it.
+		 */
+		if (extending && lv_raid_extend_needs_resync(lv)) {
+			log_warn("WARNING: The RAID target does not synchronize the new space of %s.",
+				 display_lvname(lv));
+			log_warn("WARNING: The whole LV will be resynchronized, which rewrites");
+			log_warn("WARNING: all RAID legs from the array's own data.");
+			if (!lp->yes && yes_no_prompt("Continue with a full resynchronization? [y/n]: ") == 'n') {
+				log_error("Logical volume %s not extended.", display_lvname(lv));
+				return 0;
+			}
+		}
+
 		if (lv_is_thin_pool_metadata(lv) &&
 		    (!(seg = find_pool_seg(first_seg(lv))) ||
 		     !thin_pool_feature_supported(seg->lv, THIN_FEATURE_METADATA_RESIZE))) {
@@ -6172,6 +6203,8 @@ static int _lv_resize_volume(struct logical_volume *lv,
 			       lp->extents - lv->le_count,
 			       pvh, alloc, lp->approx_alloc))
 			return_0;
+		if ((lv->le_count > old_extents) && lv_is_raid(lv))
+			lv_raid_set_resync_on_extend(lv);
 	}
 
 	if (old_extents == lv->le_count)
@@ -7134,7 +7167,7 @@ int lv_resize(struct cmd_context *cmd, struct logical_volume *lv,
 		is_extend = (lp->resize == LV_EXTEND);
 		is_reduce = (lp->resize == LV_REDUCE);
 
-		if (!_lv_resize_check_type(lv_main, lp))
+		if (!_lv_resize_check_and_confirm_type(lv_main, lp))
 			return_0;
 	}
 
@@ -7179,8 +7212,8 @@ int lv_resize(struct cmd_context *cmd, struct logical_volume *lv,
 		if (lp_meta.extents == 0)
 			return_0;
 		/* adjust_size resolves lp_meta.resize to EXTEND|REDUCE */
-		/* _lv_resize_check_type errors if resize is EXTEND for thin meta */
-		if (!_lv_resize_check_type(lv_meta, &lp_meta))
+		/* _lv_resize_check_and_confirm_type errors if resize is EXTEND for thin meta */
+		if (!_lv_resize_check_and_confirm_type(lv_meta, &lp_meta))
 			return_0;
 	}
 
@@ -7398,6 +7431,8 @@ int lv_resize(struct cmd_context *cmd, struct logical_volume *lv,
 		stack;
 	if (!lv_update_and_reload(lv_top))
 		goto_out;
+	if (!lv_raid_clear_resync_after_load(lv_meta))
+		goto_out;
 	log_debug("Resized thin pool metadata %s to %u extents.", display_lvname(lv_meta), lp_meta.extents);
 
  do_main:
@@ -7422,6 +7457,8 @@ int lv_resize(struct cmd_context *cmd, struct logical_volume *lv,
 		 * of such operation thus it's valid to 'lvresize -f -Lsamesize vg/lv' */
 	} else {
 		if (!lv_update_and_reload(lv_top))
+			goto_out;
+		if (!lv_raid_clear_resync_after_load(lv_main))
 			goto_out;
 		log_debug("Resized %s to %u extents.", display_lvname(lv_main), lp->extents);
 	}
