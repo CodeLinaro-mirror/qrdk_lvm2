@@ -1041,7 +1041,7 @@ int dm_task_set_read_ahead(struct dm_task *dmt, uint32_t read_ahead,
 
 int dm_task_suppress_identical_reload(struct dm_task *dmt)
 {
-	dmt->suppress_identical_reload = 1;
+	dmt->reload_policy = DM_RELOAD_COMPARE_SKIP_IDENTICAL;
 	return 1;
 }
 
@@ -1862,6 +1862,11 @@ uint64_t dm_task_get_existing_table_size(const struct dm_task *dmt)
 	return dmt->existing_table_size;
 }
 
+int dm_task_get_existing_table_identical(const struct dm_task *dmt)
+{
+	return dmt->existing_table_identical;
+}
+
 /*
  * Skip "rebuild N" or "write_mostly N" token pair.
  * Old dm-raid may drop these from table output.
@@ -1888,11 +1893,12 @@ static int _skip_raid_volatile_token(const char **pp)
 }
 
 /*
- * Skip optional "sync" or "nosync" flag token in the active table.
- * External tools (dmsetup) may inject these to force a resync and the
- * kernel keeps reporting the token in STATUSTYPE_TABLE afterwards, while
- * LVM metadata does not.  Dropping it via reload is rejected with EINVAL,
- * so the token is ignored when comparing against the active table only.
+ * Skip an optional "sync" or "nosync" flag token.
+ * The kernel keeps reporting the token in STATUSTYPE_TABLE after the
+ * resync it started, while the metadata may already have dropped it, so
+ * the two tables can differ by the token alone.  Reloading a table that
+ * drops it while the resync is running is rejected with EINVAL, so the
+ * token is treated as not part of the table identity.
  */
 static int _skip_raid_sync_flag(const char **pp)
 {
@@ -1927,17 +1933,19 @@ static int _skip_raid_sync_flag(const char **pp)
  * mismatches that defeat reload suppression.  We skip the param
  * count and ignore volatile "rebuild N" / "write_mostly N" pairs.
  *
- * "sync" / "nosync" may also differ: an externally forced resync
- * leaves the token in the active table only, so it is skipped there.
- * The new table (p1) is never skipped -- a sync/nosync it carries is
- * a deliberate force/avoid-resync request and must trigger a reload.
+ * "sync" / "nosync" are one-shot arguments, not table state: the kernel
+ * keeps the token in the active table after a forced resync, so the two
+ * sides can differ even when the tables are otherwise the same.  Both
+ * sides are ignored here; a sync the new table asks for is still loaded,
+ * because DM_FORCESYNC sets reload_required, and nosync is a creation-time
+ * hint that the initial load already delivered.
  *
  * The 'suspended' flag gates which side gets the volatile skip.
  * Do not simplify this to always-symmetric or always-asymmetric.
  * When NOT suspended, skip only in p2 -- a rebuild in p1 is a
  * deliberate request that must trigger a reload.  When suspended,
  * skip in both p1 and p2 -- LVM is in the second preload pass
- * (the first already loaded the rebuild table via force_reload),
+ * (the first already loaded the rebuild table via a forced reload),
  * the active table is stale, and a redundant reload here would
  * hit "Internal error: table load while devices are suspended".
  */
@@ -1971,9 +1979,12 @@ static int _raid_params_equiv(const char *p1, const char *p2,
 
 	for (;;) {
 		/*
-		 * Stale sync/nosync from an externally forced resync only
-		 * appears in the active table; never skip the new table.
+		 * A one-shot sync or nosync token is not part of the table
+		 * identity; ignore it on both sides.  The load that has to
+		 * deliver it is forced, so the comparison cannot drop it.
 		 */
+		while (*s1 && _skip_raid_sync_flag(&s1))
+			;
 		while (*s2 && _skip_raid_sync_flag(&s2))
 			;
 
@@ -2137,11 +2148,14 @@ static int _target_params_equiv(const char *type,
 	return 0;
 }
 
-static int _reload_with_suppression_v4(struct dm_task *dmt)
+static int _reload_with_comparison_v4(struct dm_task *dmt)
 {
 	struct dm_task *task;
 	struct target *t1, *t2;
 	size_t len;
+	int identical = 0;
+	int equiv;
+	int suspended;
 	int r;
 
 	/* New task to get existing table information */
@@ -2177,6 +2191,8 @@ static int _reload_with_suppression_v4(struct dm_task *dmt)
 		t2 = t2->next;
 	dmt->existing_table_size = t2 ? t2->start + t2->length : 0;
 
+	suspended = (task->dmi.v4->flags & DM_SUSPEND_FLAG) ? 1 : 0;
+
 	if (((task->dmi.v4->flags & DM_READONLY_FLAG) ? 1 : 0) != dmt->read_only)
 		goto no_match;
 
@@ -2203,42 +2219,43 @@ static int _reload_with_suppression_v4(struct dm_task *dmt)
 			goto no_match;
 		}
 		if (strcmp(t1->params, t2->params)) {
-			if (dmt->skip_reload_params_compare) {
-				log_debug("reload %d:%d diff params ignore for type %s.",
-					  task->major, task->minor, t1->type);
-				log_debug("reload params1 %s", t1->params);
-				log_debug("reload params2 %s", t2->params);
-			} else if (_target_params_equiv(t1->type, t1->params, t2->params,
-					       task->dmi.v4->flags & DM_SUSPEND_FLAG)) {
-				log_debug("reload %d:%d diff params equiv for type %s.",
-					  task->major, task->minor, t1->type);
-				log_debug("reload params1 %s", t1->params);
-				log_debug("reload params2 %s", t2->params);
-			} else {
-				log_debug("reload %d:%d diff params for type %s.",
-					  task->major, task->minor, t1->type);
-				log_debug("reload params1 %s", t1->params);
-				log_debug("reload params2 %s", t2->params);
+			equiv = _target_params_equiv(t1->type, t1->params,
+						     t2->params, suspended);
+			log_debug("reload %d:%d diff params%s for type %s.",
+				  task->major, task->minor,
+				  equiv ? " equiv" : "", t1->type);
+			log_debug("reload params1 %s", t1->params);
+			log_debug("reload params2 %s", t2->params);
+			if (!equiv)
 				goto no_match;
-			}
 		}
 
 		t1 = t1->next;
 		t2 = t2->next;
 	}
 
-	if (!t1 && !t2) {
+	if (!t1 && !t2)
+		identical = 1;
+
+no_match:
+	/*
+	 * Record the comparison even when the policy requires the load:
+	 * the caller needs to distinguish an argument-only reload from a
+	 * changed table.
+	 */
+	dmt->existing_table_identical = identical;
+
+	if (identical && dmt->reload_policy == DM_RELOAD_COMPARE_SKIP_IDENTICAL) {
 		dmt->dmi.v4 = task->dmi.v4;
 		task->dmi.v4 = NULL;
 		dm_task_destroy(task);
 		return 1;
 	}
 
-no_match:
 	dm_task_destroy(task);
 
 	/* Now do the original reload */
-	dmt->suppress_identical_reload = 0;
+	dmt->reload_policy = DM_RELOAD_NO_COMPARE;
 	r = dm_task_run(dmt);
 
 	return r;
@@ -2828,8 +2845,9 @@ DM_EXPORT_NEW_SYMBOL(int, dm_task_run, 1_02_197)
 	    !dev_uuid && dmt->major <= 0)
 		return _mknodes_v4(dmt);
 
-	if ((dmt->type == DM_DEVICE_RELOAD) && dmt->suppress_identical_reload)
-		return _reload_with_suppression_v4(dmt);
+	if ((dmt->type == DM_DEVICE_RELOAD) &&
+	    dmt->reload_policy != DM_RELOAD_NO_COMPARE)
+		return _reload_with_comparison_v4(dmt);
 
 	if ((dmt->type == DM_DEVICE_SUSPEND) && dmt->enable_checks)
 		return _suspend_with_validation_v4(dmt);

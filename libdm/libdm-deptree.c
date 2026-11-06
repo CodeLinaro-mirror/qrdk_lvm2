@@ -228,6 +228,14 @@ struct load_segment {
 	int integrity_recalculate;			/* integrity */
 };
 
+/* What _load_node() did with the node's table */
+typedef enum {
+	LOAD_NONE,	/* Not loaded by this tree */
+	LOAD_SKIPPED,	/* Identical to the active table, kernel untouched */
+	LOAD_SAME,	/* Loaded although identical to the active table */
+	LOAD_CHANGED	/* Loaded a table that differs from the active one */
+} load_result_t;
+
 /* Per-device properties */
 struct load_properties {
 	int read_only;
@@ -238,6 +246,9 @@ struct load_properties {
 	uint32_t read_ahead_flags;
 
 	unsigned segment_count;
+	/* Outcome of _load_node(), written only there. */
+	load_result_t load_result;
+	/* Negative for a shrink, positive for a growth, zero for no change. */
 	int size_changed;
 	struct dm_list segs;
 
@@ -273,26 +284,19 @@ struct load_properties {
 	unsigned delay_resume_if_extended;
 
 	/*
-	 * When comparing table lines to decide if a reload is
-	 * needed, ignore any differences between the lvm device
-	 * params and the kernel-reported device params.
-	 * dm-integrity reports many internal parameters on the
-	 * table line when lvm does not explicitly set them,
-	 * causing lvm and the kernel to have differing params.
+	 * Reasons to load the table even when it is identical to the
+	 * active one.
+	 *
+	 * reload_required: the target needs the load itself, e.g. to pass
+	 * a one-shot RAID sync argument to the kernel.  A failed load is
+	 * always an error.
+	 *
+	 * reload_due_to_child: a child load may have changed device limits, so
+	 * reload this table to propagate those limits.  The pre-3.x failure
+	 * workaround for this case is handled in _load_node().
 	 */
-	unsigned skip_reload_params_compare;
-
-	/*
-	 * Force table reload even if the table is identical.
-	 * Set when a child device table has been loaded,
-	 * because the kernel recalculates device limits only
-	 * during DM_TABLE_LOAD, not during suspend/resume.
-	 */
-	unsigned force_reload;
-
-	/* Node is being replaced with a stub (error/zero) for teardown.
-	 * Its table load should not propagate force_reload to parents. */
-	unsigned suppress_parent_reload;
+	unsigned reload_required;
+	unsigned reload_due_to_child;
 
 	/*
 	 * Call node_send_messages(), set to 2 if there are messages
@@ -3286,20 +3290,26 @@ static int _load_node(struct dm_tree_node *dnode)
 				   seg, &seg_start))
 			goto_out;
 
-	if (!dnode->props.force_reload) {
-		if (!dm_task_suppress_identical_reload(dmt))
-			log_warn("WARNING: Failed to suppress reload of identical tables.");
-		if (dnode->props.skip_reload_params_compare)
-			dmt->skip_reload_params_compare = 1;
+	if (dnode->props.reload_required || dnode->props.reload_due_to_child) {
+		dmt->reload_policy = DM_RELOAD_COMPARE_ALWAYS_LOAD;
+		log_debug_activation("Forcing %s table reload%s.", _node_name(dnode),
+				     dnode->props.reload_required ? "" : " for changed child");
 	} else
-		log_debug_activation("Forcing %s table reload to update device limits.",
-				     _node_name(dnode));
+		dmt->reload_policy = DM_RELOAD_COMPARE_SKIP_IDENTICAL;
 
 	if ((r = dm_task_run(dmt))) {
 		r = dm_task_get_info(dmt, &dnode->info);
-		if (r && !dnode->info.inactive_table)
-			log_verbose("Suppressed %s identical table reload.",
-				    _node_name(dnode));
+
+		if (r) {
+			if (!dnode->info.inactive_table) {
+				log_verbose("Suppressed %s identical reload.",
+					    _node_name(dnode));
+				dnode->props.load_result = LOAD_SKIPPED;
+			} else if (dm_task_get_existing_table_identical(dmt))
+				dnode->props.load_result = LOAD_SAME;
+			else
+				dnode->props.load_result = LOAD_CHANGED;
+		}
 
 		existing_table_size = dm_task_get_existing_table_size(dmt);
 		if ((dnode->props.size_changed =
@@ -3330,13 +3340,20 @@ static int _load_node(struct dm_tree_node *dnode)
 				dnode->props.size_changed = 0;
 			}
 		}
-	} else if (dnode->props.force_reload &&
+	} else if (dnode->props.reload_due_to_child &&
+		   !dnode->props.reload_required &&
 		   get_uname_version(&kmaj, &kmin, &krel) && kmaj < 3) {
-		/* Pre-3.x kernels lack snapshot COW handover (c1f0c183f6ac,
-		 * v2.6.33) so reload calls read_metadata and fails */
-		log_debug_activation("Forced reload of %s identical table failed, continuing.",
+		/*
+		 * Legacy workaround: snapshot table reloads can fail without COW
+		 * handover (introduced in v2.6.33, c1f0c183f6ac).  On kernels
+		 * before 3.0, tolerate a dm_task_run() failure for a reload
+		 * requested only for a child and clear that request.  This does
+		 * not check whether the table was identical or why the task failed.
+		 * A reload required by the target itself must still succeed.
+		 */
+		log_debug_activation("Forced reload of %s failed, continuing.",
 				     _node_name(dnode));
-		dnode->props.force_reload = 0;
+		dnode->props.reload_due_to_child = 0;
 		r = 1;
 	}
 
@@ -3396,6 +3413,44 @@ static int _dm_tree_wait_and_revert_activated(struct dm_tree_node *dnode)
 	return _dm_tree_revert_activated(dnode);
 }
 
+/*
+ * Must the parent reload because this child's table was loaded?
+ *
+ * Reloading a table lets the kernel refresh device limits from its
+ * children.  A load that may have changed the limits has to reach every
+ * ancestor: a changed table, or an identical one reloaded for its own
+ * changed child, since the new limits come from further down.
+ *
+ * An identical table loaded only for reload_required (a one-shot
+ * argument) changes no limits.  Keep suppressing tables made entirely
+ * of error and zero targets, as these may be teardown placeholders.
+ * A different size always makes the table differ, so it needs no
+ * separate check.
+ */
+static int _parent_needs_reload(const struct dm_tree_node *child)
+{
+	struct load_segment *seg;
+	int only_stubs = 1;
+
+	dm_list_iterate_items(seg, &child->props.segs)
+		if ((seg->type != SEG_ERROR) && (seg->type != SEG_ZERO)) {
+			only_stubs = 0;
+			break;
+		}
+
+	if (only_stubs)
+		return 0;
+
+	switch (child->props.load_result) {
+	case LOAD_CHANGED:
+		return 1;
+	case LOAD_SAME:
+		return child->props.reload_due_to_child;
+	default:
+		return 0;
+	}
+}
+
 int dm_tree_preload_children(struct dm_tree_node *dnode,
 			     const char *uuid_prefix,
 			     size_t uuid_prefix_len)
@@ -3404,7 +3459,6 @@ int dm_tree_preload_children(struct dm_tree_node *dnode,
 	void *handle = NULL;
 	struct dm_tree_node *child;
 	int update_devs_flag = 0;
-	int had_inactive_table;
 
 	/* Preload children first */
 	while ((child = dm_tree_next_child(&handle, dnode, 0))) {
@@ -3450,9 +3504,6 @@ int dm_tree_preload_children(struct dm_tree_node *dnode,
 		if (child->props.delay_resume_if_extended)
 			dnode->props.delay_resume_if_extended = 1;
 
-		/* Remember if child already had an inactive table before _load_node */
-		had_inactive_table = child->info.inactive_table;
-
 		if (!child->info.inactive_table &&
 		    child->props.segment_count &&
 		    !_load_node(child)) {
@@ -3470,16 +3521,16 @@ int dm_tree_preload_children(struct dm_tree_node *dnode,
 		}
 
 		/*
-		 * Propagate force_reload only when _load_node() just set
-		 * inactive_table in THIS traversal.
+		 * Force a parent reload only when this tree loaded the child.
 		 * A stale inactive_table (e.g. delay_resume_if_new device
 		 * loaded in the PRELOAD tree but seen again in the ACTIVATE
-		 * tree) must not trigger a parent reload - that reload was
-		 * already done during PRELOAD.
+		 * tree) leaves LOAD_NONE and must not trigger a parent
+		 * reload - that reload was already done during PRELOAD.
+		 * A child shared by several parents is loaded on the first
+		 * visit only, and every parent is reloaded.
 		 */
-		if (child->info.inactive_table && !had_inactive_table &&
-		    !child->props.suppress_parent_reload) {
-			dnode->props.force_reload = 1;
+		if (_parent_needs_reload(child)) {
+			dnode->props.reload_due_to_child = 1;
 			if (child->props.delay_resume_if_new)
 				dnode->props.delay_resume_if_new = 1;
 			log_debug_activation("Child %s table loaded, forcing reload of parent.",
@@ -3732,8 +3783,6 @@ int dm_tree_node_add_error_target(struct dm_tree_node *node,
 	if (!_add_segment(node, SEG_ERROR, size))
 		return_0;
 
-	node->props.suppress_parent_reload = 1;
-
 	return 1;
 }
 
@@ -3742,8 +3791,6 @@ int dm_tree_node_add_zero_target(struct dm_tree_node *node,
 {
 	if (!_add_segment(node, SEG_ZERO, size))
 		return_0;
-
-	node->props.suppress_parent_reload = 1;
 
 	return 1;
 }
@@ -3926,6 +3973,16 @@ int dm_tree_node_add_raid_target_with_params_v2(struct dm_tree_node *node,
 	seg->min_recovery_rate = p->min_recovery_rate;
 	seg->max_recovery_rate = p->max_recovery_rate;
 	seg->flags = p->flags;
+	/*
+	 * A one-shot sync argument has to reach the kernel even when the
+	 * table is otherwise identical, which the reload suppression would
+	 * skip.  The argument alone does not change device limits, so an
+	 * otherwise identical table loads as LOAD_SAME and its parent is
+	 * not reloaded unless a child requires it.  A failed load is never
+	 * tolerated when it has to deliver the sync.
+	 */
+	if (p->flags & DM_FORCESYNC)
+		node->props.reload_required = 1;
 
 	return 1;
 }

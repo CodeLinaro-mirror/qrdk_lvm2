@@ -819,11 +819,11 @@ static int _lvchange_integrity(struct cmd_context *cmd,
 	}
 
 	/*
-	 * In the case of dm-integrity, a new dm table line does not trigger a
-	 * table reload (see skip_reload_params_compare), so new settings are
-	 * not applied to an active integrity device.  We could add a flag to
-	 * override skip_reload_params_compare through all the layers to lift
-	 * this restriction.
+	 * In the case of dm-integrity, parameters that _integrity_params_equiv()
+	 * treats as equivalent do not trigger a table reload, so new settings
+	 * are not applied to an active integrity device.  We could add a
+	 * reload policy to force the load through all the layers to lift this
+	 * restriction.
 	 */
 	if (lv_is_active(lv)) {
 		log_error("LV must be inactive to change integrity settings.");
