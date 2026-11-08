@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Copyright (C) 2012 Red Hat, Inc. All rights reserved.
+# Copyright (C) 2012-2026 Red Hat, Inc. All rights reserved.
 #
 # This copyrighted material is made available to anyone wishing to use,
 # modify, copy, or redistribute it subject to the terms and conditions
@@ -19,12 +19,20 @@ aux have_raid 1 3 0 || skip
 aux prepare_vg 5
 
 for deactivate in true false; do
-# Extend RAID10 (2-stripes, 2-mirror)
+	# Extend RAID10 (2-stripes, 2-mirror)
 	lvcreate --type raid10 -m 1 -i 2 -l 2 -n $lv1 $vg
+	aux wait_for_sync $vg $lv1
 
-	test $deactivate && lvchange -an $vg/$lv1
-
-	lvresize -l +2 $vg/$lv1
+	if test $deactivate; then
+		lvchange -an $vg/$lv1
+		# A stopped array has no table to check: the resize
+		# commits the new size for the activation that follows.
+		lvresize --yes -l +2 $vg/$lv1
+		lvchange -ay $vg/$lv1
+		aux wait_for_sync $vg $lv1
+	else
+		lvresize --yes -l +2 $vg/$lv1
+	fi
 
 	#check raid_images_contiguous $vg $lv1
 

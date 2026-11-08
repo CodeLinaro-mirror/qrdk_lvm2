@@ -38,7 +38,7 @@ grep -F "Insufficient suitable allocatable extents" out2
 not grep -F "Unequal physical volume" out2
 
 # An extend that fits reports no imbalance.
-lvextend -l+1 $vg/$lv 2>&1 | tee out3
+lvextend --yes -l+1 $vg/$lv 2>&1 | tee out3
 not grep -F "Unequal physical volume" out3
 
 vgremove -ff $vg
@@ -97,7 +97,7 @@ check lv_on $vg ${lv}_rmeta_1 "$dev1"
 lvcreate -l 100%PVS -n filler1 $vg "$dev1"
 lvcreate -l 100%PVS -n filler2 $vg "$dev2"
 
-not lvextend --alloc normal -l+1 $vg/$lv 2>&1 | tee out7
+not lvextend --yes --alloc normal -l+1 $vg/$lv 2>&1 | tee out7
 grep -F "RAID metadata images" out7
 grep -F "must use different physical volumes" out7
 

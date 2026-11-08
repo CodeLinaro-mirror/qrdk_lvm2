@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright (C) 2011-2025 Red Hat, Inc. All rights reserved.
+# Copyright (C) 2011-2026 Red Hat, Inc. All rights reserved.
 #
 # This copyrighted material is made available to anyone wishing to use,
 # modify, copy, or redistribute it subject to the terms and conditions
@@ -1619,6 +1619,16 @@ restore_dev() {
 			die "Internal error: $dev not backed up, can't restore!"
 		dd of="$dev" if="${dev##*/}.backup" bs=16K
 	done
+}
+
+# Add @status to the "status = [...]" line of the LV block named @lv in the
+# VG backup @backup and print the modified backup to stdout.
+inject_status() {
+	awk -v lv="$2" -v status="$3" '
+		$1 == lv && $2 == "{" { inblk = 1 }
+		inblk && /status = \[/ { sub(/\] *$/, ", \"" status "\"]"); inblk = 0 }
+		inblk && /^[ \t]*\}[ \t]*$/ { inblk = 0 }
+		{ print }' "$1"
 }
 
 prepare_pvs() {

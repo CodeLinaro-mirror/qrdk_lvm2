@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Copyright (C) 2012,2017 Red Hat, Inc. All rights reserved.
+# Copyright (C) 2012-2026 Red Hat, Inc. All rights reserved.
 #
 # This copyrighted material is made available to anyone wishing to use,
 # modify, copy, or redistribute it subject to the terms and conditions
@@ -27,32 +27,44 @@ vgcreate $SHARED -s 256K "$vg" "${DEVICES[@]}"
 
 for deactivate in true false; do
 
-# Extend and reduce a 2-way RAID1
+	# Extend and reduce a 2-way RAID1
 	lvcreate --type raid1 -m 1 -l 2 -n $lv1 $vg
+	aux wait_for_sync $vg $lv1
 
-	test $deactivate && {
-		aux wait_for_sync $vg $lv1
+	if test $deactivate; then
 		lvchange -an $vg/$lv1
-	}
-
-	lvresize -l +2 $vg/$lv1
+		# A stopped array has no table to check: the resize
+		# commits the new size for the activation that follows.
+		lvresize --yes -l +2 $vg/$lv1
+		lvchange -ay $vg/$lv1
+		aux wait_for_sync $vg $lv1
+	else
+		lvresize --yes -l +2 $vg/$lv1
+	fi
 
 	NOT_RESIZE=
 	aux have_raid 1 9 0 || NOT_RESIZE=not
 	$NOT_RESIZE lvresize --fs ignore -y -l -2 $vg/$lv1
 	#check raid_images_contiguous $vg $lv1
 
-# Extend and reduce 3-striped RAID 4/5/6/10
+	# Extend and reduce 3-striped RAID 4/5/6/10
 	for i in $levels ; do
 		lvcreate --type raid$i -i 3 -l 3 -n $lv2 $vg
 		check lv_field $vg/$lv2 "seg_size" "768.00k"
+		aux wait_for_sync $vg $lv2
 
-		test $deactivate && {
-			aux wait_for_sync $vg $lv2
+		if test $deactivate; then
 			lvchange -an $vg/$lv2
-		}
-
-		lvresize -l +3 $vg/$lv2
+			# A stopped array has no table to check: the resize
+			# commits the new size for the activation that follows.
+			lvresize --yes -l +3 $vg/$lv2
+			if [ "$i" != 0 ] && [ "$i" != 0_meta ]; then
+				lvchange -ay $vg/$lv2
+				aux wait_for_sync $vg $lv2
+			fi
+		else
+			lvresize --yes -l +3 $vg/$lv2
+		fi
 		check lv_field $vg/$lv2 "seg_size" "1.50m"
 
 		#check raid_images_contiguous $vg $lv1
@@ -70,7 +82,8 @@ done
 # Bug 1005434
 # Ensure extend is contiguous
 lvcreate --type raid5 -l 2 -i 2 -n $lv1 $vg "$dev4" "$dev5" "$dev6"
-lvextend -l +2 --alloc contiguous $vg/$lv1
+aux wait_for_sync $vg $lv1
+lvextend --yes -l +2 --alloc contiguous $vg/$lv1
 check lv_tree_on $vg $lv1 "$dev4" "$dev5" "$dev6"
 
 vgremove -f $vg
