@@ -1,6 +1,6 @@
 /*
  * Copyright (C) 2001-2004 Sistina Software, Inc. All rights reserved.
- * Copyright (C) 2004-2016 Red Hat, Inc. All rights reserved.
+ * Copyright (C) 2004-2026 Red Hat, Inc. All rights reserved.
  *
  * This file is part of LVM2.
  *
@@ -191,7 +191,13 @@ static int _lvresize_params(struct cmd_context *cmd, struct lvresize_params *lp)
 	}
 
 	lp->alloc = (alloc_policy_t) (uint32_t) arg_uint_value(cmd, alloc_ARG, 0);
-	lp->yes = arg_is_set(cmd, yes_ARG);
+	/*
+	 * No one can answer a prompt when dmeventd runs the command, so the
+	 * answer would be "no" and an automatic extension would never
+	 * happen.  dmeventd marks the commands it runs, in-process or
+	 * forked, letting them behave as if --yes was given.
+	 */
+	lp->yes = arg_is_set(cmd, yes_ARG) || cmd->run_by_dmeventd;
 	lp->force = arg_is_set(cmd, force_ARG);
 	lp->nosync = arg_is_set(cmd, nosync_ARG);
 
