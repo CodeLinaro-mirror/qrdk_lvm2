@@ -1,4 +1,5 @@
 .bin-dir-stamp
+.test-run.lock
 bin
 init.sh
 results/

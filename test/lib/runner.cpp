@@ -1,4 +1,4 @@
-/* -*- C++ -*- copyright (c) 2014 Red Hat, Inc.
+/* -*- C++ -*- copyright (c) 2014-2026 Red Hat, Inc.
  *
  * This file is part of LVM2.
  *
@@ -27,8 +27,51 @@
 
 #include "brick-shelltest.h"
 
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <string>
+#include <sys/file.h>
+#include <unistd.h>
+
+/*
+ * A test suite owns the loop devices and the device-mapper namespace of the
+ * host, so two runs of one build tree collide: the second one finds the
+ * suspended devices of the first and skips its tests.  Take a lock in the
+ * test directory for the whole run and let a second run wait for it.  The
+ * descriptor is closed on exec, so test scripts and the daemons they start
+ * do not keep the lock after the run.
+ */
+static void lock_test_run(int argc, const char **argv)
+{
+    std::string dir = ".";
+
+    for (int i = 1; i + 1 < argc; ++i)
+        if (!strcmp(argv[i], "--testdir")) {
+            dir = argv[i + 1];
+            break;
+        }
+
+    std::string path = dir + "/.test-run.lock";
+    int fd = open(path.c_str(), O_RDONLY | O_CREAT | O_CLOEXEC, 0666);
+
+    if (fd < 0)
+        return;
+
+    if (!flock(fd, LOCK_EX | LOCK_NB) || errno != EWOULDBLOCK)
+        return;
+
+    std::cout << "Waiting for another test run of " << dir
+              << " to finish..." << std::flush;
+    if (flock(fd, LOCK_EX))
+        return;
+    std::cout << " done." << std::endl;
+}
+
 int main(int argc, const char **argv)
 {
+    lock_test_run(argc, argv);
+
     try {
         return brick::shelltest::run( argc, argv, "LVM_TEST_FLAVOUR" );
     } catch (std::exception const& e) {

@@ -39,7 +39,7 @@ endif
 CLEAN_TARGETS += $(shell find -H lib -type l 2>/dev/null) \
 	$(CXXSOURCES:%.cpp=%.o) $(CXXSOURCES:%.cpp=%.d) $(CXXSOURCES:%.cpp=%.gcno) $(CXXSOURCES:%.cpp=%.gcda)
 
-CLEAN_TARGETS += .lib-dir-stamp .tests-stamp $(LIB) $(addprefix lib/,\
+CLEAN_TARGETS += .lib-dir-stamp .tests-stamp .test-run.lock $(LIB) $(addprefix lib/,\
 	clvmd harness dmeventd dmsetup dmstats dmvdostats lvmpolld \
 	$(LVM_PROFILES) $(LVM_SCRIPTS) \
 	paths-installed paths-installed-t paths-common paths-common-t)
