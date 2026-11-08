@@ -30,7 +30,7 @@
 /* command.c's parse errors are reported here rather than on stderr */
 #undef log_error
 static int _log_count;
-static char _log_msg[256];
+static char _log_msg[4096]; /* same size as the real log message buffer */
 #define log_error(fmt, args...) \
 do { \
 	_log_count++; \
