@@ -785,23 +785,20 @@ int check_pv_dev_sizes(struct volume_group *vg)
 	return r;
 }
 
-int vg_extend_each_pv(struct volume_group *vg, struct pvcreate_params *pp)
+/*
+ * If existing PVs in the VG have inconsistent logical block sizes, new devices
+ * are not required to be consistent with them.  Sets prev_lbs to the logical
+ * block size of the first existing PV (0 if unknown).
+ */
+static void _vg_existing_block_sizes(struct volume_group *vg, unsigned int *prev_lbs,
+				     int *inconsistent_existing_lbs)
 {
 	struct pv_list *pvl;
-	unsigned int max_logical_block_size = 0;
 	unsigned int physical_block_size, logical_block_size;
-	unsigned int prev_lbs = 0;
-	int inconsistent_existing_lbs = 0;
 
-	log_debug_metadata("Adding PVs to VG %s.", vg->name);
+	*prev_lbs = 0;
+	*inconsistent_existing_lbs = 0;
 
-	if (vg_bad_status_bits(vg, RESIZEABLE_VG))
-		return_0;
-
-	/*
-	 * Check if existing PVs have inconsistent block sizes.
-	 * If so, do not enforce new devices to be consistent.
-	 */
 	dm_list_iterate_items(pvl, &vg->pvs) {
 		logical_block_size = 0;
 		physical_block_size = 0;
@@ -815,42 +812,91 @@ int vg_extend_each_pv(struct volume_group *vg, struct pvcreate_params *pp)
 		if (!logical_block_size)
 			continue;
 
-		if (!prev_lbs) {
-			prev_lbs = logical_block_size;
+		if (!*prev_lbs) {
+			*prev_lbs = logical_block_size;
 			continue;
 		}
 
-		if (prev_lbs != logical_block_size) {
-			inconsistent_existing_lbs = 1;
+		if (*prev_lbs != logical_block_size) {
+			*inconsistent_existing_lbs = 1;
 			break;
 		}
 	}
+}
+
+static int _check_extend_dev_block_size(struct volume_group *vg, struct device *dev,
+					unsigned int prev_lbs, int inconsistent_existing_lbs,
+					unsigned int *max_logical_block_size)
+{
+	unsigned int physical_block_size = 0, logical_block_size = 0;
+
+	if (!check_dev_block_size_for_vg(dev, (const struct volume_group *) vg,
+					 max_logical_block_size)) {
+		log_error("PV %s has wrong block size.", dev_name(dev));
+		return 0;
+	}
+
+	if (!dev_get_direct_block_sizes(dev, &physical_block_size, &logical_block_size))
+		log_warn("WARNING: PV %s has unknown block size.", dev_name(dev));
+
+	else if (prev_lbs && logical_block_size && (logical_block_size != prev_lbs)) {
+		if (vg->cmd->allow_mixed_block_sizes || inconsistent_existing_lbs)
+			log_debug("Devices have inconsistent block sizes (%u and %u)", prev_lbs, logical_block_size);
+		else {
+			log_error("Devices have inconsistent logical block sizes (%u and %u).",
+				  prev_lbs, logical_block_size);
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+/*
+ * Check that the devs (struct device_list) can be added to the VG as far as
+ * block sizes are concerned.  Called before the devs are written as new PVs;
+ * vg_extend_each_pv repeats the same checks on the PVs.
+ */
+int vg_check_devs_block_sizes(struct volume_group *vg, struct dm_list *devs)
+{
+	struct device_list *devl;
+	unsigned int max_logical_block_size = 0;
+	unsigned int prev_lbs;
+	int inconsistent_existing_lbs;
+
+	_vg_existing_block_sizes(vg, &prev_lbs, &inconsistent_existing_lbs);
+
+	dm_list_iterate_items(devl, devs) {
+		if (!_check_extend_dev_block_size(vg, devl->dev, prev_lbs,
+						  inconsistent_existing_lbs,
+						  &max_logical_block_size))
+			return 0;
+	}
+
+	return 1;
+}
+
+int vg_extend_each_pv(struct volume_group *vg, struct pvcreate_params *pp)
+{
+	struct pv_list *pvl;
+	unsigned int max_logical_block_size = 0;
+	unsigned int prev_lbs;
+	int inconsistent_existing_lbs;
+
+	log_debug_metadata("Adding PVs to VG %s.", vg->name);
+
+	if (vg_bad_status_bits(vg, RESIZEABLE_VG))
+		return_0;
+
+	_vg_existing_block_sizes(vg, &prev_lbs, &inconsistent_existing_lbs);
 
 	dm_list_iterate_items(pvl, &pp->pvs) {
 		log_debug_metadata("Adding PV %s to VG %s.", pv_dev_name(pvl->pv), vg->name);
 
-		if (!(check_dev_block_size_for_vg(pvl->pv->dev,
-						  (const struct volume_group *) vg,
-						  &max_logical_block_size))) {
-			log_error("PV %s has wrong block size.", pv_dev_name(pvl->pv));
+		if (!_check_extend_dev_block_size(vg, pvl->pv->dev, prev_lbs,
+						  inconsistent_existing_lbs,
+						  &max_logical_block_size))
 			return 0;
-		}
-
-		logical_block_size = 0;
-		physical_block_size = 0;
-
-		if (!dev_get_direct_block_sizes(pvl->pv->dev, &physical_block_size, &logical_block_size))
-			log_warn("WARNING: PV %s has unknown block size.", pv_dev_name(pvl->pv));
-
-		else if (prev_lbs && logical_block_size && (logical_block_size != prev_lbs)) {
-			if (vg->cmd->allow_mixed_block_sizes || inconsistent_existing_lbs)
-				log_debug("Devices have inconsistent block sizes (%u and %u)", prev_lbs, logical_block_size);
-			else {
-				log_error("Devices have inconsistent logical block sizes (%u and %u).",
-					  prev_lbs, logical_block_size);
-				return 0;
-			}
-		}
 
 		if (!add_pv_to_vg(vg, pv_dev_name(pvl->pv), pvl->pv, 0)) {
 			log_error("PV %s cannot be added to VG %s.",
@@ -1449,13 +1495,6 @@ void pvcreate_params_set_defaults(struct pvcreate_params *pp)
 	pp->pva.extent_count = 0;
 	pp->pva.extent_size = 0;
 
-	dm_list_init(&pp->prompts);
-	dm_list_init(&pp->arg_devices);
-	dm_list_init(&pp->arg_process);
-	dm_list_init(&pp->arg_confirm);
-	dm_list_init(&pp->arg_create);
-	dm_list_init(&pp->arg_remove);
-	dm_list_init(&pp->arg_fail);
 	dm_list_init(&pp->pvs);
 }
 
@@ -3305,9 +3344,9 @@ struct volume_group *vg_read_orphans(struct cmd_context *cmd, const char *orphan
 	 * 1. for reporting, in which case it doesn't matter if something
 	 *    changed between the label scan and printing the PVs here
 	 *
-	 * 2. pvcreate_each_device() for pvcreate//vgcreate/vgextend,
-	 *    which already does the label rescan after taking the
-	 *    orphan lock.
+	 * 2. dev_args_pv_orphans_read() for vgcreate/vgextend, which already
+	 *    did the label rescan (dev_args_label_scan_excl) after taking the global
+	 *    protection of the devs.
 	 */
 
 	while ((pvl = (struct pv_list *) dm_list_first(&head.list))) {
