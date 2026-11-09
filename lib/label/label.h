@@ -30,6 +30,7 @@
 
 struct labeller;
 struct dev_filter;
+struct pv_header_extension;
 struct cmd_context;
 struct logical_volume;
 
@@ -95,6 +96,9 @@ void label_exit(void);
 int label_register_handler(struct labeller *handler);
 
 struct labeller *label_get_handler(const char *name);
+
+void label_pv_flags_save(struct device *dev, struct pv_header_extension *pvhdr_ext);
+void label_pv_flags_clear(struct device *dev);
 
 int label_remove(struct device *dev);
 int label_write(struct device *dev, struct label *label);

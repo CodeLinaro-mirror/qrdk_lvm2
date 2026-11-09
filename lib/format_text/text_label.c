@@ -552,6 +552,8 @@ static int _text_read(struct cmd_context *cmd, struct labeller *labeller, struct
 		return 0;
 	}
 
+	label_pv_flags_save(dev, pvhdr_ext);
+
 	strncpy(vgid, FMT_TEXT_ORPHAN_VG_NAME, ID_LEN);
 
 	/*
