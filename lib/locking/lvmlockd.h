@@ -102,6 +102,9 @@ int lvmlockd_use(void);
 void lvmlockd_init(struct cmd_context *cmd);
 void lvmlockd_connect(void);
 void lvmlockd_disconnect(void);
+int lockd_get_scan_global_mode(int *global_mode, const char **global_type);
+int lockd_get_bootstrap_global_mode(struct cmd_context *cmd, const char *lock_type,
+				    int *global_mode);
 
 
 /* vgcreate/vgremove use init/free */
@@ -221,6 +224,20 @@ static inline void lvmlockd_disconnect(void)
 
 static inline void lvmlockd_connect(void)
 {
+}
+
+static inline int lockd_get_scan_global_mode(int *global_mode, const char **global_type)
+{
+	*global_mode = LOCKD_GLOBAL_MODE_0;
+	*global_type = NULL;
+	return 1;
+}
+
+static inline int lockd_get_bootstrap_global_mode(struct cmd_context *cmd, const char *lock_type,
+						  int *global_mode)
+{
+	*global_mode = LOCKD_GLOBAL_MODE_0;
+	return 1;
 }
 
 static inline int lvmlockd_use(void)
