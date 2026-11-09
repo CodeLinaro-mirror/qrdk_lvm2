@@ -401,7 +401,7 @@ int lm_add_lockspace_idm(struct lockspace *ls, int adopt_only, int adopt_ok)
 	if (daemon_test)
 		return 0;
 
-	if (!strcmp(ls->name, S_NAME_GL_IDM)) {
+	if (!strcmp(ls->name, "lvm_global")) {
 		/*
 		 * Prepare the pv list for global lock, if the drive contains
 		 * "propeller" partition, then this drive will be considered
@@ -828,7 +828,7 @@ int lm_is_running_idm(void)
 	int sock, rv;
 
 	if (daemon_test)
-		return gl_use_idm;
+		return daemon_global_type == LD_LM_IDM;
 
 	rv = ilm_connect(&sock);
 	if (rv < 0) {

@@ -889,7 +889,7 @@ int lm_is_running_dlm(void)
 	int rv;
 
 	if (daemon_test)
-		return gl_use_dlm;
+		return daemon_global_type == LD_LM_DLM;
 
 	memset(sys_clustername, 0, sizeof(sys_clustername));
 
