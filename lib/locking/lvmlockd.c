@@ -11,6 +11,7 @@
 #include "lib/misc/lib.h"
 #include "lib/commands/toolcontext.h"
 #include "lib/metadata/metadata.h"
+#include "lib/datastruct/str_list.h"
 #include "lib/metadata/segtype.h"
 #include "lib/activate/activate.h"
 #include "lib/locking/lvmlockd.h"
@@ -1358,7 +1359,8 @@ static int _init_vg_idm(struct cmd_context *cmd, struct volume_group *vg)
 	return _init_vg(cmd, vg, "idm");
 }
 
-static int _init_vg_sanlock(struct cmd_context *cmd, struct volume_group *vg, int lv_lock_count, const char *set_args)
+static int _init_vg_sanlock(struct cmd_context *cmd, struct volume_group *vg, int lv_lock_count,
+			    const char *set_args, int global_mode, int global_lock_owner)
 {
 	daemon_reply reply;
 	const char *reply_str;
@@ -1378,6 +1380,16 @@ static int _init_vg_sanlock(struct cmd_context *cmd, struct volume_group *vg, in
 		return_0;
 	if (!_lvmlockd_connected)
 		return_0;
+
+	/*
+	 * The GLLK (global mode 1) is enabled in the VG that bootstraps
+	 * global mode 1, and disabled in every other VG.  In global mode 2
+	 * the GLLK is disabled in every VG so that old lvm versions, which
+	 * can still use the VG, find no global lock to acquire (global mode 2
+	 * uses GL2LK.)  lvmlockd does not decide this, the command does, along
+	 * with writing the global lock tag below.
+	 */
+	opts = (global_mode == LOCKD_GLOBAL_MODE_1 && global_lock_owner) ? "enable" : "disable";
 
 	if (set_args) {
 		if (!lockd_lockargs_get_user_flags(set_args, &lock_args_flags))
@@ -1552,6 +1564,22 @@ static int _init_vg_sanlock(struct cmd_context *cmd, struct volume_group *vg, in
 	vg->lock_type = "sanlock";
 	vg->lock_args = vg_lock_args;
 
+	if (global_mode == LOCKD_GLOBAL_MODE_1 || global_mode == LOCKD_GLOBAL_MODE_2) {
+		if (!lv_change_tag(vg->sanlock_lv,
+				   global_mode == LOCKD_GLOBAL_MODE_1 ?
+				   LOCKD_GLOBAL_MODE_1_TAG : LOCKD_GLOBAL_MODE_2_TAG, 1)) {
+			ret = 0;
+			goto out;
+		}
+		if (global_lock_owner &&
+		    !lv_change_tag(vg->sanlock_lv,
+				   global_mode == LOCKD_GLOBAL_MODE_1 ?
+				   LOCKD_GLOBAL_LOCK_1_TAG : LOCKD_GLOBAL_LOCK_2_TAG, 1)) {
+			ret = 0;
+			goto out;
+		}
+	}
+
 	if (!vg_write(vg) || !vg_commit(vg)) {
 		log_error("VG %s init failed: vg_write vg_commit", vg->name);
 		ret = 0;
@@ -1680,6 +1708,17 @@ out:
 	return ret;
 }
 
+static int _lockd_vg_has_global_lock_tag(struct volume_group *vg)
+{
+	struct logical_volume *lv = vg->sanlock_lv;
+
+	if (!lv)
+		return 0;
+
+	return str_list_match_item(&lv->tags, LOCKD_GLOBAL_LOCK_1_TAG) ||
+	       str_list_match_item(&lv->tags, LOCKD_GLOBAL_LOCK_2_TAG);
+}
+
 /* called before vg_remove on disk */
 
 static int _free_vg_sanlock(struct cmd_context *cmd, struct volume_group *vg)
@@ -1783,8 +1822,12 @@ static int _free_vg_sanlock(struct cmd_context *cmd, struct volume_group *vg)
 	 * and the global lock existed in foo, do not continue to remove
 	 * VG bar without the global lock.  See the corresponding check above.
 	 */
-	if (lockd_flags & LD_RF_WARN_GL_REMOVED) {
-		log_warn("VG %s held the sanlock global lock, enable global lock in another VG.", vg->name);
+	/*
+	 * The VG holds the global lock if its lvmlock LV has a global lock tag
+	 * (or if lvmlockd saw its global lock enabled, for VGs without tags.)
+	 */
+	if (_lockd_vg_has_global_lock_tag(vg) || (lockd_flags & LD_RF_WARN_GL_REMOVED)) {
+		log_warn("VG %s held the sanlock global lock, which is unavailable until it is enabled in another VG.", vg->name);
 		cmd->lockd_gl_removed = 1;
 	}
 
@@ -1805,7 +1848,8 @@ static int _free_vg_sanlock(struct cmd_context *cmd, struct volume_group *vg)
 /* vgcreate */
 
 int lockd_init_vg(struct cmd_context *cmd, struct volume_group *vg,
-		  const char *lock_type, int lv_lock_count, const char *set_args)
+		  const char *lock_type, int lv_lock_count, const char *set_args,
+		  int global_mode, int global_lock_owner)
 {
 	switch (get_lock_type_from_string(lock_type)) {
 	case LOCK_TYPE_NONE:
@@ -1815,7 +1859,7 @@ int lockd_init_vg(struct cmd_context *cmd, struct volume_group *vg,
 	case LOCK_TYPE_DLM:
 		return _init_vg_dlm(cmd, vg);
 	case LOCK_TYPE_SANLOCK:
-		return _init_vg_sanlock(cmd, vg, lv_lock_count, set_args);
+		return _init_vg_sanlock(cmd, vg, lv_lock_count, set_args, global_mode, global_lock_owner);
 	case LOCK_TYPE_IDM:
 		return _init_vg_idm(cmd, vg);
 	default:
@@ -1941,6 +1985,33 @@ void lockd_free_vg_final(struct cmd_context *cmd, struct volume_group *vg)
  * lock the vg, read/use/write the vg, unlock the vg.
  */
 
+/*
+ * The global mode and global lock location that a VG's lvmlock LV tags say
+ * the VG uses.  This is passed to lvmlockd when the VG lockspace is started
+ * so that lvmlockd has the global mode for commands that cannot get it from
+ * a label scan (lvmlockd only remembers it while lockspaces exist.)
+ * A shared VG without a global mode tag was created by an older lvm: GM1.
+ */
+
+static int _lockd_vg_global_info(struct volume_group *vg, int *global_mode, const char **global_vgname)
+{
+	struct logical_volume *lv = vg->sanlock_lv;
+
+	*global_mode = LOCKD_GLOBAL_MODE_1;
+	*global_vgname = NULL;
+
+	if (!lv)
+		return 1;
+
+	if (str_list_match_item(&lv->tags, LOCKD_GLOBAL_MODE_2_TAG))
+		*global_mode = LOCKD_GLOBAL_MODE_2;
+
+	if (_lockd_vg_has_global_lock_tag(vg))
+		*global_vgname = vg->name;
+
+	return 1;
+}
+
 int lockd_start_vg(struct cmd_context *cmd, struct volume_group *vg, int *exists)
 {
 	char uuid[64] __attribute__((aligned(8)));
@@ -1953,11 +2024,15 @@ int lockd_start_vg(struct cmd_context *cmd, struct volume_group *vg, int *exists
 	int ret;
 	struct lvmlockd_pvs lock_pvs;
 	const char *lock_type = vg->lock_type ?: "empty";
+	const char *global_vgname = NULL;
+	int global_mode = LOCKD_GLOBAL_MODE_1;
 
 	memset(uuid, 0, sizeof(uuid));
 
 	if (!vg_is_shared(vg))
 		return 1;
+
+	_lockd_vg_global_info(vg, &global_mode, &global_vgname);
 
 	if (!_use_lvmlockd) {
 		log_error("VG %s lockstart failed: lvmlockd is not enabled", vg->name);
@@ -2036,6 +2111,8 @@ int lockd_start_vg(struct cmd_context *cmd, struct volume_group *vg, int *exists
 				"version = " FMTd64, (int64_t) vg->seqno,
 				"host_id = " FMTd64, (int64_t) host_id,
 				"opts = %s", opts ?:  "none",
+				"global_mode = " FMTd64, (int64_t) global_mode,
+				"global_vgname = %s", global_vgname ?: "none",
 				NULL);
 		_lockd_free_pv_list(&lock_pvs);
 	} else {
@@ -2049,6 +2126,8 @@ int lockd_start_vg(struct cmd_context *cmd, struct volume_group *vg, int *exists
 				"version = " FMTd64, (int64_t) vg->seqno,
 				"host_id = " FMTd64, (int64_t) host_id,
 				"opts = %s", opts ?:  "none",
+				"global_mode = " FMTd64, (int64_t) global_mode,
+				"global_vgname = %s", global_vgname ?: "none",
 				NULL);
 	}
 
