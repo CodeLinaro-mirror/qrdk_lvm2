@@ -60,6 +60,7 @@ static inline void lvmlockd_close(daemon_handle h)
 #define EADOPT_RETRY 224
 #define EIOTIMEOUT   225
 #define ELOCKREPAIR  226
+#define EGMMIX       228 /* global mode conflicts with the global mode in use */
 
 #define LOCKARGS_VERSION	0x00000001 /* meta only */
 #define LOCKARGS_LVMLOCK	0x00000002 /* meta only */
