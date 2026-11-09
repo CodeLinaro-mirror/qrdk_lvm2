@@ -22,9 +22,8 @@
 
 #define R_NAME_GL_DISABLED "_GLLK_disabled"
 #define R_NAME_GL          "GLLK"
+#define R_NAME_GL2         "GL2LK"
 #define R_NAME_VG          "VGLK"
-#define S_NAME_GL_DLM      "lvm_global"
-#define S_NAME_GL_IDM      "lvm_global"
 #define LVM_LS_PREFIX      "lvm_"           /* ls name is prefix + vg_name */
 /* global lockspace name for sanlock is a vg name */
 
@@ -129,6 +128,7 @@ struct client {
 #define LD_AF_NO_TIMEOUT	   0x01000000
 #define LD_AF_HOSTS_UNKNOWN	   0x02000000
 #define LD_AF_NOWATCHDOG	   0x04000000
+#define LD_AF_GL_ENABLED	   0x08000000
 
 /*
  * Number of times to repeat a lock request after
@@ -198,6 +198,8 @@ struct action {
 	int result;
 	int lm_rv;			/* return value from lm_ function */
 	int align_mb;
+	int global_mode;
+	int global_type;
 	unsigned int force_fence_retry : 1;
 	char *path;
 	char vg_uuid[64];
@@ -207,6 +209,7 @@ struct action {
 	char vg_args[MAX_ARGS+1];
 	char lv_args[MAX_ARGS+1];
 	char other_args[MAX_ARGS+1];
+	char global_vgname[MAX_NAME+1];
 	struct owner owner;
 	struct pvs pvs;			/* PV list for idm */
 };
@@ -389,45 +392,29 @@ static inline int list_empty(const struct list_head *head)
 #endif
 
 /*
- * gl_type_static and gl_use_ are set by command line or config file
- * to specify whether the global lock comes from dlm or sanlock.
- * Without a static setting, lvmlockd will figure out where the
- * global lock should be (but it could get mixed up in cases where
- * both sanlock and dlm vgs exist.)
- *
- * gl_use_dlm means that the gl should come from lockspace gl_lsname_dlm
- * gl_use_sanlock means that the gl should come from lockspace gl_lsname_sanlock
- *
- * gl_use_dlm has precedence over gl_use_sanlock, so if a node sees both
- * dlm and sanlock vgs, it will use the dlm gl.
- *
- * gl_use_ is set when the first evidence of that lm_type is seen
- * in any command.
- *
- * gl_lsname_sanlock is set when the first vg is seen in which an
- * enabled gl is exists, or when init_vg creates a vg with gl enabled,
- * or when enable_gl is used.
- *
- * gl_lsname_sanlock is cleared when free_vg deletes a vg with gl enabled
- * or when disable_gl matches.
+ * daemon_global_type is set once, from the configured global lock type or
+ * the first shared VG.  All shared VGs use that same lock type.  For dlm
+ * and idm, daemon_global_name is set with the type and is permanent.  For
+ * sanlock, it is the lockspace containing the enabled global lock and can
+ * change when the global lock is moved.
  */
 
-EXTERN int gl_type_static;
-EXTERN int gl_use_dlm;
-EXTERN int gl_use_sanlock;
-EXTERN int gl_use_idm;
+EXTERN int daemon_global_type;
+EXTERN char daemon_global_name[MAX_NAME+1];
 EXTERN int gl_vg_removed;
-EXTERN char gl_lsname_dlm[MAX_NAME+1];
-EXTERN char gl_lsname_sanlock[MAX_NAME+1];
-EXTERN char gl_lsname_idm[MAX_NAME+1];
-EXTERN int global_dlm_lockspace_exists;
-EXTERN int global_idm_lockspace_exists;
+EXTERN int global_lockspace_exists;
 
 EXTERN int daemon_test; /* run as much as possible without a live lock manager */
 EXTERN int daemon_debug;
 EXTERN int daemon_host_id;
 EXTERN const char *daemon_host_id_file;
 EXTERN int sanlock_io_timeout;
+
+#define GM0 0
+#define GM1 1
+#define GM2 2
+
+EXTERN int daemon_global_mode;
 
 /*
  * This flag is set to 1 if we see multiple vgs with the global
@@ -647,6 +634,7 @@ int lm_vg_status_sanlock(struct lockspace *ls, struct action *act);
 void lm_set_host_dead_sanlock(struct lockspace *ls, struct owner *owner);
 int lm_setlockargs_supported_sanlock(struct lockspace *ls, struct action *act);
 int lm_setlockargs_vg_sanlock(char *ls_name, char *vg_name, struct action *act);
+int lm_setglobalmode_vg_sanlock(char *ls_name, char *vg_name, struct action *act);
 
 static inline int lm_support_sanlock(void)
 {
@@ -779,6 +767,11 @@ static inline int lm_setlockargs_supported_sanlock(struct lockspace *ls, struct 
 }
 
 static inline int lm_setlockargs_vg_sanlock(char *ls_name, char *vg_name, struct action *act)
+{
+	return -1;
+}
+
+static inline int lm_setglobalmode_vg_sanlock(char *ls_name, char *vg_name, struct action *act)
 {
 	return -1;
 }

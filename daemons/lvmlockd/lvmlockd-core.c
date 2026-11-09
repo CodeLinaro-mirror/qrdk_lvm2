@@ -41,6 +41,10 @@
 #include "lvmlockd-internal.h"
 
 static int str_to_mode(const char *str);
+static int daemon_set_global_type(int lm_type);
+static int daemon_global_update_gl(struct action *act);
+static void daemon_global_update_start(struct action *act);
+static void daemon_global_reset(void);
 
 /*
  * Basic operation of lvmlockd
@@ -1055,7 +1059,7 @@ int last_string_from_args(char *args_in, char *last)
  */
 
 #define ADOPT_VERSION_MAJOR 1
-#define ADOPT_VERSION_MINOR 0
+#define ADOPT_VERSION_MINOR 1
 
 static void write_adopt_file(void)
 {
@@ -1075,8 +1079,18 @@ static void write_adopt_file(void)
 		ADOPT_VERSION_MAJOR, ADOPT_VERSION_MINOR, getpid(), adopt_update_count, ctime(&t));
 
 	pthread_mutex_lock(&lockspaces_mutex);
+
+	/*
+	 * The global mode/type/name are needed to identify and adopt the
+	 * orphan gl lock after a restart (and to re-add the dlm global
+	 * lockspace.)
+	 */
+	if (daemon_global_mode != GM0 && daemon_global_type != LD_LM_NONE && daemon_global_name[0])
+		fprintf(fp, "GLOBAL: %d %s %s\n",
+			daemon_global_mode, lm_str(daemon_global_type), daemon_global_name);
+
 	list_for_each_entry(ls, &lockspaces, list) {
-		if (ls->lm_type == LD_LM_DLM && !strcmp(ls->name, gl_lsname_dlm))
+		if (ls->lm_type == LD_LM_DLM && !strcmp(ls->name, daemon_global_name))
 			continue;
 		fprintf(fp, "VG: %38s %s %s %s\n",
 			ls->vg_uuid, ls->vg_name, lm_str(ls->lm_type), ls->vg_args);
@@ -1123,6 +1137,26 @@ static int read_adopt_file(struct list_head *vg_lockd)
 			if ((sscanf(adopt_line, "lvmlockd adopt_version %u.%u", &v_major, &v_minor) != 2) ||
 			    (v_major != ADOPT_VERSION_MAJOR))
 				goto fail;
+
+		} else if (!strncmp(adopt_line, "GLOBAL:", 7)) {
+			char gl_ls_name[MAX_NAME+1] = { 0 };
+			char gl_lm_str[16] = { 0 };
+			int gl_mode = 0;
+			int lm_type;
+
+			/* Restore global mode/type/name to identify the gl lock to adopt. */
+
+			if ((sscanf(adopt_line, "GLOBAL: %d %15s %64s", &gl_mode, gl_lm_str, gl_ls_name) != 3) ||
+			    (gl_mode != GM1 && gl_mode != GM2) ||
+			    ((lm_type = str_to_lm(gl_lm_str)) < 0)) {
+				log_error("Invalid global state in adopt file, gl lock not adopted: %s",
+					  adopt_line);
+				continue;
+			}
+
+			daemon_global_mode = gl_mode;
+			daemon_global_type = lm_type;
+			dm_strncpy(daemon_global_name, gl_ls_name, sizeof(daemon_global_name));
 
 		} else if (!strncmp(adopt_line, "VG:", 3)) {
 			if (!(ls = alloc_lockspace()))
@@ -2034,9 +2068,9 @@ static int res_able(struct lockspace *ls, struct resource *r,
 		return -EINVAL;
 	}
 
-	if (act->op == LD_OP_ENABLE && gl_lsname_sanlock[0]) {
+	if (act->op == LD_OP_ENABLE && daemon_global_name[0]) {
 		log_error("disable global lock in %s before enable in %s",
-			  gl_lsname_sanlock, ls->name);
+			  daemon_global_name, ls->name);
 		return -EINVAL;
 	}
 
@@ -2746,7 +2780,10 @@ static struct resource *find_resource_act(struct lockspace *ls,
 	r->mode = LD_LK_UN;
 
 	if (r->type == LD_RT_GL) {
-		dm_strncpy(r->name, R_NAME_GL, sizeof(r->name));
+		if (ls->lm_type == LD_LM_SANLOCK && act->global_mode == GM2)
+			dm_strncpy(r->name, R_NAME_GL2, sizeof(r->name));
+		else
+			dm_strncpy(r->name, R_NAME_GL, sizeof(r->name));
 		r->use_vb = 1;
 	} else if (r->type == LD_RT_VG) {
 		dm_strncpy(r->name, R_NAME_VG, sizeof(r->name));
@@ -2935,7 +2972,7 @@ static void *lockspace_thread_main(void *arg_in)
 	}
 	pthread_mutex_unlock(&ls->mutex);
 
-	if (ls->lm_type == LD_LM_DLM && !strcmp(gl_lsname_dlm, ls->name)) {
+	if (ls->lm_type == LD_LM_DLM && !strcmp(daemon_global_name, ls->name)) {
 		log_debug("dlm global lockspace adopt_ok");
 		adopt_ok = 1;
 	}
@@ -2964,8 +3001,8 @@ static void *lockspace_thread_main(void *arg_in)
 
 		log_debug("S %s lm_add_lockspace done %d", ls->name, error);
 
-		if (ls->sanlock_gl_enabled && gl_lsname_sanlock[0] &&
-		    strcmp(ls->name, gl_lsname_sanlock))
+		if (ls->sanlock_gl_enabled && daemon_global_name[0] &&
+		    strcmp(ls->name, daemon_global_name))
 			sanlock_gl_dup = 1;
 
 		if (add_act) {
@@ -3116,7 +3153,8 @@ static void *lockspace_thread_main(void *arg_in)
 
 			if (act->op == LD_OP_SETLOCKARGS_BEFORE && act->rt == LD_RT_VG) {
 				/* check if sanlock version supports the new args */
-				if (!lm_setlockargs_supported_sanlock(ls, act)) {
+				if (act->global_mode != GM1 && act->global_mode != GM2 &&
+				    !lm_setlockargs_supported_sanlock(ls, act)) {
 					list_del(&act->list);
 					act->result = -EPROTONOSUPPORT;
 					add_client_result(act);
@@ -3497,10 +3535,9 @@ out_act:
 	ls->thread_done = 1;
 	pthread_mutex_unlock(&ls->mutex);
 
-	if (ls->lm_type == LD_LM_DLM && !strcmp(ls->name, gl_lsname_dlm))
-		global_dlm_lockspace_exists = 0;
-	if (ls->lm_type == LD_LM_IDM && !strcmp(ls->name, gl_lsname_idm))
-		global_idm_lockspace_exists = 0;
+	if ((ls->lm_type == LD_LM_DLM || ls->lm_type == LD_LM_IDM) &&
+	    !strcmp(ls->name, daemon_global_name))
+		global_lockspace_exists = 0;
 
 	list_for_each_entry(sr_old, &start_results, list) {
 		if (!strcmp(sr_old->vg_name, ls->vg_name)) {
@@ -3597,20 +3634,6 @@ static int vg_ls_name(const char *vg_name, char *ls_name)
 	}
 
 	return 0;
-}
-
-/* FIXME: add mutex for gl_lsname_ ? */
-
-static void gl_ls_name(char *ls_name)
-{
-	if (gl_use_dlm)
-		memcpy(ls_name, gl_lsname_dlm, MAX_NAME);
-	else if (gl_use_sanlock)
-		memcpy(ls_name, gl_lsname_sanlock, MAX_NAME);
-	else if (gl_use_idm)
-		memcpy(ls_name, gl_lsname_idm, MAX_NAME);
-	else
-		memset(ls_name, 0, MAX_NAME);
 }
 
 /*
@@ -3727,10 +3750,9 @@ static int add_lockspace_thread(const char *ls_name,
 	if (act)
 		list_add(&act->list, &ls->actions);
 
-	if (ls->lm_type == LD_LM_DLM && !strcmp(ls->name, gl_lsname_dlm))
-		global_dlm_lockspace_exists = 1;
-	if (ls->lm_type == LD_LM_IDM && !strcmp(ls->name, gl_lsname_idm))
-		global_idm_lockspace_exists = 1;
+	if ((ls->lm_type == LD_LM_DLM || ls->lm_type == LD_LM_IDM) &&
+	    !strcmp(ls->name, daemon_global_name))
+		global_lockspace_exists = 1;
 	list_add_tail(&ls->list, &lockspaces);
 	pthread_mutex_unlock(&lockspaces_mutex);
 
@@ -3758,7 +3780,7 @@ static int add_global_lockspace(char *ls_name, int lm_type,
 {
 	int rv;
 
-	if (global_dlm_lockspace_exists || global_idm_lockspace_exists)
+	if (global_lockspace_exists)
 		return 0;
 
 	/*
@@ -3772,7 +3794,7 @@ static int add_global_lockspace(char *ls_name, int lm_type,
 
 	/*
 	 * EAGAIN may be returned for a short period because
-	 * global_dlm_lockspace_exists is set to 0 before the
+	 * global_lockspace_exists is set to 0 before the
 	 * ls is removed from the lockspaces list by the
 	 * worker_thread.
 	 */
@@ -3826,29 +3848,9 @@ out:
 	return rv;
 }
 
-static int add_dlm_global_lockspace(struct action *act)
-{
-	return add_global_lockspace(gl_lsname_dlm, LD_LM_DLM, act);
-}
-
-static int rem_dlm_global_lockspace(void)
-{
-	return rem_global_lockspace(gl_lsname_dlm);
-}
-
-static int add_idm_global_lockspace(struct action *act)
-{
-	return add_global_lockspace(gl_lsname_idm, LD_LM_IDM, act);
-}
-
-static int rem_idm_global_lockspace(void)
-{
-	return rem_global_lockspace(gl_lsname_idm);
-}
-
 /*
- * When the first dlm lockspace is added for a vg, automatically add a separate
- * dlm lockspace for the global lock.
+ * When the first dlm or idm lockspace is added for a VG, automatically add a
+ * separate lockspace for the global lock.
  *
  * For sanlock, a separate lockspace is not used for the global lock, but the
  * gl lock lives in a vg lockspace, (although it's recommended to create a
@@ -3868,11 +3870,11 @@ static int add_lockspace(struct action *act)
 	 * dlm lockspace using lvmlockctl?
 	 */
 	if (act->rt == LD_RT_GL) {
-		if (gl_use_dlm) {
-			rv = add_dlm_global_lockspace(act);
+		if (daemon_global_type == LD_LM_DLM) {
+			rv = add_global_lockspace(daemon_global_name, daemon_global_type, act);
 			return rv;
-		} else if (gl_use_idm) {
-			rv = add_idm_global_lockspace(act);
+		} else if (daemon_global_type == LD_LM_IDM) {
+			rv = add_global_lockspace(daemon_global_name, daemon_global_type, act);
 			return rv;
 		} else {
 			return -EINVAL;
@@ -3880,10 +3882,10 @@ static int add_lockspace(struct action *act)
 	}
 
 	if (act->rt == LD_RT_VG) {
-		if (gl_use_dlm)
-			add_dlm_global_lockspace(NULL);
-		else if (gl_use_idm)
-			add_idm_global_lockspace(NULL);
+		if (daemon_global_type == LD_LM_DLM)
+			add_global_lockspace(daemon_global_name, daemon_global_type, NULL);
+		else if (daemon_global_type == LD_LM_IDM)
+			add_global_lockspace(daemon_global_name, daemon_global_type, NULL);
 
 		vg_ls_name(act->vg_name, ls_name);
 
@@ -3923,7 +3925,7 @@ static int rem_lockspace(struct action *act)
 	memset(ls_name, 0, sizeof(ls_name));
 
 	if (act->rt == LD_RT_GL)
-		gl_ls_name(ls_name);
+		dm_strncpy(ls_name, daemon_global_name, sizeof(ls_name));
 	else
 		vg_ls_name(act->vg_name, ls_name);
 
@@ -3954,15 +3956,14 @@ static int rem_lockspace(struct action *act)
 	pthread_mutex_unlock(&lockspaces_mutex);
 
 	/*
-	 * For DLM and IDM locking scheme, the global lockspace was
-	 * automatically added when the first vg lockspace was added,
-	 * now reverse that by automatically removing the dlm global
-	 * lockspace when the last vg lockspace is removed.
+	 * For DLM and IDM locking, the global lockspace was automatically added when
+	 * the first VG lockspace was added.  Remove it when the last VG lockspace is
+	 * removed.
 	 */
-	if (rt == LD_RT_VG && gl_use_dlm)
-		rem_dlm_global_lockspace();
-	else if (rt == LD_RT_VG && gl_use_idm)
-		rem_idm_global_lockspace();
+	if (rt == LD_RT_VG && daemon_global_type == LD_LM_DLM)
+		rem_global_lockspace(daemon_global_name);
+	else if (rt == LD_RT_VG && daemon_global_type == LD_LM_IDM)
+		rem_global_lockspace(daemon_global_name);
 
 	return 0;
 }
@@ -4162,15 +4163,15 @@ static int for_each_lockspace(int do_stop, int do_free, int do_force)
 				need_free++;
 			}
 		}
+
+		/*
+		 * The global mode, global lock name and type are only kept
+		 * while lockspaces exist.
+		 */
+		if (free_count && list_empty(&lockspaces))
+			daemon_global_reset();
 	}
 
-	if (list_empty(&lockspaces)) {
-		if (!gl_type_static) {
-			gl_use_dlm = 0;
-			gl_use_sanlock = 0;
-			gl_use_idm = 0;
-		}
-	}
 	pthread_mutex_unlock(&lockspaces_mutex);
 
 	if (stop_count || free_count || need_stop || need_free) {
@@ -4296,7 +4297,13 @@ static int work_setlockargs_vg_final(struct action *act)
 			log_debug("S %s work_setlockargs_vg_final ls not cleared, retry", ls_name);
 			return -EAGAIN;
 		}
-		rv = lm_setlockargs_vg_sanlock(ls_name, act->vg_name, act);
+
+		/* FIXME: separate setglobalmode from setlockargs */
+
+		if (act->global_mode == GM1 || act->global_mode == GM2)
+			rv = lm_setglobalmode_vg_sanlock(ls_name, act->vg_name, act);
+		else
+			rv = lm_setlockargs_vg_sanlock(ls_name, act->vg_name, act);
 	}
 
 	return rv;
@@ -4317,7 +4324,7 @@ static void work_test_gl(void)
 			is_enabled = lm_gl_is_enabled(ls);
 			if (is_enabled) {
 				log_debug("S %s worker found gl_is_enabled", ls->name);
-				dm_strncpy(gl_lsname_sanlock, ls->name, sizeof(gl_lsname_sanlock));
+				dm_strncpy(daemon_global_name, ls->name, sizeof(daemon_global_name));
 			}
 		}
 		pthread_mutex_unlock(&ls->mutex);
@@ -4581,9 +4588,9 @@ static void *worker_thread_main(void *arg_in)
 			int run_idm = lm_is_running_idm();
 
 			if (daemon_test) {
-				run_sanlock = gl_use_sanlock;
-				run_dlm = gl_use_dlm;
-				run_idm = gl_use_idm;
+				run_sanlock = daemon_global_type == LD_LM_SANLOCK;
+				run_dlm = daemon_global_type == LD_LM_DLM;
+				run_idm = daemon_global_type == LD_LM_IDM;
 			}
 
 			/*
@@ -4916,14 +4923,8 @@ static int client_send_result(struct client *cl, struct action *act)
 			strcat(result_flags, "NO_LOCKSPACES,");
 		pthread_mutex_unlock(&lockspaces_mutex);
 
-		if (gl_use_sanlock) {
-			if (!gl_lsname_sanlock[0])
-				strcat(result_flags, "NO_GL_LS,");
-		} else if (gl_use_dlm) {
-			if (!gl_lsname_dlm[0])
-				strcat(result_flags, "NO_GL_LS,");
-		} else if (gl_use_idm) {
-			if (!gl_lsname_idm[0])
+		if (daemon_global_type != LD_LM_NONE) {
+			if (!daemon_global_name[0])
 				strcat(result_flags, "NO_GL_LS,");
 		} else {
 			int found_lm = 0;
@@ -4953,6 +4954,9 @@ static int client_send_result(struct client *cl, struct action *act)
 
 	if (act->flags & LD_AF_HOSTS_UNKNOWN)
 		strcat(result_flags, "HOSTS_UNKNOWN,");
+
+	if (act->flags & LD_AF_GL_ENABLED)
+		strcat(result_flags, "GL_ENABLED,");
 
 	if (act->op == LD_OP_INIT || act->op == LD_OP_SETLOCKARGS_FINAL) {
 		/*
@@ -5177,16 +5181,27 @@ static int add_lock_action(struct action *act)
 
 	memset(ls_name, 0, sizeof(ls_name));
 
+	if (act->rt == LD_RT_GL) {
+		int rv = daemon_global_update_gl(act);
+		if (rv < 0)
+			return rv;
+	}
+
+	if (act->op == LD_OP_LOCK && act->rt == LD_RT_GL &&
+	    act->global_mode == GM2 && !daemon_global_name[0])
+		return -ENOLS;
+
 	/*
 	 * Determine which lockspace this action is for, and set ls_name.
 	 */
 
 	if (act->rt == LD_RT_GL) {
 		/* Global lock is requested */
-		if (gl_use_sanlock && (act->op == LD_OP_ENABLE || act->op == LD_OP_DISABLE)) {
+		if (daemon_global_type == LD_LM_SANLOCK &&
+		    (act->op == LD_OP_ENABLE || act->op == LD_OP_DISABLE)) {
 			vg_ls_name(act->vg_name, ls_name);
 		} else {
-			if (!gl_use_dlm && !gl_use_sanlock && !gl_use_idm) {
+			if (daemon_global_type == LD_LM_NONE) {
 				int run_sanlock = lm_is_running_sanlock();
 				int run_dlm = lm_is_running_dlm();
 				int run_idm = lm_is_running_idm();
@@ -5199,16 +5214,16 @@ static int add_lock_action(struct action *act)
 						  op_str(act->op), mode_str(act->mode));
 				} else {
 					if (run_dlm)
-						gl_use_dlm = 1;
+						daemon_set_global_type(LD_LM_DLM);
 					else if (run_sanlock)
-						gl_use_sanlock = 1;
+						daemon_set_global_type(LD_LM_SANLOCK);
 					else if (run_idm)
-						gl_use_idm = 1;
-					log_debug("global lock op %s mode %s: gl_use_sanlock %d gl_use_dlm %d gl_use_idm %d",
-						  op_str(act->op), mode_str(act->mode), gl_use_sanlock, gl_use_dlm, gl_use_idm);
+						daemon_set_global_type(LD_LM_IDM);
+					log_debug("global lock op %s mode %s: daemon global type %s",
+						  op_str(act->op), mode_str(act->mode), lm_str(daemon_global_type));
 				}
 			}
-			gl_ls_name(ls_name);
+			dm_strncpy(ls_name, daemon_global_name, sizeof(ls_name));
 		}
 	} else {
 		/* VG lock is requested */
@@ -5233,7 +5248,8 @@ static int add_lock_action(struct action *act)
 			log_debug("lockspace \"%s\" not found after search", ls_name);
 			return -ENOLS;
 
-		} else if (act->op == LD_OP_LOCK && act->rt == LD_RT_GL && gl_use_sanlock) {
+		} else if (act->op == LD_OP_LOCK && act->rt == LD_RT_GL &&
+			   daemon_global_type == LD_LM_SANLOCK && act->global_mode == GM1) {
 			/*
 			 * The sanlock global lock may have been enabled in an existing VG,
 			 * so search existing VGs for an enabled global lock.
@@ -5243,7 +5259,8 @@ static int add_lock_action(struct action *act)
 			add_work_action(act);
 			return 0;
 
-		} else if (act->op == LD_OP_LOCK && act->rt == LD_RT_GL && act->mode != LD_LK_UN && gl_use_dlm) {
+		} else if (act->op == LD_OP_LOCK && act->rt == LD_RT_GL && act->mode != LD_LK_UN &&
+			   daemon_global_type == LD_LM_DLM) {
 			/*
 			 * Automatically start the dlm global lockspace when
 			 * a command tries to acquire the global lock.
@@ -5251,10 +5268,11 @@ static int add_lock_action(struct action *act)
 			log_debug("lockspace \"%s\" not found for dlm gl, adding...", ls_name);
 			act->flags |= LD_AF_SEARCH_LS;
 			act->flags |= LD_AF_WAIT_STARTING;
-			add_dlm_global_lockspace(NULL);
+			add_global_lockspace(daemon_global_name, daemon_global_type, NULL);
 			goto retry;
 
-		} else if (act->op == LD_OP_LOCK && act->rt == LD_RT_GL && act->mode != LD_LK_UN && gl_use_idm) {
+		} else if (act->op == LD_OP_LOCK && act->rt == LD_RT_GL && act->mode != LD_LK_UN &&
+			   daemon_global_type == LD_LM_IDM) {
 			/*
 			 * Automatically start the idm global lockspace when
 			 * a command tries to acquire the global lock.
@@ -5262,7 +5280,7 @@ static int add_lock_action(struct action *act)
 			log_debug("lockspace \"%s\" not found for idm gl, adding...", ls_name);
 			act->flags |= LD_AF_SEARCH_LS;
 			act->flags |= LD_AF_WAIT_STARTING;
-			add_idm_global_lockspace(NULL);
+			add_global_lockspace(daemon_global_name, daemon_global_type, NULL);
 			goto retry;
 
 		} else if (act->op == LD_OP_LOCK && act->mode == LD_LK_UN) {
@@ -5488,6 +5506,103 @@ out:
 	return -1;
 }
 
+/*
+ * The global mode (GM) and the lockspace holding the global lock are not
+ * stored persistently.  Commands that need them know them from their label
+ * scan and include them in each global lock request (except unlock).  lvmlockd
+ * remembers the values last used (in a global lock request, or from the tags of
+ * a VG when its lockspace is started) only to detect a conflicting GM, and to
+ * identify the global lock to adopt after a restart.  The values are cleared
+ * when the last lockspace is gone.
+ */
+
+/* called with lockspaces_mutex held when the last lockspace was freed */
+
+static void daemon_global_reset(void)
+{
+	if (daemon_global_mode == GM0 && daemon_global_type == LD_LM_NONE &&
+	    !daemon_global_name[0])
+		return;
+
+	log_debug("reset global mode %d type %s name %s",
+		  daemon_global_mode, lm_str(daemon_global_type), daemon_global_name);
+
+	daemon_global_mode = GM0;
+	daemon_global_type = LD_LM_NONE;
+	daemon_global_name[0] = '\0';
+}
+
+/*
+ * A global lock request includes the GM and optionally the VG holding the
+ * global lock.  A request without a GM is invalid, except for unlock (which
+ * finds the resource that was locked) and enable/disable (which apply to a
+ * specific lockspace).  A request with a GM that conflicts with the GM in
+ * use while lockspaces exist is refused.
+ */
+
+static int daemon_global_update_gl(struct action *act)
+{
+	char ls_name[MAX_NAME+1] = { 0 };
+	int unlock = (act->op == LD_OP_LOCK && act->mode == LD_LK_UN);
+	int rv;
+
+	/* Unlock finds the resource that was locked, enable/disable use a specific lockspace. */
+	if (act->op != LD_OP_LOCK || unlock)
+		return 0;
+
+	if (act->global_mode != GM1 && act->global_mode != GM2) {
+		log_error("global lock request without a valid global mode %d", act->global_mode);
+		return -EINVAL;
+	}
+
+	if (act->global_vgname[0]) {
+		rv = vg_ls_name(act->global_vgname, ls_name);
+		if (rv < 0)
+			return rv;
+	}
+
+	if (daemon_global_mode != GM0 && daemon_global_mode != act->global_mode &&
+	    !lockspaces_empty()) {
+		log_error("global lock request mode %d conflicts with global mode %d in use",
+			  act->global_mode, daemon_global_mode);
+		return -EGMMIX;
+	}
+
+	daemon_global_mode = act->global_mode;
+
+	if (ls_name[0])
+		dm_strncpy(daemon_global_name, ls_name, sizeof(daemon_global_name));
+
+	return 0;
+}
+
+/*
+ * A lockspace start includes the GM from the VG's tags, and the VG name if it
+ * holds the global lock.  This provides lvmlockd with the GM for later
+ * requests from commands that do not provide it.  It does not refuse the
+ * start if the GM conflicts, which is only an error for global lock requests.
+ */
+
+static void daemon_global_update_start(struct action *act)
+{
+	char ls_name[MAX_NAME+1] = { 0 };
+
+	if (act->global_mode != GM1 && act->global_mode != GM2)
+		return;
+
+	if (daemon_global_mode != GM0 && daemon_global_mode != act->global_mode &&
+	    !lockspaces_empty()) {
+		log_warn("WARNING: VG %s global mode %d conflicts with global mode %d in use",
+			 act->vg_name, act->global_mode, daemon_global_mode);
+		return;
+	}
+
+	daemon_global_mode = act->global_mode;
+
+	if (act->global_vgname[0] && vg_ls_name(act->global_vgname, ls_name) >= 0)
+		dm_strncpy(daemon_global_name, ls_name, sizeof(daemon_global_name));
+}
+
 static int str_to_mode(const char *str)
 {
 	if (!str)
@@ -5515,6 +5630,26 @@ static int str_to_lm(const char *str)
 	if (!strcmp(str, "idm"))
 		return LD_LM_IDM;
 	return -2;
+}
+
+static int daemon_set_global_type(int lm_type)
+{
+	if (lm_type != LD_LM_DLM && lm_type != LD_LM_SANLOCK && lm_type != LD_LM_IDM)
+		return -EINVAL;
+
+	if (daemon_global_type != LD_LM_NONE)
+		return daemon_global_type == lm_type ? 0 : -EINVAL;
+
+	daemon_global_type = lm_type;
+
+	if (lm_type == LD_LM_DLM)
+		dm_strncpy(daemon_global_name, "lvm_global", sizeof(daemon_global_name));
+	else if (lm_type == LD_LM_IDM)
+		dm_strncpy(daemon_global_name, "lvm_global", sizeof(daemon_global_name));
+
+	log_debug("set daemon global type %s name %s", lm_str(daemon_global_type),
+		  daemon_global_name);
+	return 0;
 }
 
 static uint32_t str_to_opts(const char *str)
@@ -6008,15 +6143,15 @@ static void client_recv_action(struct client *cl)
 	if (!cl->name[0] && cl_name)
 		strncpy(cl->name, cl_name, MAX_NAME);
 
-	if (!gl_use_dlm && !gl_use_sanlock && !gl_use_idm && (lm > 0)) {
+	if (daemon_global_type == LD_LM_NONE && (lm > 0)) {
 		if (lm == LD_LM_DLM && lm_support_dlm())
-			gl_use_dlm = 1;
+			daemon_set_global_type(LD_LM_DLM);
 		else if (lm == LD_LM_SANLOCK && lm_support_sanlock())
-			gl_use_sanlock = 1;
+			daemon_set_global_type(LD_LM_SANLOCK);
 		else if (lm == LD_LM_IDM && lm_support_idm())
-			gl_use_idm = 1;
+			daemon_set_global_type(LD_LM_IDM);
 
-		log_debug("set gl_use_%s", lm_str(lm));
+		log_debug("set daemon global type %s", lm_str(lm));
 	}
 
 	if (!(act = alloc_action())) {
@@ -6079,6 +6214,15 @@ static void client_recv_action(struct client *cl)
 	val = daemon_request_int(req, "align_mb", 0);
 	if (val)
 		act->align_mb = val;
+
+	act->global_mode = daemon_request_int(req, "global_mode", -1);
+
+	str = daemon_request_str(req, "global_type", NULL);
+	act->global_type = str ? str_to_lm(str) : -1;
+
+	str = daemon_request_str(req, "global_vgname", NULL);
+	if (str && strcmp(str, "none"))
+		dm_strncpy(act->global_vgname, str, sizeof(act->global_vgname));
 
 	act->lv_size_bytes = (uint64_t)dm_config_find_int64(req.cft->root, "lv_size_bytes", 0);
 
@@ -6158,6 +6302,7 @@ skip_pvs_path:
 
 	switch (act->op) {
 	case LD_OP_START:
+		daemon_global_update_start(act);
 		rv = add_lockspace(act);
 		break;
 	case LD_OP_STOP:
@@ -6648,17 +6793,15 @@ static void adopt_locks(void)
 	}
 
 	list_for_each_entry(ls, &ls_found, list) {
-		if (ls->lm_type == LD_LM_DLM)
-			gl_use_dlm = 1;
+		daemon_set_global_type(ls->lm_type);
 
 		log_debug("adopt %s lockspace %s vg %s",
 			  lm_str(ls->lm_type), ls->name, ls->vg_name);
 	}
 
-	if (!gl_use_dlm)
-		gl_use_sanlock = 1;
-
 	list_for_each_entry(ls, &vg_lockd, list) {
+		daemon_set_global_type(ls->lm_type);
+
 		log_debug("adopt vg %s lock_type %s lock_args %s",
 			  ls->vg_name, lm_str(ls->lm_type), ls->vg_args);
 
@@ -6693,7 +6836,7 @@ static void adopt_locks(void)
 	list_for_each_entry_safe(ls1, l1safe, &ls_found, list) {
 
 		/* The dlm global lockspace is special and doesn't match a VG. */
-		if ((ls1->lm_type == LD_LM_DLM) && !strcmp(ls1->name, gl_lsname_dlm)) {
+		if ((ls1->lm_type == LD_LM_DLM) && !strcmp(ls1->name, daemon_global_name)) {
 			list_del(&ls1->list);
 			free(ls1);
 			continue;
@@ -6766,7 +6909,7 @@ static void adopt_locks(void)
 	 * Create and queue start actions to add lockspaces.
 	 */
 
-	if (gl_use_dlm) {
+	if (daemon_global_type == LD_LM_DLM) {
 		if (!(act = alloc_action()))
 			goto fail;
 		log_debug("adopt add dlm global lockspace");
@@ -6775,7 +6918,7 @@ static void adopt_locks(void)
 		act->rt = LD_RT_GL;
 		act->lm_type = LD_LM_DLM;
 		act->client_id = INTERNAL_CLIENT_ID;
-		add_dlm_global_lockspace(act);
+		add_global_lockspace(daemon_global_name, daemon_global_type, act);
 		count_start++;
 	}
 
@@ -6924,26 +7067,37 @@ static void adopt_locks(void)
 
 	/*
 	 * Adopt orphan GL lock.
+	 *
+	 * The global mode/type/name are restored from the adopt file by
+	 * read_adopt_file(), which identifies the gl lock to adopt (and the
+	 * dlm global lockspace to re-add above.)  Without them (an old adopt
+	 * file, or a bad GLOBAL line), there is no gl lock to adopt until a
+	 * lockspace start provides the global mode (e.g. vgchange --lockstart.)
 	 */
 
-	if (!(act = alloc_action()))
-		goto fail;
-	act->op = LD_OP_LOCK;
-	act->rt = LD_RT_GL;
-	act->mode = LD_LK_SH;
-	act->flags = LD_AF_ADOPT_ONLY;
-	act->client_id = INTERNAL_CLIENT_ID;
-	act->lm_type = (gl_use_sanlock ? LD_LM_SANLOCK : LD_LM_DLM);
-
-	log_debug("adopt lock for gl");
-
-	rv = add_lock_action(act);
-	if (rv < 0) {
-		log_error("adopt add_lock_action gl %s error %d", act->vg_name, rv);
-		count_adopt_fail++;
-		free_action(act);
+	if (daemon_global_mode == GM0) {
+		log_debug("adopt lock for gl skipped: global mode is not known");
 	} else {
-		count_adopt++;
+		if (!(act = alloc_action()))
+			goto fail;
+		act->op = LD_OP_LOCK;
+		act->rt = LD_RT_GL;
+		act->mode = LD_LK_SH;
+		act->flags = LD_AF_ADOPT_ONLY;
+		act->client_id = INTERNAL_CLIENT_ID;
+		act->lm_type = daemon_global_type;
+		act->global_mode = daemon_global_mode;
+
+		log_debug("adopt lock for gl");
+
+		rv = add_lock_action(act);
+		if (rv < 0) {
+			log_error("adopt add_lock_action gl %s error %d", act->vg_name, rv);
+			count_adopt_fail++;
+			free_action(act);
+		} else {
+			count_adopt++;
+		}
 	}
 
 	/*
@@ -7149,6 +7303,18 @@ static void adopt_locks(void)
 	(void) unlink(adopt_file);
 	write_adopt_file();
 	log_debug("adopt_locks done");
+
+	/*
+	 * The global mode saved in the adopt file was needed to adopt the gl
+	 * lock, and has now been written back to the adopt file.  Stop
+	 * remembering it: the global mode on disk may have changed while
+	 * lvmlockd was not running, and the first lockspace start or gl
+	 * request after this provides the current mode from the VG tags.  (A
+	 * stale remembered mode would cause false EGMMIX conflicts.)  The
+	 * global type and name are kept, since they identify the gl lockspace
+	 * for gl requests that provide their own mode.
+	 */
+	daemon_global_mode = GM0;
 	return;
 
 fail:
@@ -7162,6 +7328,7 @@ fail:
 	}
 
 	(void) unlink(adopt_file);
+	daemon_global_mode = GM0;
 	log_error("adopt_locks failed, reset host");
 	/* coverity[leaked_storage] vg_lockd cleaned up by list_for_each_entry_safe above */
 }
@@ -7623,9 +7790,6 @@ static int main_loop(daemon_state *ds_arg)
 		return rv;
 	}
 
-	dm_strncpy(gl_lsname_dlm, S_NAME_GL_DLM, sizeof(gl_lsname_dlm));
-	dm_strncpy(gl_lsname_idm, S_NAME_GL_IDM, sizeof(gl_lsname_idm));
-
 	INIT_LIST_HEAD(&lockspaces);
 	INIT_LIST_HEAD(&start_results);
 	pthread_mutex_init(&lockspaces_mutex, NULL);
@@ -7902,11 +8066,11 @@ int main(int argc, char *argv[])
 		case 'g':
 			lm = str_to_lm(optarg);
 			if (lm == LD_LM_DLM && lm_support_dlm())
-				gl_use_dlm = 1;
+				daemon_set_global_type(LD_LM_DLM);
 			else if (lm == LD_LM_SANLOCK && lm_support_sanlock())
-				gl_use_sanlock = 1;
+				daemon_set_global_type(LD_LM_SANLOCK);
 			else if (lm == LD_LM_IDM && lm_support_idm())
-				gl_use_idm = 1;
+				daemon_set_global_type(LD_LM_IDM);
 			else {
 				fprintf(stderr, "invalid gl-type option\n");
 				exit(EXIT_FAILURE);

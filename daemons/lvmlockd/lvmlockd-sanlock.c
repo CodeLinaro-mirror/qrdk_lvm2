@@ -194,33 +194,33 @@ int lm_data_size_sanlock(void)
  * new variant should contain a larger major number.
  *
  * VG_LOCK_ARGS_V1 format:
- * 1.0.0:lvname
+ * 1.1.0:lvname
  *
  * VG_LOCK_ARGS_V2 format:
- * 2.0.0:lvname:notimeout:persist
- * 2.0.0:lvname:notimeout
- * 2.0.0:lvname:persist
+ * 2.1.0:lvname:notimeout:persist
+ * 2.1.0:lvname:notimeout
+ * 2.1.0:lvname:persist
  */
 
 #define VG_LOCK_ARGS_MAJOR 2
-#define VG_LOCK_ARGS_MINOR 0
+#define VG_LOCK_ARGS_MINOR 1
 #define VG_LOCK_ARGS_PATCH 0
 
-#define VG_LOCK_ARGS_V1 "1.0.0"
-#define VG_LOCK_ARGS_V2 "2.0.0"
+#define VG_LOCK_ARGS_V1 "1.1.0"
+#define VG_LOCK_ARGS_V2 "2.1.0"
 
 #define LV_LOCK_ARGS_MAJOR 1
-#define LV_LOCK_ARGS_MINOR 0
+#define LV_LOCK_ARGS_MINOR 1
 #define LV_LOCK_ARGS_PATCH 0
 
-#define LV_LOCK_ARGS_V1 "1.0.0"
+#define LV_LOCK_ARGS_V1 "1.1.0"
 
 /*
  * offset 0 is lockspace
  * offset align_size * 1 is unused
  * offset align_size * 2 is unused
  * ...
- * offset align_size * 64 is unused
+ * offset align_size * 64 is gl2 lock
  * offset align_size * 65 is gl lock
  * offset align_size * 66 is vg lock
  * offset align_size * 67 is first lv lock
@@ -228,6 +228,7 @@ int lm_data_size_sanlock(void)
  * ...
  */
 
+#define GL2_LOCK_BEGIN UINT64_C(64)
 #define GL_LOCK_BEGIN UINT64_C(65)
 #define VG_LOCK_BEGIN UINT64_C(66)
 #define LV_LOCK_BEGIN UINT64_C(67)
@@ -259,9 +260,9 @@ static void strcpy_name_len(char *buf, const char *str, size_t len)
 
 /*
  * copy out lvname from lock_args string:
- * 1.0.0:lvname
- * 2.0.0:lvname
- * 2.0.0:lvname:other
+ * 1.1.0:lvname
+ * 2.1.0:lvname
+ * 2.1.0:lvname:other
  */
 static int lockd_lockargs_get_locklv(char *vg_args, char *lock_lv_name)
 {
@@ -797,11 +798,11 @@ int lm_init_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_ar
 	log_debug("S %s init_vg_san path %s align %d", ls_name, disk.path, opt_align_mb);
 
 	if (daemon_test) {
-		if (!gl_lsname_sanlock[0])
-			dm_strncpy(gl_lsname_sanlock, ls_name, sizeof(gl_lsname_sanlock));
+		if (!daemon_global_name[0])
+			dm_strncpy(daemon_global_name, ls_name, sizeof(daemon_global_name));
 		rv = dm_snprintf(vg_args, MAX_ARGS+1, "%s:%s", VG_LOCK_ARGS_V1, lock_lv_name);
 		if (rv < 0)
-			log_debug("init_vg_san vg_args may be too long %s", vg_args);
+			log_debug("init_vg_san vg_args may be too long %d %s", rv, vg_args);
 		return 0;
 	}
 
@@ -911,20 +912,15 @@ int lm_init_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_ar
 	}
 
 	/*
-	 * We want to create the global lock in the first sanlock vg.
-	 * If other sanlock vgs exist, then one of them must contain
-	 * the gl.  If gl_lsname_sanlock is not set, then perhaps
-	 * the sanlock vg with the gl has been removed or has not yet
-	 * been seen. (Would vgcreate get this far in that case?)
-	 * If dlm vgs exist, then we choose to use the dlm gl and
-	 * not a sanlock gl.
+	 * Create the global lock in the first sanlock VG.  Once
+	 * daemon_global_name is set, another sanlock VG cannot create it.
 	 */
 
 	if (flags & LD_AF_ENABLE)
 		gl_name = R_NAME_GL;
 	else if (flags & LD_AF_DISABLE)
 		gl_name = R_NAME_GL_DISABLED;
-	else if (!gl_use_sanlock || gl_lsname_sanlock[0] || !lockspaces_empty())
+	else if (daemon_global_type != LD_LM_SANLOCK || daemon_global_name[0] || !lockspaces_empty())
 		gl_name = R_NAME_GL_DISABLED;
 	else
 		gl_name = R_NAME_GL;
@@ -939,6 +935,16 @@ int lm_init_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_ar
 	rv = sanlock_write_resource(&rd.rs, 0, 0, write_rs_flags);
 	if (rv < 0) {
 		log_error("S %s init_vg_san write_resource gl error %d %s",
+			  ls_name, rv, rd.rs.disks[0].path);
+		return rv;
+	}
+
+	strcpy_name_len(rd.rs.name, R_NAME_GL2, SANLK_NAME_LEN);
+	rd.rs.disks[0].offset = align_size * GL2_LOCK_BEGIN;
+
+	rv = sanlock_write_resource(&rd.rs, 0, 0, write_rs_flags);
+	if (rv < 0) {
+		log_error("S %s init_vg_san write_resource gl2 error %d %s",
 			  ls_name, rv, rd.rs.disks[0].path);
 		return rv;
 	}
@@ -1019,7 +1025,7 @@ int lm_init_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_ar
 	}
 
 	if (!strcmp(gl_name, R_NAME_GL))
-		dm_strncpy(gl_lsname_sanlock, ls_name, sizeof(gl_lsname_sanlock));
+		dm_strncpy(daemon_global_name, ls_name, sizeof(daemon_global_name));
 
 	log_debug("S %s init_vg_san done vg_args %s", ls_name, vg_args);
 
@@ -1197,6 +1203,7 @@ int lm_rename_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_
 	uint32_t io_timeout;
 	uint32_t write_ls_flags = 0;
 	uint32_t write_rs_flags = 0;
+	unsigned int major = 0, minor = 0, patch = 0;
 	int sector_size = 0;
 	int align_size = 0;
 	int i, rv;
@@ -1212,6 +1219,13 @@ int lm_rename_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_
 	rv = lockd_lockargs_get_locklv(vg_args, lock_lv_name);
 	if (rv < 0) {
 		log_error("S %s init_lv_san lockd_lockargs_get_locklv error %d %s",
+			  ls_name, rv, vg_args);
+		return rv;
+	}
+
+	rv = lockd_lockargs_get_version(vg_args, &major, &minor, &patch);
+	if (rv < 0) {
+		log_error("S %s rename_vg_san lockd_lockargs_get_version error %d %s",
 			  ls_name, rv, vg_args);
 		return rv;
 	}
@@ -1311,6 +1325,38 @@ int lm_rename_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_
 		log_error("S %s rename_vg_san write_resource gl error %d %s",
 			  ls_name, rv, rd.rs.disks[0].path);
 		return rv;
+	}
+
+	/*
+	 * GL2 resource
+	 *
+	 * The gl2 lease does not exist in a VG with lock_args minor 0
+	 * (the area is unused), so there is nothing to rename.  If the
+	 * VG is later converted to global mode 2, setglobalmode writes
+	 * a new gl2 lease with the current lockspace name.
+	 */
+
+	if (minor) {
+		memset(&rd, 0, sizeof(rd));
+		memcpy(rd.rs.disks[0].path, disk.path, SANLK_PATH_LEN);
+		rd.rs.disks[0].offset = align_size * GL2_LOCK_BEGIN;
+		rd.rs.num_disks = 1;
+
+		rv = sanlock_read_resource(&rd.rs, 0);
+		if (rv < 0) {
+			log_error("S %s rename_vg_san read_resource gl2 error %d %s",
+				  ls_name, rv, rd.rs.disks[0].path);
+			return rv;
+		}
+
+		memcpy(rd.rs.lockspace_name, ss.name, SANLK_NAME_LEN);
+
+		rv = sanlock_write_resource(&rd.rs, 0, 0, write_rs_flags);
+		if (rv < 0) {
+			log_error("S %s rename_vg_san write_resource gl2 error %d %s",
+				  ls_name, rv, rd.rs.disks[0].path);
+			return rv;
+		}
 	}
 
 	/*
@@ -1528,10 +1574,10 @@ out:
 	ls->sanlock_gl_enabled = enable;
 
 	if (enable)
-		dm_strncpy(gl_lsname_sanlock, ls->name, sizeof(gl_lsname_sanlock));
+		dm_strncpy(daemon_global_name, ls->name, sizeof(daemon_global_name));
 
-	if (!enable && !strcmp(gl_lsname_sanlock, ls->name))
-		memset(gl_lsname_sanlock, 0, sizeof(gl_lsname_sanlock));
+	if (!enable && !strcmp(daemon_global_name, ls->name))
+		memset(daemon_global_name, 0, sizeof(daemon_global_name));
 
 	return 0;
 }
@@ -1836,8 +1882,8 @@ int lm_prepare_lockspace_sanlock(struct lockspace *ls, uint64_t *prev_generation
 	memcpy(lms->ss.host_id_disk.path, disk_path, SANLK_PATH_LEN-1);
 
 	if (daemon_test) {
-		if (!gl_lsname_sanlock[0]) {
-			dm_strncpy(gl_lsname_sanlock, lsname, sizeof(gl_lsname_sanlock));
+		if (!daemon_global_name[0]) {
+			dm_strncpy(daemon_global_name, lsname, sizeof(daemon_global_name));
 			log_debug("S %s prepare_lockspace_san use global lock", lsname);
 		}
 		lms->align_size = ONE_MB;
@@ -1993,15 +2039,16 @@ int lm_prepare_lockspace_sanlock(struct lockspace *ls, uint64_t *prev_generation
 	ls->sanlock_gl_enabled = gl_found;
 
 	if (gl_found) {
-		if (gl_use_dlm) {
-			log_error("S %s prepare_lockspace_san gl_use_dlm is set", lsname);
-		} else if (gl_lsname_sanlock[0] && strcmp(gl_lsname_sanlock, lsname)) {
+		if (daemon_global_type != LD_LM_SANLOCK) {
+			log_error("S %s prepare_lockspace_san global type is %d", lsname,
+				  daemon_global_type);
+		} else if (daemon_global_name[0] && strcmp(daemon_global_name, lsname)) {
 			log_error("S %s prepare_lockspace_san multiple sanlock global locks current %s",
-				  lsname, gl_lsname_sanlock);
+				  lsname, daemon_global_name);
 		} else {
-			dm_strncpy(gl_lsname_sanlock, lsname, sizeof(gl_lsname_sanlock));
+			dm_strncpy(daemon_global_name, lsname, sizeof(daemon_global_name));
 			log_debug("S %s prepare_lockspace_san use global lock %s",
-				  lsname, gl_lsname_sanlock);
+				  lsname, daemon_global_name);
 		}
 	}
 
@@ -2154,10 +2201,10 @@ out:
 	free(lms);
 	ls->lm_data = NULL;
 
-	/* FIXME: should we only clear gl_lsname when doing free_vg? */
+	/* FIXME: should we only clear daemon_global_name when doing free_vg? */
 
-	if (!strcmp(ls->name, gl_lsname_sanlock))
-		memset(gl_lsname_sanlock, 0, sizeof(gl_lsname_sanlock));
+	if (!strcmp(ls->name, daemon_global_name))
+		memset(daemon_global_name, 0, sizeof(daemon_global_name));
 
 	return 0;
 }
@@ -2173,8 +2220,12 @@ int lm_add_resource_sanlock(struct lockspace *ls, struct resource *r)
 	memcpy(rds->rs.disks[0].path, lms->ss.host_id_disk.path, SANLK_PATH_LEN);
 	rds->rs.flags = lms->rs_flags;
 
-	if (r->type == LD_RT_GL)
-		rds->rs.disks[0].offset = GL_LOCK_BEGIN * lms->align_size;
+	if (r->type == LD_RT_GL) {
+		if (!strcmp(r->name, R_NAME_GL2))
+			rds->rs.disks[0].offset = GL2_LOCK_BEGIN * lms->align_size;
+		else
+			rds->rs.disks[0].offset = GL_LOCK_BEGIN * lms->align_size;
+	}
 	else if (r->type == LD_RT_VG)
 		rds->rs.disks[0].offset = VG_LOCK_BEGIN * lms->align_size;
 
@@ -2485,8 +2536,8 @@ int lm_lock_sanlock(struct lockspace *ls, struct resource *r, int ld_mode,
 			if (!lm_gl_is_enabled(ls)) {
 				log_error("%s:%s lock_san gl has been disabled",
 					  ls->name, r->name);
-				if (!strcmp(gl_lsname_sanlock, ls->name))
-					memset(gl_lsname_sanlock, 0, sizeof(gl_lsname_sanlock));
+				if (!strcmp(daemon_global_name, ls->name))
+					memset(daemon_global_name, 0, sizeof(daemon_global_name));
 				return -EUNATCH;
 			}
 		}
@@ -2935,12 +2986,177 @@ int lm_is_running_sanlock(void)
 	int rv;
 
 	if (daemon_test)
-		return gl_use_sanlock;
+		return daemon_global_type == LD_LM_SANLOCK;
 
 	rv = sanlock_version(0, &daemon_version, &daemon_proto);
 	if (rv < 0)
 		return 0;
 	return 1;
+}
+
+/*
+ * Change the global mode settings of a VG (vgchange --locksettings).
+ * The lockspace has been stopped (setlockargs_before), and we are the
+ * only host using it.  This rewrites the lock_args version to the
+ * current minor, initializes the gl2 lease if the VG predates it,
+ * and sets the GLLK name:
+ * . global_mode 2: GLLK is disabled, so that old lvm versions using the VG
+ *   find no global lock to acquire (GL2LK is used instead.)
+ * . global_mode 1: GLLK is enabled if LD_AF_ENABLE is set, otherwise the
+ *   GLLK name is left as it is.  LD_AF_GL_ENABLED is set in act->flags if
+ *   the GLLK is enabled afterward, so that the command can set the
+ *   LOCKD_GLOBAL_LOCK_1 tag.
+ * The lock lv name and other flags in vg_args are preserved.
+ */
+
+int lm_setglobalmode_vg_sanlock(char *ls_name, char *vg_name, struct action *act)
+{
+	struct sanlk_resourced rd;
+	char lock_lv_name[MAX_ARGS+1] = {0};
+	char disk_path[SANLK_PATH_LEN] = {0};
+	char gl_name[SANLK_NAME_LEN + 1] = {0};
+	const char *new_name;
+	char new_args[MAX_ARGS+1] = {0};
+	char *rest;
+	uint32_t ss_size_flags = 0;
+	uint32_t rs_size_flags = 0;
+	uint32_t write_rs_flags;
+	unsigned int major = 0, minor = 0, patch = 0;
+	int sector_size = 0;
+	int align_size = 0;
+	int align_mb = 0;
+	int no_timeout;
+	int using_caw;
+	int rv;
+
+	if (act->global_mode != GM1 && act->global_mode != GM2)
+		return -EINVAL;
+
+	if (lockd_lockargs_get_version(act->vg_args, &major, &minor, &patch) < 0) {
+		log_error("S %s setglobalmode invalid lock_args %s", ls_name, act->vg_args);
+		return -EINVAL;
+	}
+
+	rv = lockd_lockargs_get_locklv(act->vg_args, lock_lv_name);
+	if (rv < 0) {
+		log_error("S %s setglobalmode lockd_lockargs_get_locklv error %d %s",
+			  ls_name, rv, act->vg_args);
+		return rv;
+	}
+
+	if ((rv = build_dm_path(disk_path, SANLK_PATH_LEN, vg_name, lock_lv_name)))
+		return rv;
+
+	rv = read_lockspace_info(disk_path, 1, &sector_size, &align_size, &align_mb, &ss_size_flags, &rs_size_flags,
+				 &no_timeout, &using_caw, NULL);
+	if (rv < 0) {
+		log_error("S %s setglobalmode read_lockspace_info error %d %s", ls_name, rv, disk_path);
+		return rv;
+	}
+
+	if (!align_size) {
+		/*
+		 * The lockspace has no size flags (it was created by an older
+		 * version of sanlock), so use the old method to get the align
+		 * size.  Without this, the lease offsets below would all be
+		 * zero, and the gl2 lease would be written over the lockspace
+		 * area at offset 0.
+		 */
+		struct sanlk_lockspace ss;
+
+		memset(&ss, 0, sizeof(ss));
+		memcpy(ss.host_id_disk.path, disk_path, SANLK_PATH_LEN);
+		ss.host_id_disk.offset = 0;
+
+		align_size = sanlock_align(&ss.host_id_disk);
+		if (align_size <= 0) {
+			log_error("S %s setglobalmode unknown sector/align size for %s",
+				  ls_name, ss.host_id_disk.path);
+			return -1;
+		}
+	}
+
+	write_rs_flags = using_caw ? SANLK_WRITE_USE_CAW : SANLK_WRITE_NO_CAW;
+
+	/* gl2 does not exist in a VG with lock_args minor 0, the area is unused. */
+
+	if (!minor) {
+		memset(&rd, 0, sizeof(rd));
+		strcpy_name_len(rd.rs.lockspace_name, ls_name, SANLK_NAME_LEN);
+		strcpy_name_len(rd.rs.name, R_NAME_GL2, SANLK_NAME_LEN);
+		memcpy(rd.rs.disks[0].path, disk_path, SANLK_PATH_LEN);
+		rd.rs.disks[0].offset = (uint64_t)align_size * GL2_LOCK_BEGIN;
+		rd.rs.num_disks = 1;
+		rd.rs.flags = rs_size_flags;
+
+		rv = sanlock_write_resource(&rd.rs, 0, 0, write_rs_flags);
+		if (rv < 0) {
+			log_error("S %s setglobalmode write_resource gl2 error %d %s", ls_name, rv, disk_path);
+			return rv;
+		}
+	}
+
+	/* read the current gl name; leave rs.name empty, it is what we're reading */
+
+	memset(&rd, 0, sizeof(rd));
+	strcpy_name_len(rd.rs.lockspace_name, ls_name, SANLK_NAME_LEN);
+	memcpy(rd.rs.disks[0].path, disk_path, SANLK_PATH_LEN);
+	rd.rs.disks[0].offset = (uint64_t)align_size * GL_LOCK_BEGIN;
+	rd.rs.num_disks = 1;
+	rd.rs.flags = rs_size_flags;
+
+	rv = sanlock_read_resource(&rd.rs, 0);
+	if (rv < 0) {
+		log_error("S %s setglobalmode read_resource gl error %d %s", ls_name, rv, disk_path);
+		return rv;
+	}
+
+	memcpy(gl_name, rd.rs.name, SANLK_NAME_LEN);
+
+	if (strcmp(gl_name, R_NAME_GL) && strcmp(gl_name, R_NAME_GL_DISABLED)) {
+		log_error("S %s setglobalmode invalid gl name %s", ls_name, gl_name);
+		return -EINVAL;
+	}
+
+	if (act->global_mode == GM2)
+		new_name = R_NAME_GL_DISABLED;
+	else if (act->flags & LD_AF_ENABLE)
+		new_name = R_NAME_GL;
+	else
+		new_name = gl_name;
+
+	if (strcmp(gl_name, new_name)) {
+		strcpy_name_len(rd.rs.name, new_name, SANLK_NAME_LEN);
+		rv = sanlock_write_resource(&rd.rs, 0, 0, write_rs_flags);
+		if (rv < 0) {
+			log_error("S %s setglobalmode write_resource gl error %d %s", ls_name, rv, disk_path);
+			return rv;
+		}
+	}
+
+	if (!strcmp(new_name, R_NAME_GL))
+		act->flags |= LD_AF_GL_ENABLED;
+
+	/* replace the version in lock_args, keep the lock lv name and flags */
+
+	rest = strchr(act->vg_args, ':');
+	if (!rest) {
+		log_error("S %s setglobalmode invalid lock_args %s", ls_name, act->vg_args);
+		return -EINVAL;
+	}
+
+	rv = dm_snprintf(new_args, sizeof(new_args), "%s%s",
+			 (major >= 2) ? VG_LOCK_ARGS_V2 : VG_LOCK_ARGS_V1, rest);
+	if (rv < 0) {
+		log_error("S %s setglobalmode vg_args string too long %s", ls_name, act->vg_args);
+		return -EINVAL;
+	}
+
+	memcpy(act->vg_args, new_args, sizeof(new_args));
+
+	log_debug("S %s setglobalmode mode %d new args %s", ls_name, act->global_mode, act->vg_args);
+
+	return 0;
 }
 
 #if LOCKDSANLOCK_SUPPORT >= 420
@@ -3025,11 +3241,14 @@ int lm_setlockargs_supported_sanlock(struct lockspace *ls, struct action *act)
 int lm_setlockargs_vg_sanlock(char *ls_name, char *vg_name, struct action *act)
 {
 	struct sanlk_lockspace ss = {0};
+	struct sanlk_resourced rd = {0};
 	char lock_lv_name[MAX_ARGS+1] = {0};
 	char disk_path[SANLK_PATH_LEN] = {0};
 	uint32_t ss_size_flags = 0;
 	uint32_t rs_size_flags = 0;
+	uint32_t write_rs_flags = 0;
 	uint32_t lock_args_flags = 0;
+	unsigned int major = 0, minor = 0, patch = 0;
 	int sector_size = 0;
 	int align_size = 0;
 	int align_mb = 0;
@@ -3052,6 +3271,13 @@ int lm_setlockargs_vg_sanlock(char *ls_name, char *vg_name, struct action *act)
 	rv = lockd_lockargs_get_locklv(act->vg_args, lock_lv_name);
 	if (rv < 0) {
 		log_error("S %s setlockargs lockd_lockargs_get_locklv error %d %s",
+			  ls_name, rv, act->vg_args);
+		return rv;
+	}
+
+	rv = lockd_lockargs_get_version(act->vg_args, &major, &minor, &patch);
+	if (rv < 0) {
+		log_error("S %s setlockargs lockd_lockargs_get_version error %d %s",
 			  ls_name, rv, act->vg_args);
 		return rv;
 	}
@@ -3088,6 +3314,44 @@ int lm_setlockargs_vg_sanlock(char *ls_name, char *vg_name, struct action *act)
 	if (rv < 0) {
 		log_error("S %s setlockargs write_lockspace error %d %s", ls_name, rv, ss.host_id_disk.path);
 		return rv;
+	}
+
+	/*
+	 * The gl2 lease does not exist in a VG with lock_args minor 0 (the
+	 * area is unused), but the new lock_args below use minor 1, which
+	 * means the gl2 lease area is in use.  Create the gl2 lease now so
+	 * that the new lock_args are accurate (lm_setglobalmode_vg_sanlock
+	 * and lm_rename_vg_sanlock write or rename the gl2 lease only for
+	 * lock_args minor >= 1.)
+	 */
+
+	if (!minor) {
+		if (!align_size) {
+			/* use the old method */
+			align_size = sanlock_align(&ss.host_id_disk);
+			if (align_size <= 0) {
+				log_error("S %s setlockargs unknown align size for %s",
+					  ls_name, ss.host_id_disk.path);
+				return -1;
+			}
+		}
+
+		write_rs_flags = using_caw ? SANLK_WRITE_USE_CAW : SANLK_WRITE_NO_CAW;
+
+		memset(&rd, 0, sizeof(rd));
+		strcpy_name_len(rd.rs.lockspace_name, ls_name, SANLK_NAME_LEN);
+		strcpy_name_len(rd.rs.name, R_NAME_GL2, SANLK_NAME_LEN);
+		memcpy(rd.rs.disks[0].path, disk_path, SANLK_PATH_LEN);
+		rd.rs.disks[0].offset = (uint64_t)align_size * GL2_LOCK_BEGIN;
+		rd.rs.num_disks = 1;
+		rd.rs.flags = rs_size_flags;
+
+		rv = sanlock_write_resource(&rd.rs, 0, 0, write_rs_flags);
+		if (rv < 0) {
+			log_error("S %s setlockargs write_resource gl2 error %d %s",
+				  ls_name, rv, rd.rs.disks[0].path);
+			return rv;
+		}
 	}
 
 	update_info_file(vg_name, no_timeout, no_watchdog);
