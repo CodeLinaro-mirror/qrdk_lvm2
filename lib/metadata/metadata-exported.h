@@ -628,26 +628,12 @@ struct pv_create_args {
 
 struct pvcreate_params {
 	/*
-	 * From argc and argv.
-	 */
-	char **pv_names;
-	uint32_t pv_count;
-
-	/*
 	 * From command line args.
 	 */
 	int zero;
 	force_t force;
 	unsigned yes;
 	uint32_t setpersist_flags;
-	char *vg_name;
-
-	/*
-	 * setpersist_flags came from persistent_reservations=full
-	 * rather than an explicit --setpersist option; vgcreate applies
-	 * it only when all devs support PR.
-	 */
-	int setpersist_default;
 
 	/*
 	 * From recovery-specific command line args.
@@ -660,23 +646,11 @@ struct pvcreate_params {
 	 */
 	struct pv_create_args pva;
 
-	/*
-	 * Used for command processing.
-	 */
-	struct dm_list prompts;         /* pvcreate_prompt */
-	struct dm_list arg_devices;     /* pvcreate_device, one for each pv_name */
-	struct dm_list arg_process;     /* pvcreate_device, used for processing */
-	struct dm_list arg_confirm;     /* pvcreate_device, used for processing */
-	struct dm_list arg_create;      /* pvcreate_device, used for pvcreate */
-	struct dm_list arg_remove;      /* pvcreate_device, used for pvremove */
-	struct dm_list arg_fail;        /* pvcreate_device, failed to create */
 	struct dm_list pvs;             /* pv_list, created and usable for vgcreate/vgextend */
-	const char *orphan_vg_name;
-	unsigned is_remove : 1;         /* is removing PVs, not creating */
+
 	unsigned preserve_existing : 1;
-	unsigned check_failed : 1;
-	unsigned check_consistent_block_size : 1;
 	unsigned start_pr : 1;
+	unsigned setpersist_from_full:1; /* persistent_reservations=full implied --setpersist y */
 };
 
 struct lvresize_params {
