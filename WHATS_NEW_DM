@@ -1,5 +1,7 @@
 Version 1.02.219 - 
 ===================
+  Fix dm tree reloads of shrunk tables and of children shared by two parents.
+  Reload a parent whose child table mixes error or zero with mapped segments.
   Fix a race when opening the device-mapper control node.
 
 Version 1.02.218 - 27th October 2026

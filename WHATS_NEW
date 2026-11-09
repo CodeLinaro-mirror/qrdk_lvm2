@@ -1,5 +1,10 @@
 Version 2.03.45 - 
 ==================
+  Answer extend prompts with yes for commands run by dmeventd.
+  Fix extending a RAID LV on a dm-raid target older than 1.15.0.
+  Ask before a full resync that rewrites all legs of an extended RAID LV.
+  Refuse extending a RAID LV that is degraded or rebuilding a leg.
+  Report a pending RAID full resynchronization as lv_resync_pending.
   Add configure --with-default-io-engine=ENGINE setting.
   Refuse to extend an active --nosync RAID LV that is not in sync.
   Honor the requested allocation PV list when adding integrity to a RAID LV.
