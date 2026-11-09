@@ -2870,6 +2870,97 @@ int lockd_global(struct cmd_context *cmd, const char *def_mode)
 }
 
 /*
+ * Acquire PR or GL on devs, depending on the global mode.
+ */
+
+int lockd_global_devices_lock(struct cmd_context *cmd, struct dm_list *devs,
+			      int bootstrap, int *used_gl, int *used_pr)
+{
+	const char *global_type = NULL;
+	char gl_vgname[NAME_LEN + 1] = { 0 };
+	int global_mode;
+	int config_mode;
+
+	*used_gl = 0;
+	*used_pr = 0;
+
+	if (!_use_lvmlockd)
+		return 1;
+
+	/*
+	 * The command's label scan has populated lvmcache with info
+	 * about shared VGs visible on the system, which includes info
+	 * about their lock type, global mode tag, global lock tag.
+	 */
+	if (!lockd_get_scan_global_mode(&global_mode, &global_type))
+		return 0;
+
+	if (cmd->global_devs.mode) {
+		/* vgcreate already selected the mode (from the scan, or to bootstrap.) */
+		global_mode = cmd->global_devs.mode;
+	} else {
+		if (global_mode == LOCKD_GLOBAL_MODE_0) {
+			log_error("Cannot protect devices: no lvm config or shared VGs exist to determine the global mode.");
+			return 0;
+		}
+
+		config_mode = _lockd_config_global_mode(cmd);
+		if (config_mode < 0)
+			return 0;
+		if (config_mode && config_mode != global_mode) {
+			log_error("Configured global mode %d conflicts with disk global mode %d.",
+				  config_mode, global_mode);
+			return 0;
+		}
+	}
+
+	/*
+	 * GM1: use GL1
+	 */
+	if (global_mode == LOCKD_GLOBAL_MODE_1) {
+		if (bootstrap)
+			return 1;
+		if (!_lockd_get_global_lock_vgname(global_mode, global_type, gl_vgname, sizeof(gl_vgname)))
+			return 0;
+		if (!_lockd_global(cmd, "ex", global_mode, gl_vgname))
+			return 0;
+		*used_gl = 1;
+		return 1;
+	}
+
+	/*
+	 * GM2: use PR, and if that's not supported fall back to GL2.
+	 */
+	if (global_mode == LOCKD_GLOBAL_MODE_2) {
+		if (!persist_global_devices_lock(cmd, devs, used_pr))
+			return 0;
+		if (*used_pr)
+			return 1;
+		if (bootstrap)
+			return 1;
+		if (!_lockd_get_global_lock_vgname(global_mode, global_type, gl_vgname, sizeof(gl_vgname)))
+			return 0;
+		if (!_lockd_global(cmd, "ex", global_mode, gl_vgname))
+			return 0;
+		*used_gl = 2;
+		return 1;
+	}
+
+	log_error("Cannot protect devices: invalid global mode %d.", global_mode);
+	return 0;
+}
+
+int lockd_global_devices_unlock(struct cmd_context *cmd, struct dm_list *devs,
+				int used_gl, int used_pr)
+{
+	if (used_pr)
+		return persist_global_devices_release(cmd, devs);
+	if (used_gl)
+		return _lockd_global(cmd, "un", -1, NULL);
+	return 1;
+}
+
+/*
  * VG lock
  *
  * Return 1: continue, lockd_state may still indicate an error
