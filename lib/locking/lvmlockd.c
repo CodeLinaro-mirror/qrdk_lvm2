@@ -2708,6 +2708,7 @@ static int _lockd_global(struct cmd_context *cmd, const char *def_mode,
 		log_error("Start a lock manager, lvmlockd did not find one running.");
 
 	if (result == -ENOLS ||
+	    result == -EGMMIX ||
 	    result == -ESTARTING ||
 	    result == -EVGKILLED ||
 	    result == -ELOCKIO ||
@@ -2726,6 +2727,8 @@ static int _lockd_global(struct cmd_context *cmd, const char *def_mode,
 				log_error("Global lock failed: lockspace is starting");
 			else if (result == -ENOLS)
 				log_error("Global lock failed: check that global lockspace is started");
+			else if (result == -EGMMIX)
+				log_error("Global lock failed: global mode conflicts with the mode in use by lvmlockd");
 			else if (result == -ELOCKIO)
 				log_error("Global lock failed: storage errors for sanlock leases");
 			else if (result == -EIOTIMEOUT)
@@ -2758,6 +2761,11 @@ static int _lockd_global(struct cmd_context *cmd, const char *def_mode,
 
 		if (result == -ESTARTING) {
 			log_warn("Skipping global lock: lockspace is starting");
+			goto allow;
+		}
+
+		if (result == -EGMMIX) {
+			log_warn("Skipping global lock: global mode conflicts with the mode in use by lvmlockd");
 			goto allow;
 		}
 
