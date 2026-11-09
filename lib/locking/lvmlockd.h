@@ -122,7 +122,8 @@ int lockd_vgcreate_begin(struct cmd_context *cmd, const char *lock_type,
 /* vgcreate/vgremove use init/free */
 
 int lockd_init_vg(struct cmd_context *cmd, struct volume_group *vg,
-                  const char *lock_type, int lv_lock_count, const char *set_args);
+                  const char *lock_type, int lv_lock_count, const char *set_args,
+		  int global_mode, int global_lock_owner);
 int lockd_free_vg_before(struct cmd_context *cmd, struct volume_group *vg, int changing, int yes);
 void lockd_free_vg_final(struct cmd_context *cmd, struct volume_group *vg);
 
@@ -278,7 +279,8 @@ static inline int lvmlockd_use(void)
 }
 
 static inline int lockd_init_vg(struct cmd_context *cmd, struct volume_group *vg,
-                  const char *lock_type, int lv_lock_count, const char *set_args)
+                  const char *lock_type, int lv_lock_count, const char *set_args,
+		  int global_mode, int global_lock_owner)
 {
 	return 1;
 }

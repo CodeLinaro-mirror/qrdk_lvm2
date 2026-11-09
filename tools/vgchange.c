@@ -1281,6 +1281,7 @@ static int _vgchange_locktype(struct cmd_context *cmd, struct volume_group *vg, 
 	struct lv_list *lvl;
 	struct logical_volume *lv;
 	int lv_lock_count = 0;
+	struct vgcreate_lockd_params lockd_params = { 0 };
 
 	/* Special recovery case. */
 	if (lock_type && !strcmp(lock_type, "none") && (cmd->lockopt & LOCKOPT_FORCE)) {
@@ -1392,7 +1393,16 @@ static int _vgchange_locktype(struct cmd_context *cmd, struct volume_group *vg, 
 
 		vg->system_id = NULL;
 
-		if (!lockd_init_vg(cmd, vg, lock_type, lv_lock_count, arg_str_value(cmd, setlockargs_ARG, NULL))) {
+		/*
+		 * The global mode comes from the shared VGs in the label scan.
+		 * If there are none, this VG bootstraps the global mode.
+		 */
+		if (!lockd_vgcreate_begin(cmd, lock_type, &lockd_params))
+			return 0;
+
+		if (!lockd_init_vg(cmd, vg, lock_type, lv_lock_count,
+				   arg_str_value(cmd, setlockargs_ARG, NULL),
+				   lockd_params.global_mode, lockd_params.bootstrap)) {
 			log_error("Failed to initialize lock args for lock type %s", lock_type);
 			return 0;
 		}
@@ -2061,4 +2071,3 @@ int vgchange_setlockargs_cmd(struct cmd_context *cmd, int argc, char **argv)
 	destroy_processing_handle(cmd, handle);
 	return ret;
 }
-
