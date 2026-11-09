@@ -1165,10 +1165,13 @@ cluster_load_known_failures() {
         fi
     done < "$kf_file"
 
-    # Load versions from most recent log_create file
+    # Load versions from most recent log_create file that has them.
+    # (Not every log_create file contains VERSION lines, e.g. when the
+    # version collection at create time failed, so fall back to older
+    # logs rather than treating every known-failure condition as
+    # unconditional.)
     local log_create
-    log_create=$(ls -t "$results_dir"/cluster/log_create_*.txt 2>/dev/null | head -1)
-    if [ -n "$log_create" ]; then
+    while IFS= read -r log_create; do
         while IFS= read -r line; do
             local program=$(echo "$line" | awk '{print $2}')
             local version=$(echo "$line" | awk '{print $3}')
@@ -1176,6 +1179,34 @@ cluster_load_known_failures() {
                 export "CLUSTER_VERSION_${program}"="$version"
             fi
         done < <(grep '^VERSION ' "$log_create")
+        # Stop at the first (newest) log that provided versions.
+        if [ -n "${CLUSTER_VERSION_lvm:-}" ]; then
+            break
+        fi
+    done < <(ls -t "$results_dir"/cluster/log_create_*.txt 2>/dev/null)
+
+    # If no log provided versions, collect them from node 1 of the
+    # running cluster (if any), so known-failure version conditions
+    # are evaluated against the actual running software.
+    if [ -z "${CLUSTER_VERSION_lvm:-}" ] && [ -n "${CLUSTER_ID:-}" ]; then
+        local _node1_vm _node1_ip _ver
+        _node1_vm=$(cluster_vm_get_name "$CLUSTER_ID" 1 2>/dev/null)
+        _node1_ip=$(cluster_vm_get_ip "$_node1_vm" 2>/dev/null)
+        if [ -n "$_node1_ip" ]; then
+            while IFS= read -r line; do
+                local program=$(echo "$line" | awk '{print $2}')
+                local version=$(echo "$line" | awk '{print $3}')
+                if [ -n "$program" ] && [ -n "$version" ]; then
+                    export "CLUSTER_VERSION_${program}"="$version"
+                fi
+            done < <(cluster_vm_ssh "$_node1_ip" "
+                        uname -r | awk '{print \"VERSION kernel \" \$1}'
+                        lvm version 2>/dev/null | awk '/LVM version/{print \"VERSION lvm \" \$3}'
+                        sanlock version 2>/dev/null | awk '{print \"VERSION sanlock \" \$2; exit}'
+                        dlm_controld -V 2>/dev/null | awk '{print \"VERSION dlm \" \$2; exit}'
+                        mdadm --version 2>&1 | awk -F'[ -]' '/^mdadm/{for(i=1;i<=NF;i++) if(\$i~/^v?[0-9]/) {gsub(/^v/,\"\",\$i); print \"VERSION mdadm \" \$i; exit}}'
+                    " 2>/dev/null | grep '^VERSION ')
+        fi
     fi
 
     return 0

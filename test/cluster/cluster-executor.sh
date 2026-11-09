@@ -2423,8 +2423,10 @@ WRAPPER_EOF
     chmod +x "$wrapper_script"
 
     # Execute test script
-    bash "$wrapper_script" "$test_script" 2>&1
-    local exit_code=$?
+    # (protected with || so a failing test does not trip errexit in the
+    # caller's shell before failure reporting and log renaming can run)
+    local exit_code=0
+    bash "$wrapper_script" "$test_script" 2>&1 || exit_code=$?
 
     # Capture failure information
     local failed_line=""
