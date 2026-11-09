@@ -82,6 +82,10 @@ struct vgcreate_lockd_params {
 #define LOCKD_GLOBAL_MODE_1	1
 #define LOCKD_GLOBAL_MODE_2	2
 
+#define LOCKD_GLOBAL_LOCK_NONE	0
+#define LOCKD_GLOBAL_LOCK_ENABLE	1
+#define LOCKD_GLOBAL_LOCK_DISABLE	2
+
 #define LOCKD_GLOBAL_MODE_1_TAG "LOCKD_GLOBAL_MODE_1"
 #define LOCKD_GLOBAL_MODE_2_TAG "LOCKD_GLOBAL_MODE_2"
 #define LOCKD_GLOBAL_LOCK_1_TAG "LOCKD_GLOBAL_LOCK_1"
@@ -184,6 +188,11 @@ int lockd_lvremove_lock(struct cmd_context *cmd, struct logical_volume *lv, stru
 void lockd_lvremove_done(struct cmd_context *cmd, struct logical_volume *lv, struct logical_volume *lv_other, int other_unlock);
 
 int lockd_setlockargs(struct cmd_context *cmd, struct volume_group *vg, const char *set_args, uint64_t *our_key_held);
+int lockd_set_global_mode(struct cmd_context *cmd, struct volume_group *vg, int global_mode, int global_lock_owner,
+			  int *gl_enabled, uint64_t *our_key_held);
+int lockd_set_global_lock(struct cmd_context *cmd, struct volume_group *vg, int global_mode, int global_lock,
+			  int *gl_enabled, uint64_t *our_key_held);
+int lockd_lockargs_minor(const char *lock_args);
 
 #else /* LVMLOCKD_SUPPORT */
 
@@ -442,6 +451,23 @@ static inline void lockd_lvremove_done(struct cmd_context *cmd, struct logical_v
 static inline int lockd_setlockargs(struct cmd_context *cmd, struct volume_group *vg, const char *set_args, uint64_t *our_key_held)
 {
 	return 0;
+}
+
+static inline int lockd_set_global_mode(struct cmd_context *cmd, struct volume_group *vg, int global_mode,
+					int global_lock_owner, int *gl_enabled, uint64_t *our_key_held)
+{
+	return 0;
+}
+
+static inline int lockd_set_global_lock(struct cmd_context *cmd, struct volume_group *vg, int global_mode,
+					int global_lock, int *gl_enabled, uint64_t *our_key_held)
+{
+	return 0;
+}
+
+static inline int lockd_lockargs_minor(const char *lock_args)
+{
+	return -1;
 }
 
 #endif	/* LVMLOCKD_SUPPORT */

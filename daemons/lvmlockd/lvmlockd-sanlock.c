@@ -3002,10 +3002,11 @@ int lm_is_running_sanlock(void)
  * and sets the GLLK name:
  * . global_mode 2: GLLK is disabled, so that old lvm versions using the VG
  *   find no global lock to acquire (GL2LK is used instead.)
- * . global_mode 1: GLLK is enabled if LD_AF_ENABLE is set, otherwise the
- *   GLLK name is left as it is.  LD_AF_GL_ENABLED is set in act->flags if
- *   the GLLK is enabled afterward, so that the command can set the
- *   LOCKD_GLOBAL_LOCK_1 tag.
+ * . global_mode 1: GLLK is enabled if LD_AF_ENABLE is set, and disabled if
+ *   LD_AF_DISABLE is set (vgchange --locksettings global_lock=enable|disable),
+ *   otherwise the GLLK name is left as it is.  LD_AF_GL_ENABLED is set in
+ *   act->flags if the GLLK is enabled afterward, so that the command can set
+ *   the LOCKD_GLOBAL_LOCK_1 tag.
  * The lock lv name and other flags in vg_args are preserved.
  */
 
@@ -3122,6 +3123,8 @@ int lm_setglobalmode_vg_sanlock(char *ls_name, char *vg_name, struct action *act
 		new_name = R_NAME_GL_DISABLED;
 	else if (act->flags & LD_AF_ENABLE)
 		new_name = R_NAME_GL;
+	else if (act->flags & LD_AF_DISABLE)
+		new_name = R_NAME_GL_DISABLED;
 	else
 		new_name = gl_name;
 

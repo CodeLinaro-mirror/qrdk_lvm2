@@ -5252,10 +5252,25 @@ void lockd_lockopt_get_flags(const char *str, uint32_t *flags, int *retries, int
 }
 
 /*
- * Change the lock_args (and global mode settings) of a sanlock VG while
- * no other host is using it.  For setlockargs, set_args holds the new
+ * Supports 'vgchange --setlockargs' and 'vgchange --locksettings'.
+ *
+ * . setlockargs is focused only on changes that are reflected in the
+ *   lock_args string
+ * . locksettings is for other changes related to the locking operations
+ *   that are not specifically reflected in the lock_args (currently
+ *   global mode and global lock.)
+ *
+ * Change the lock_args, and lock settings (e.g. global mode) of a sanlock VG
+ * while no other host is using it.  For --setlockargs, set_args holds the new
  * user flags.  For --locksettings, global_mode is 1 or 2 and set_args is
  * NULL; lvmlockd keeps the existing lock_args flags.
+ *
+ * opts tells lvmlockd how to change the global lock leases of the VG:
+ * . "enable": enable the GLLK lease
+ * . "disable": disable the GLLK lease
+ * . "none": leave the leases as they are
+ * (the GLLK is always left disabled in global mode 2.)
+ *
  * global_mode 2: the GLLK of the VG is disabled (old lvm versions then find
  * no global lock to acquire.)
  * global_mode 1: global_lock_owner tells lvmlockd to enable the GLLK of the
@@ -5263,22 +5278,17 @@ void lockd_lockopt_get_flags(const char *str, uint32_t *flags, int *retries, int
  * of the VG is enabled afterward.
  */
 
-static int _lockd_change_lockargs(struct cmd_context *cmd, struct volume_group *vg,
-				  const char *set_args, int global_mode, int global_lock_owner,
-				  int *gl_enabled, uint64_t *our_key_held)
+static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
+		      const char *set_args, int global_mode, const char *opts,
+		      int *gl_enabled, uint64_t *our_key_held)
 {
 	daemon_reply reply;
 	const char *reply_str;
 	const char *vg_lock_args = NULL;
-	const char *opts = "none";
+	const char *setcmd = set_args ? "setlockargs" : "locksettings";
 	uint32_t result_flags;
 	int result;
 	int ret;
-
-	if (global_mode == LOCKD_GLOBAL_MODE_2)
-		opts = "disable";
-	else if (global_mode == LOCKD_GLOBAL_MODE_1 && global_lock_owner)
-		opts = "enable";
 
 	/*
 	 * Check if other PR keys are registered, which would
@@ -5321,7 +5331,7 @@ static int _lockd_change_lockargs(struct cmd_context *cmd, struct volume_group *
 	 * the lockspace.
 	 */
 
-	log_debug("lockd setlockargs_vg_before %s", vg->name);
+	log_debug("lockd %s %s send setlockargs_vg_before", setcmd, vg->name);
 
 	reply = _lockd_send("setlockargs_vg_before",
 				"pid = " FMTd64, (int64_t) getpid(),
@@ -5374,6 +5384,7 @@ static int _lockd_change_lockargs(struct cmd_context *cmd, struct volume_group *
 	 * start of PR/locking using the new lockargs.
 	 */
 	if (vg->pr & (VG_PR_REQUIRE | VG_PR_AUTOSTART)) {
+		log_debug("lockd %s %s persist_upgrade_ex", setcmd, vg->name);
 		if (!persist_upgrade_ex(cmd, vg, our_key_held)) {
 			log_error("Failed to upgrade to exclusive PR.");
 			log_error("Restart PR and locking to retry setlockargs.");
@@ -5390,7 +5401,7 @@ static int _lockd_change_lockargs(struct cmd_context *cmd, struct volume_group *
 	 */
 
  retry_final:
-	log_debug("lockd setlockargs_vg_final %s", vg->name);
+	log_debug("lockd %s %s send setlockargs_vg_final", setcmd, vg->name);
 
 	reply = _lockd_send("setlockargs_vg_final",
 				"pid = " FMTd64, (int64_t) getpid(),
@@ -5430,7 +5441,7 @@ static int _lockd_change_lockargs(struct cmd_context *cmd, struct volume_group *
 		goto out;
 	}
 
-	log_debug("lockd setlockargs_vg %s result %d new lock_args %s", vg->name, result, vg_lock_args);
+	log_debug("lockd %s %s result %d new lock_args %s", setcmd, vg->name, result, vg_lock_args);
 
 	vg->lock_args = vg_lock_args;
 
@@ -5443,6 +5454,8 @@ out:
 	daemon_reply_destroy(reply);
 	return ret;
 }
+
+/* vgchange --setlockargs */
 
 int lockd_setlockargs(struct cmd_context *cmd, struct volume_group *vg, const char *set_args, uint64_t *our_key_held)
 {
@@ -5473,6 +5486,91 @@ int lockd_setlockargs(struct cmd_context *cmd, struct volume_group *vg, const ch
 		return 0;
 	}
 
-	return _lockd_change_lockargs(cmd, vg, set_args, 0, 0, NULL, our_key_held);
+	return _lockd_set_general(cmd, vg, set_args, 0, "none", NULL, our_key_held);
 }
 
+/* vgchange --locksettings global_mode=1|2 */
+
+int lockd_set_global_mode(struct cmd_context *cmd, struct volume_group *vg, int global_mode, int global_lock_owner,
+			  int *gl_enabled, uint64_t *our_key_held)
+{
+	const char *opts = "none";
+
+	if (!_use_lvmlockd) {
+		log_error("lvmlockd is not in use.");
+		return 0;
+	}
+	if (!_lvmlockd_connected) {
+		log_error("lvmlockd is not connected.");
+		return 0;
+	}
+
+	if (!vg->lock_type || strcmp(vg->lock_type, "sanlock")) {
+		log_error("Global mode is only supported for lock type sanlock.");
+		return 0;
+	}
+
+	if (global_mode != LOCKD_GLOBAL_MODE_1 && global_mode != LOCKD_GLOBAL_MODE_2)
+		return_0;
+
+	if (global_mode == LOCKD_GLOBAL_MODE_2)
+		opts = "disable";
+	else if (global_lock_owner)
+		opts = "enable";
+
+	return _lockd_set_general(cmd, vg, NULL, global_mode, opts, gl_enabled, our_key_held);
+}
+
+/* vgchange --locksettings global_lock=enable|disable */
+
+int lockd_set_global_lock(struct cmd_context *cmd, struct volume_group *vg, int global_mode, int global_lock,
+			  int *gl_enabled, uint64_t *our_key_held)
+{
+	const char *opts = "none";
+
+	if (!_use_lvmlockd) {
+		log_error("lvmlockd is not in use.");
+		return 0;
+	}
+	if (!_lvmlockd_connected) {
+		log_error("lvmlockd is not connected.");
+		return 0;
+	}
+
+	if (!vg->lock_type || strcmp(vg->lock_type, "sanlock")) {
+		log_error("The global lock is only supported for lock type sanlock.");
+		return 0;
+	}
+
+	if (global_mode != LOCKD_GLOBAL_MODE_1 && global_mode != LOCKD_GLOBAL_MODE_2)
+		return_0;
+
+	if (global_lock != LOCKD_GLOBAL_LOCK_ENABLE && global_lock != LOCKD_GLOBAL_LOCK_DISABLE)
+		return_0;
+
+	/*
+	 * In global mode 1, enable/disable the GLLK lease of the VG.
+	 * In global mode 2, the GLLK is always disabled, and the GL2LK
+	 * lease needs no change (the lock tags written by the command
+	 * are what locates the GL2LK.)
+	 */
+	if (global_mode == LOCKD_GLOBAL_MODE_1)
+		opts = (global_lock == LOCKD_GLOBAL_LOCK_ENABLE) ? "enable" : "disable";
+
+	return _lockd_set_general(cmd, vg, NULL, global_mode, opts, gl_enabled, our_key_held);
+}
+
+/* Return the minor number of a lock_args version string, or -1 if invalid. */
+
+int lockd_lockargs_minor(const char *lock_args)
+{
+	unsigned int minor = 0;
+
+	if (!lock_args)
+		return -1;
+
+	if (_lockd_lockargs_get_version((char *)lock_args, NULL, &minor, NULL) < 0)
+		return -1;
+
+	return (int)minor;
+}
