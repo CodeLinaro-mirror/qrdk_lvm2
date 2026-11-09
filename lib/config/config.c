@@ -505,7 +505,8 @@ int override_config_tree_from_profile(struct cmd_context *cmd,
 int config_file_read_fd(struct dm_config_tree *cft, struct device *dev, dev_io_reason_t reason,
 			off_t offset, size_t size, off_t offset2, size_t size2,
 			checksum_fn_t checksum_fn, uint32_t checksum,
-			int checksum_only, int no_dup_node_check, int only_pv_summary)
+			int checksum_only, int no_dup_node_check,
+			dm_config_section_filter_fn filter, void *filter_arg)
 {
 	char namebuf[NAME_LEN + 1] __attribute__((aligned(8)));
 	int namelen = 0;
@@ -603,11 +604,11 @@ int config_file_read_fd(struct dm_config_tree *cft, struct device *dev, dev_io_r
 
 	if (!checksum_only) {
 		fe = fb + size + size2;
-		if (no_dup_node_check) {
-			if (only_pv_summary) {
-				if (!dm_config_parse_only_section(cft, fb, fe, "physical_volumes"))
-					goto_out;
-			} else if (!dm_config_parse_without_dup_node_check(cft, fb, fe))
+		if (filter) {
+			if (!dm_config_parse_filtered(cft, fb, fe, filter, filter_arg))
+				goto_out;
+		} else if (no_dup_node_check) {
+			if (!dm_config_parse_without_dup_node_check(cft, fb, fe))
 				goto_out;
 		} else {
 			if (!dm_config_parse(cft, fb, fe))
@@ -669,7 +670,7 @@ int config_file_read_from_file(struct dm_config_tree *cft)
 	cf->dev = &fake_dev;
 
 	r = config_file_read_fd(cft, cf->dev, DEV_IO_MDA_CONTENT, 0, (size_t) info.st_size, 0, 0,
-				(checksum_fn_t) NULL, 0, 0, 0, 0);
+				(checksum_fn_t) NULL, 0, 0, 0, NULL, NULL);
 
 	free((void*)alias->str);
 	free((void*)alias);

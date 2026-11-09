@@ -246,7 +246,8 @@ int config_set_source(struct dm_config_tree *cft, config_source_t type);
 int config_file_read_fd(struct dm_config_tree *cft, struct device *dev, dev_io_reason_t reason,
 			off_t offset, size_t size, off_t offset2, size_t size2,
 			checksum_fn_t checksum_fn, uint32_t checksum,
-			int checksum_only, int no_dup_node_check, int only_pv_summary);
+			int checksum_only, int no_dup_node_check,
+			dm_config_section_filter_fn filter, void *filter_arg);
 int config_file_read_from_file(struct dm_config_tree *cft);
 struct dm_config_tree *config_file_open_and_read(const char *config_file, config_source_t source,
 						 struct cmd_context *cmd);
