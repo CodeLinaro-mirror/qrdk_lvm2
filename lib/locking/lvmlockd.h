@@ -45,6 +45,7 @@ struct vgcreate_lockd_params {
 #define LD_RF_NO_LM		0x00000010
 #define LD_RF_SH_EXISTS		0x00000020
 #define LD_RF_HOSTS_UNKNOWN	0x00000040
+#define LD_RF_GL_ENABLED	0x00000080
 
 /* lockd_state flags */
 #define LDST_EX			0x00000001

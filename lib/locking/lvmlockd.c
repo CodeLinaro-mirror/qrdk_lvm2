@@ -302,6 +302,9 @@ static void _result_str_to_flags(const char *result_str, uint32_t *result_flags)
 
 	if (strstr(result_str, "HOSTS_UNKNOWN"))
 		*result_flags |= LD_RF_HOSTS_UNKNOWN;
+
+	if (strstr(result_str, "GL_ENABLED"))
+		*result_flags |= LD_RF_GL_ENABLED;
 }
 
 static char *_owner_str(struct owner *owner)
@@ -5481,40 +5484,34 @@ void lockd_lockopt_get_flags(const char *str, uint32_t *flags, int *retries, int
 	}
 }
 
-int lockd_setlockargs(struct cmd_context *cmd, struct volume_group *vg, const char *set_args, uint64_t *our_key_held)
+/*
+ * Change the lock_args (and global mode settings) of a sanlock VG while
+ * no other host is using it.  For setlockargs, set_args holds the new
+ * user flags.  For --locksettings, global_mode is 1 or 2 and set_args is
+ * NULL; lvmlockd keeps the existing lock_args flags.
+ * global_mode 2: the GLLK of the VG is disabled (old lvm versions then find
+ * no global lock to acquire.)
+ * global_mode 1: global_lock_owner tells lvmlockd to enable the GLLK of the
+ * VG, otherwise the GLLK is left as it is.  *gl_enabled is set if the GLLK
+ * of the VG is enabled afterward.
+ */
+
+static int _lockd_change_lockargs(struct cmd_context *cmd, struct volume_group *vg,
+				  const char *set_args, int global_mode, int global_lock_owner,
+				  int *gl_enabled, uint64_t *our_key_held)
 {
 	daemon_reply reply;
 	const char *reply_str;
 	const char *vg_lock_args = NULL;
+	const char *opts = "none";
 	uint32_t result_flags;
-	uint32_t lock_args_flags = 0;
 	int result;
 	int ret;
 
-	if (!_use_lvmlockd) {
-		log_error("lvmlockd is not in use.");
-		return 0;
-	}
-	if (!_lvmlockd_connected) {
-		log_error("lvmlockd is not connected.");
-		return 0;
-	}
-
-	if (!vg->lock_type || strcmp(vg->lock_type, "sanlock")) {
-		log_error("setlockargs is only supported for lock type sanlock.");
-		return 0;
-	}
-
-	if (!set_args)
-		return_0;
-
-	if (!lockd_lockargs_get_user_flags(set_args, &lock_args_flags))
-		return_0;
-
-	if ((lock_args_flags & LOCKARGS_PERSIST) && !(vg->pr & VG_PR_REQUIRE)) {
-		log_error("lockargs \"persist\" requires persistent reservation setting \"require\".");
-		return 0;
-	}
+	if (global_mode == LOCKD_GLOBAL_MODE_2)
+		opts = "disable";
+	else if (global_mode == LOCKD_GLOBAL_MODE_1 && global_lock_owner)
+		opts = "enable";
 
 	/*
 	 * Check if other PR keys are registered, which would
@@ -5564,7 +5561,9 @@ int lockd_setlockargs(struct cmd_context *cmd, struct volume_group *vg, const ch
 				"vg_name = %s", vg->name,
 				"vg_lock_type = %s", vg->lock_type,
 				"vg_lock_args = %s", vg->lock_args,
-				"set_lock_args = %s", set_args,
+				"set_lock_args = %s", set_args ?: "none",
+				"global_mode = " FMTd64, (int64_t) global_mode,
+				"opts = %s", opts,
 				NULL);
 
 	if (!_lockd_result(cmd, "setlockargs_vg_before", reply, &result, &result_flags, NULL, NULL)) {
@@ -5631,7 +5630,9 @@ int lockd_setlockargs(struct cmd_context *cmd, struct volume_group *vg, const ch
 				"vg_name = %s", vg->name,
 				"vg_lock_type = %s", vg->lock_type,
 				"vg_lock_args = %s", vg->lock_args,
-				"set_lock_args = %s", set_args,
+				"set_lock_args = %s", set_args ?: "none",
+				"global_mode = " FMTd64, (int64_t) global_mode,
+				"opts = %s", opts,
 				NULL);
 
 	if (!_lockd_result(cmd, "setlockargs_vg_final", reply, &result, &result_flags, NULL, NULL)) {
@@ -5643,6 +5644,12 @@ int lockd_setlockargs(struct cmd_context *cmd, struct volume_group *vg, const ch
 		daemon_reply_destroy(reply);
 		sleep(1);
 		goto retry_final;
+	}
+
+	if (result < 0) {
+		log_error("VG %s setlockargs failed: result %d", vg->name, result);
+		ret = 0;
+		goto out;
 	}
 
 	if (!(reply_str = daemon_reply_str(reply, "vg_lock_args", NULL))) {
@@ -5659,10 +5666,46 @@ int lockd_setlockargs(struct cmd_context *cmd, struct volume_group *vg, const ch
 	log_debug("lockd setlockargs_vg %s result %d new lock_args %s", vg->name, result, vg_lock_args);
 
 	vg->lock_args = vg_lock_args;
+
+	if (gl_enabled)
+		*gl_enabled = (result_flags & LD_RF_GL_ENABLED) ? 1 : 0;
+
 	ret = 1;
 
 out:
 	daemon_reply_destroy(reply);
 	return ret;
+}
+
+int lockd_setlockargs(struct cmd_context *cmd, struct volume_group *vg, const char *set_args, uint64_t *our_key_held)
+{
+	uint32_t lock_args_flags = 0;
+
+	if (!_use_lvmlockd) {
+		log_error("lvmlockd is not in use.");
+		return 0;
+	}
+	if (!_lvmlockd_connected) {
+		log_error("lvmlockd is not connected.");
+		return 0;
+	}
+
+	if (!vg->lock_type || strcmp(vg->lock_type, "sanlock")) {
+		log_error("setlockargs is only supported for lock type sanlock.");
+		return 0;
+	}
+
+	if (!set_args)
+		return_0;
+
+	if (!lockd_lockargs_get_user_flags(set_args, &lock_args_flags))
+		return_0;
+
+	if ((lock_args_flags & LOCKARGS_PERSIST) && !(vg->pr & VG_PR_REQUIRE)) {
+		log_error("lockargs \"persist\" requires persistent reservation setting \"require\".");
+		return 0;
+	}
+
+	return _lockd_change_lockargs(cmd, vg, set_args, 0, 0, NULL, our_key_held);
 }
 
