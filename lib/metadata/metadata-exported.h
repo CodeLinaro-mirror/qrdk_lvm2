@@ -643,6 +643,13 @@ struct pvcreate_params {
 	char *vg_name;
 
 	/*
+	 * setpersist_flags came from persistent_reservations=full
+	 * rather than an explicit --setpersist option; vgcreate applies
+	 * it only when all devs support PR.
+	 */
+	int setpersist_default;
+
+	/*
 	 * From recovery-specific command line args.
 	 */
 	const char *restorefile; /* NULL if no --restorefile option */

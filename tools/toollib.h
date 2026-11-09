@@ -22,6 +22,61 @@
 int become_daemon(struct cmd_context *cmd, int skip_lvm);
 
 /*
+ * The element of the devs list created by dev_args_list_create(_available) and
+ * processed by the devs_* functions.
+ *
+ * The devs_* functions that check devs mark a dev that fails with "failed" and
+ * log why, then return 0 after checking all devs.  A command that requires all
+ * devs fails.  A command that can use some of the devs continues with the devs
+ * that have not failed.  The devs_* functions skip failed devs.  A failed dev
+ * stays in the list so that it can still be released by unlock_global_devs.
+ * (dev is NULL for an arg that did not resolve to a device.)
+ */
+struct device_arg {
+	struct dm_list list;
+	const char *name;
+	struct device *dev;
+	unsigned failed : 1;
+
+	/*
+	 * The write steps (dev_args_wipe_and_zero, dev_args_pv_setup_and_zero,
+	 * dev_args_pv_write) have nothing to do for this dev, e.g. it is not a PV
+	 * and is being removed, or it is already a PV and will be used as is.
+	 */
+	unsigned skip_write : 1;
+
+	/*
+	 * The usage of the dev, saved by the first dev_args_accepted_for_* call.
+	 * Later calls fail the command if the usage, vg name or pvid changed.
+	 */
+	unsigned usage_saved : 1;
+	unsigned is_not_pv : 1;		/* not a PV */
+	unsigned is_orphan_pv : 1;	/* an orphan PV */
+	unsigned is_vg_pv : 1;		/* a PV in a VG (vg_name) */
+	unsigned is_used_unknown_pv : 1; /* a PV used by an unknown VG */
+	unsigned is_unused_dup_dev : 1;	/* a duplicate of a PV on another dev */
+	char pvid[ID_LEN + 1];
+	const char *vg_name;
+
+	/*
+	 * *_user_prompt: signatures found on the dev that will be wiped
+	 * (struct dev_signature), and the user's answers.  If the user
+	 * agreed to wipe the signatures, dev_args_wipe_and_zero does not ask again.
+	 */
+	struct dm_list sigs;
+	unsigned sigs_detected : 1;
+	unsigned sigs_approved : 1;
+	unsigned prompt_answered : 1;
+};
+
+int dev_args_list_create(struct cmd_context *cmd, int argc, char **argv,
+			 struct dm_list *devs);
+int dev_args_list_create_unique(struct cmd_context *cmd, int argc, char **argv,
+				struct dm_list *devs);
+int dev_args_list_create_available(struct cmd_context *cmd, int argc, char **argv,
+				   struct dm_list *devs);
+
+/*
  * The "struct processing_handle" is used as a handle for processing
  * functions (process_each_* and related).
  *
@@ -182,6 +237,45 @@ void opt_array_to_str(struct cmd_context *cmd, const uint16_t *opts, int count,
 
 int pvcreate_params_from_args(struct cmd_context *cmd, struct pvcreate_params *pp);
 int pvcreate_each_device(struct cmd_context *cmd, struct processing_handle *handle, struct pvcreate_params *pp);
+void dev_args_filter_clear(struct cmd_context *cmd, struct dm_list *devs);
+int dev_args_filter_nodata(struct cmd_context *cmd, struct dm_list *devs);
+int dev_args_filter_read(struct cmd_context *cmd, struct dm_list *devs);
+int dev_passes_filter_nodata(struct cmd_context *cmd, struct device *dev);
+int dev_args_old_ext_version(struct dm_list *devs);
+int dev_args_label_scan(struct cmd_context *cmd, struct dm_list *devs);
+int dev_open_excl(struct device *dev);
+int dev_args_any_failed(struct dm_list *devs);
+int dev_args_all_failed(struct dm_list *devs);
+void dev_args_label_drop(struct cmd_context *cmd, struct dm_list *devs);
+int dev_args_label_scan_excl(struct cmd_context *cmd, struct dm_list *devs);
+void dev_args_close(struct cmd_context *cmd, struct dm_list *devs);
+int dev_args_accepted_for_pvremove(struct cmd_context *cmd, struct dm_list *devs);
+int pvremove_user_prompt(struct cmd_context *cmd, struct dm_list *devs, int *repeat);
+int dev_args_accepted_for_pvcreate(struct cmd_context *cmd, struct dm_list *devs,
+				   struct pvcreate_params *pp);
+int pvcreate_user_prompt(struct cmd_context *cmd, struct dm_list *devs, int *repeat);
+int dev_args_wipe_and_zero(struct cmd_context *cmd, struct dm_list *devs);
+int dev_args_label_remove(struct cmd_context *cmd, struct dm_list *devs);
+int dev_args_pv_setup_and_zero(struct cmd_context *cmd, struct dm_list *devs,
+			       struct pv_create_args *pva, struct dm_list *pvs);
+int dev_args_pv_write(struct cmd_context *cmd, struct dm_list *devs, struct dm_list *pvs);
+int dev_args_update_devices_file(struct cmd_context *cmd, struct dm_list *devs,
+				 struct dm_list *pvs, int remove);
+int dev_args_accepted_for_vgcreate(struct cmd_context *cmd, struct dm_list *devs,
+				   struct pvcreate_params *pp);
+int vgcreate_user_prompt(struct cmd_context *cmd, struct dm_list *devs, int *repeat);
+int dev_args_pv_orphans_read(struct cmd_context *cmd, struct dm_list *devs, struct dm_list *pvs);
+int dev_args_to_device_list(struct cmd_context *cmd, struct dm_list *args,
+			    struct dm_list *devs, int skip_failed);
+int dev_args_all_pv_orphans(struct dm_list *devs);
+int dev_args_all_vg_members(struct dm_list *devs);
+int lock_global_dev_args(struct cmd_context *cmd, struct dm_list *devs);
+int unlock_global_dev_args(struct cmd_context *cmd, struct dm_list *devs);
+int dev_args_accepted_for_vgextend_early(struct cmd_context *cmd, struct dm_list *devs,
+					 struct pvcreate_params *pp);
+int dev_args_accepted_for_vgextend(struct cmd_context *cmd, struct dm_list *devs,
+				   struct volume_group *vg, struct pvcreate_params *pp);
+int vgextend_user_prompt(struct cmd_context *cmd, struct dm_list *devs, int *repeat);
 
 int vgcreate_params_set_defaults(struct cmd_context *cmd,
 				 struct vgcreate_params *vp_def,
