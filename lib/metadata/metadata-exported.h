@@ -795,6 +795,7 @@ int vg_remove_direct(struct volume_group *vg);
 int vg_remove(struct volume_group *vg);
 int vg_rename(struct cmd_context *cmd, struct volume_group *vg,
 	      const char *new_name);
+int vg_check_devs_block_sizes(struct volume_group *vg, struct dm_list *devs);
 int vg_extend_each_pv(struct volume_group *vg, struct pvcreate_params *pp);
 
 int vgreduce_single(struct cmd_context *cmd, struct volume_group *vg,
