@@ -173,7 +173,7 @@ verify_key_removed() {
 # Test 1: verify lock_args metadata for persist,timeout
 #
 # Create a shared VG with persist,timeout lock_args.
-# Verify lock_args version 2.0.0 and flags in VG metadata.
+# Verify lock_args version 2.1.0 and flags in VG metadata.
 # ---------------------------------------------------------------
 
 echo "== Test 1: vgcreate --setlockargs persist,timeout =="
@@ -181,7 +181,7 @@ echo "== Test 1: vgcreate --setlockargs persist,timeout =="
 node1 vgcreate --shared --setpersist y --setlockargs persist,timeout testvg $dev1 $dev2
 nodep vgchange --lockstart --persist start testvg
 
-node1 vgs -o+lockargs testvg | grep '2.0.0'
+node1 vgs -o+lockargs testvg | grep '2.1.0'
 node1 vgs -o lockargs --noheadings testvg | grep 'persist'
 node1 vgs -o lockargs --noheadings testvg | not grep 'notimeout'
 
