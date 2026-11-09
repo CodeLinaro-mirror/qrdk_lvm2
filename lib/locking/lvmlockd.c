@@ -913,6 +913,71 @@ static int _lockd_request(struct cmd_context *cmd,
 }
 
 /*
+ * A global lock request includes the global mode and the name of the VG
+ * holding the global lock, from the command's scan.  An unlock request does
+ * not include them.
+ */
+
+static int _lockd_request_gl(struct cmd_context *cmd,
+			     const char *mode,
+			     const char *opts,
+			     int global_mode,
+			     const char *global_vgname,
+			     int *result,
+			     uint32_t *result_flags,
+			     struct owner *owner)
+{
+	const char *cmd_name = get_cmd_name();
+	daemon_reply reply;
+	int pid = getpid();
+
+	*result = 0;
+	*result_flags = 0;
+
+	if (!strcmp(mode, "na"))
+		return 1;
+
+	if (!_use_lvmlockd)
+		return 0;
+	if (!_lvmlockd_connected)
+		return 0;
+
+	if (!cmd_name || !cmd_name[0])
+		cmd_name = "none";
+
+	if (global_mode > 0) {
+		reply = _lockd_send("lock_gl",
+				"cmd = %s", cmd_name,
+				"pid = " FMTd64, (int64_t) pid,
+				"mode = %s", mode,
+				"opts = %s", opts ?: "none",
+				"vg_lock_type = %s", "none",
+				"global_mode = " FMTd64, (int64_t) global_mode,
+				"global_vgname = %s", (global_vgname && global_vgname[0]) ? global_vgname : "none",
+				NULL);
+	} else {
+		reply = _lockd_send("lock_gl",
+				"cmd = %s", cmd_name,
+				"pid = " FMTd64, (int64_t) pid,
+				"mode = %s", mode,
+				"opts = %s", opts ?: "none",
+				"vg_lock_type = %s", "none",
+				NULL);
+	}
+
+	if (!_lockd_result(cmd, "lock_gl", reply, result, result_flags, owner, NULL)) {
+		log_error("lvmlockd lock_gl %s failed no result", mode);
+		daemon_reply_destroy(reply);
+		return 0;
+	}
+
+	log_debug("lockd lock_gl %s result %d %x", mode, *result, *result_flags);
+
+	daemon_reply_destroy(reply);
+	return 1;
+}
+
+/*
  * Eventually add an option to specify which pv the lvmlock lv should be placed on.
  */
 
@@ -2438,17 +2503,13 @@ out:
 }
 
 /*
- * The global lock protects:
- *
- * - The global VG namespace.  Two VGs cannot have the same name.
- *   Used by any command that creates or removes a VG name,
- *   e.g. vgcreate, vgremove, vgrename, vgsplit, vgmerge.
+ * The global lock protects the same things that PR protects on devices
+ * that do not belong to a VG (see lockd_global_devices_lock):
  *
  * - The set of orphan PVs.
  *   Used by any command that changes a non-PV device into an orphan PV,
- *   an orphan PV into a device, a non-orphan PV (in a VG) into an orphan PV
- *   (not in a VG), or an orphan PV into a non-orphan PV,
- *   e.g. pvcreate, pvremove, vgcreate, vgremove, vgextend, vgreduce.
+ *   an orphan PV into a device, or an orphan PV into a non-orphan PV,
+ *   e.g. pvcreate, pvremove, vgcreate, vgextend.
  *
  * - The properties of orphan PVs.  It is possible to make changes to the
  *   properties of an orphan PV, e.g. pvresize, pvchange.
@@ -2457,33 +2518,23 @@ out:
  * orphan PVs do not belong to a real VG (an artificial VG does not
  * apply since a sanlock lock only exists on real storage.)
  *
- * If a command will change any of the things above, it must first acquire
- * the global lock in exclusive mode.
+ * The global lock is not used to protect the VG namespace (two VGs having
+ * the same name), which PR cannot protect.  Commands that only read global
+ * state, or that change VG names, do not use the global lock.
  *
- * If command is reading any of the things above, it must acquire the global
- * lock in shared mode.  A number of commands read the things above, including:
+ * A command acquires the global lock only in ex mode, and only through
+ * lock_global_devs(), which acquires either PR on the devs or the global
+ * lock, depending on the global mode.  The global lock is released with
+ * unlock_global_devs() (or by lvmlockd when the command disconnects.)
  *
- * - Reporting/display commands which show all VGs.  Any command that
- *   will iterate through the entire VG namespace must first acquire the
- *   global lock shared so that it has an accurate view of the namespace.
+ * (lvmlockd can still acquire the global lock in sh mode, and this function
+ * handles sh, but no command currently uses it.)
  *
- * - A command where a tag name is used to identify what to process.
- *   A tag requires reading all VGs to check if they match the tag.
- *
- * In these cases, the global lock must be acquired before the list of
- * all VGs is created.
- *
- * The global lock is not generally unlocked explicitly in the code.
- * When the command disconnects from lvmlockd, lvmlockd automatically
- * releases the locks held by the command.  The exception is if a command
- * will continue running for a long time while not needing the global lock,
- * e.g. commands that poll to report progress.
- *
- * There are two cases where the global lock can be taken in shared mode,
- * and then later converted to ex.  pvchange and pvresize use process_each_pv
- * which does lockd_gl("sh") to get the list of VGs.  Later, in the "_single"
- * function called within process_each_pv, the PV may be an orphan, in which
- * case the ex global lock is needed, so it's converted to ex at that point.
+ * Commands that release PVs from a VG (vgreduce, vgremove) do not use the
+ * global lock.  The PVs are protected from use by other hosts while they are
+ * released only if the VG uses PR (--setpersist y), where the PR on the PVs
+ * is dropped after the last write to them.  Without VG PR, another host could
+ * use the PVs between the VG write and the final PV write.
  *
  * Effects of misconfiguring use_lvmlockd.
  *
@@ -2516,7 +2567,14 @@ out:
  * are unprotected.
  */
 
-int lockd_global(struct cmd_context *cmd, const char *def_mode)
+/*
+ * A lock request must include the global mode (and the name of the VG holding
+ * the global lock when known), which the command gets from its label scan.
+ * An unlock request does not need them (global_mode -1.)
+ */
+
+static int _lockd_global(struct cmd_context *cmd, const char *def_mode,
+			 int global_mode, const char *global_vgname)
 {
 	struct owner owner = { 0 };
 	char opt_buf[64] = {};
@@ -2582,9 +2640,8 @@ int lockd_global(struct cmd_context *cmd, const char *def_mode)
  req:
 	log_debug("lockd global %s", mode);
 
-	if (!_lockd_request(cmd, "lock_gl",
-			    NULL, NULL, NULL, NULL, NULL, NULL, mode, opts,
-			    NULL, &result, &result_flags, &owner, NULL)) {
+	if (!_lockd_request_gl(cmd, mode, opts, global_mode, global_vgname,
+			       &result, &result_flags, &owner)) {
 		/* No result from lvmlockd, it is probably not running. */
 
 		/* We don't care if an unlock fails. */
@@ -2787,6 +2844,16 @@ int lockd_global(struct cmd_context *cmd, const char *def_mode)
 		cmd->lockd_global_ex = 1;
 
 	return 1;
+}
+
+/*
+ * Old entry point used by lock_global() until the remaining commands are
+ * converted to lock_global_devs(); the global mode comes from the caller's
+ * scan in the new code.
+ */
+int lockd_global(struct cmd_context *cmd, const char *def_mode)
+{
+	return _lockd_global(cmd, def_mode, -1, NULL);
 }
 
 /*
