@@ -18,6 +18,7 @@
 
 #include "lib/device/dev-cache.h"
 #include "lib/device/dev-type.h"
+#include "lib/device/persist.h"
 #include "lib/commands/cmd_enum.h"
 #include "lib/log/lvm-logging.h"
 #include "lib/misc/lvm-string.h"
@@ -78,6 +79,25 @@ struct cmd_report {
 	struct dm_report_group *report_group;
 	struct dm_report *log_rh;
 	const char *log_name;
+};
+
+/*
+ * Protection held by lock_global_devs() on the devices a command is
+ * about to claim, until unlock_global_devs().
+ */
+enum global_devs_held {
+	GLOBAL_DEVS_NONE = 0,
+	GLOBAL_DEVS_GL,		/* global lock held ex */
+	GLOBAL_DEVS_PR,		/* PR held on the devices */
+};
+
+struct global_devs_lock {
+	enum global_devs_held held;
+	unsigned bootstrap:1;	/* vgcreate: no global lock exists yet, don't take GL */
+	int mode;		/* vgcreate: global mode selected from the scan or config */
+	unsigned handed_off:1;	/* persist_vg*_update stopped or replaced the PR, don't release it */
+	unsigned begin_pr:1;	/* persist_vgcreate/vgextend_begin registered begin_key, release it unless handed off */
+	char begin_key[PR_KEY_BUF_SIZE];	/* the key registered by persist_vg*_begin */
 };
 
 /* FIXME Split into tool & library contexts */
@@ -176,6 +196,7 @@ struct cmd_context {
 	unsigned lockd_lv_sh_for_ex:1;
 	unsigned lockd_global_ex:1;		/* set while global lock held ex (lockd) */
 	unsigned lockf_global_ex:1;		/* set while global lock held ex (flock) */
+	struct global_devs_lock global_devs;	/* see lock_global_devs() */
 	unsigned nolocking:1;
 	unsigned vg_notify:1;
 	unsigned lv_notify:1;
