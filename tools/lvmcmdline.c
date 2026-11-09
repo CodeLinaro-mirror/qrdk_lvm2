@@ -3082,8 +3082,7 @@ static void _init_md_checks(struct cmd_context *cmd)
 		cmd->md_component_checks = "auto";
 	}
 
-	if (!strcmp(cmd->md_component_checks, "full"))
-		cmd->use_full_md_check = 1;
+	cmd->use_full_md_check = !strcmp(cmd->md_component_checks, "full");
 
 	/* use_full_md_check can also be set later */
 
