@@ -2955,6 +2955,70 @@ int lockd_global_devices_unlock(struct cmd_context *cmd, struct dm_list *devs,
 	return 1;
 }
 
+int lockd_vgcreate_begin(struct cmd_context *cmd, const char *lock_type,
+			 struct vgcreate_lockd_params *params)
+{
+	const char *found_lock_type = NULL;
+	int config_mode;
+	int non_sanlock = is_lockd_type(lock_type) && strcmp(lock_type, "sanlock");
+
+	if (!_use_lvmlockd)
+		return 1;
+
+	/*
+	 * The global mode is determined by the shared VGs in the initial label
+	 * scan of this command.  When configured to be 1 or 2, then return an
+	 * error if a different mode is found.  If no shared VGs exist, this
+	 * vgcreate bootstraps the global mode, using the configured mode or
+	 * preferring GM2 (GM1 for non-sanlock lock types, and for a VG that
+	 * is not shared.)
+	 */
+
+	config_mode = _lockd_config_global_mode(cmd);
+	if (config_mode < 0)
+		return 0;
+
+	if (!lockd_get_scan_global_mode(&params->scan_mode, &found_lock_type))
+		return 0;
+
+	if (config_mode && params->scan_mode && config_mode != params->scan_mode) {
+		log_error("Configured global mode %d conflicts with disk global mode %d.",
+			  config_mode, params->scan_mode);
+		return 0;
+	}
+
+	if (params->scan_mode == LOCKD_GLOBAL_MODE_0) {
+		params->bootstrap = 1;
+		if (!lockd_get_bootstrap_global_mode(cmd, lock_type, &params->global_mode))
+			return 0;
+	} else {
+		params->global_mode = params->scan_mode;
+
+		if (params->global_mode == LOCKD_GLOBAL_MODE_2 && non_sanlock) {
+			log_error("Global mode 2 requires a sanlock VG.");
+			return 0;
+		}
+
+		if (is_lockd_type(lock_type) && found_lock_type &&
+		    strcmp(lock_type, found_lock_type)) {
+			log_error("Cannot create VG with lock type %s: existing shared VGs use lock type %s.",
+				  lock_type, found_lock_type);
+			return 0;
+		}
+	}
+
+	/*
+	 * The caller next uses lock_global_devs() to acquire PR on devices,
+	 * or GL, depending on the Global Mode selected above.
+	 * While bootstrapping, there is no global lock to take yet.
+	 */
+
+	cmd->global_devs.mode = params->global_mode;
+	cmd->global_devs.bootstrap = params->bootstrap && !non_sanlock;
+
+	return 1;
+}
+
 /*
  * VG lock
  *

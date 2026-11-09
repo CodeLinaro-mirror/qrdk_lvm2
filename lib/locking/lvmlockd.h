@@ -21,6 +21,12 @@ struct lockd_state {
 	uint64_t generation;
 };
 
+struct vgcreate_lockd_params {
+	int scan_mode;		/* global mode seen in the label scan (0 if no shared VGs) */
+	int global_mode;	/* global mode the new VG will use */
+	int bootstrap;		/* no shared VGs exist, the new VG bootstraps the global mode */
+};
+
 #define LOCKD_SANLOCK_LV_NAME "lvmlock"
 
 /* lockd_lv flags */
@@ -105,10 +111,12 @@ void lvmlockd_disconnect(void);
 int lockd_get_scan_global_mode(int *global_mode, const char **global_type);
 int lockd_get_bootstrap_global_mode(struct cmd_context *cmd, const char *lock_type,
 				    int *global_mode);
-int lockd_global_device_lock(struct cmd_context *cmd, struct dm_list *devs,
+int lockd_global_devices_lock(struct cmd_context *cmd, struct dm_list *devs,
 			     int bootstrap, int *used_gl, int *used_pr);
-int lockd_global_device_unlock(struct cmd_context *cmd, struct dm_list *devs,
+int lockd_global_devices_unlock(struct cmd_context *cmd, struct dm_list *devs,
 			       int used_gl, int used_pr);
+int lockd_vgcreate_begin(struct cmd_context *cmd, const char *lock_type,
+			 struct vgcreate_lockd_params *params);
 
 
 /* vgcreate/vgremove use init/free */
@@ -254,6 +262,12 @@ static inline int lockd_global_devices_lock(struct cmd_context *cmd, struct dm_l
 
 static inline int lockd_global_devices_unlock(struct cmd_context *cmd, struct dm_list *devs,
 					     int used_gl, int used_pr)
+{
+	return 1;
+}
+
+static inline int lockd_vgcreate_begin(struct cmd_context *cmd, const char *lock_type,
+				       struct vgcreate_lockd_params *params)
 {
 	return 1;
 }
