@@ -20,6 +20,7 @@
 #include "lib/device/dev-cache.h"
 #include "lib/device/device_id.h"
 #include "lib/locking/locking.h"
+#include "lib/locking/lvmlockd.h"
 #include "lib/metadata/metadata.h"
 #include "lib/format_text/format-text.h"
 #include "lib/config/config.h"
@@ -68,6 +69,10 @@ struct lvmcache_vginfo {
 	bool scan_summary_mismatch; /* vgsummary from devs had mismatching seqno or checksum */
 	bool has_duplicate_local_vgname;   /* this local vg and another local vg have same name */
 	bool has_duplicate_foreign_vgname; /* this foreign vg and another foreign vg have same name */
+	unsigned lockd_global_mode_1:1;
+	unsigned lockd_global_mode_2:1;
+	unsigned lockd_global_lock_1:1;
+	unsigned lockd_global_lock_2:1;
 };
 
 /*
@@ -142,6 +147,84 @@ unsigned int lvmcache_vg_info_count(void)
 		count++;
 	}
 	return count;
+}
+
+void lvmcache_get_global_mode(int *gm_none, int *gm1, int *gm2,
+			      int *locktype_sanlock, int *locktype_other)
+{
+	struct lvmcache_vginfo *vginfo;
+
+	*gm_none = 0;
+	*gm1 = 0;
+	*gm2 = 0;
+	*locktype_sanlock = 0;
+	*locktype_other = 0;
+
+	dm_list_iterate_items(vginfo, &_vginfos) {
+		if (!vginfo->lock_type || !is_lockd_type(vginfo->lock_type))
+			continue;
+
+		if (vginfo->lockd_global_mode_1)
+			(*gm1)++;
+
+		if (vginfo->lockd_global_mode_2)
+			(*gm2)++;
+
+		if (!vginfo->lockd_global_mode_1 && !vginfo->lockd_global_mode_2)
+			(*gm_none)++;
+
+		if (vginfo->lock_type && !strcmp(vginfo->lock_type, "sanlock"))
+			(*locktype_sanlock)++;
+		else if (vginfo->lock_type)
+			(*locktype_other)++;
+	}
+}
+
+const char *lvmcache_get_lock_type(void)
+{
+	struct lvmcache_vginfo *vginfo;
+	const char *lock_type = NULL;
+
+	dm_list_iterate_items(vginfo, &_vginfos) {
+		if (!vginfo->lock_type || !is_lockd_type(vginfo->lock_type))
+			continue;
+		if (lock_type && strcmp(lock_type, vginfo->lock_type))
+			return NULL;
+		lock_type = vginfo->lock_type;
+	}
+
+	return lock_type;
+}
+
+void lvmcache_get_global_lock(int *gl_none, int *gl1, int *gl2, char *gl_vgname)
+{
+	struct lvmcache_vginfo *vginfo;
+	const char *only_gl_vgname = NULL;
+
+	*gl_none = 0;
+	*gl1 = 0;
+	*gl2 = 0;
+
+	dm_list_iterate_items(vginfo, &_vginfos) {
+		if (!vginfo->lock_type || !is_lockd_type(vginfo->lock_type))
+			continue;
+
+		if (vginfo->lockd_global_lock_1) {
+			(*gl1)++;
+			only_gl_vgname = vginfo->vgname;
+		}
+
+		if (vginfo->lockd_global_lock_2) {
+			(*gl2)++;
+			only_gl_vgname = vginfo->vgname;
+		}
+
+		if (!vginfo->lockd_global_lock_1 && !vginfo->lockd_global_lock_2)
+			(*gl_none)++;
+	}
+
+	if (((*gl1 == 1) && !*gl2) || (!*gl1 && (*gl2 == 1)))
+		dm_strncpy(gl_vgname, only_gl_vgname, NAME_LEN);
 }
 
 int lvmcache_found_duplicate_vgnames(void)
@@ -2225,6 +2308,11 @@ int lvmcache_update_vgname_and_id(struct cmd_context *cmd, struct lvmcache_info 
 	}
 
  update_vginfo:
+	vginfo->lockd_global_mode_1 = vgsummary->lockd_global_mode_1;
+	vginfo->lockd_global_mode_2 = vgsummary->lockd_global_mode_2;
+	vginfo->lockd_global_lock_1 = vgsummary->lockd_global_lock_1;
+	vginfo->lockd_global_lock_2 = vgsummary->lockd_global_lock_2;
+
 	if (!_lvmcache_update_vgstatus(info, vgsummary->vgstatus, vgsummary->creation_host,
 				       vgsummary->lock_type, vgsummary->system_id)) {
 		/*

@@ -17,6 +17,7 @@
 #include "lib/metadata/metadata.h"
 #include "lib/commands/toolcontext.h"
 #include "import-export.h"
+#include "lib/locking/lvmlockd.h"
 
 /* FIXME Use tidier inclusion method */
 static const struct text_vg_version_ops *(_text_vsn_list[2]);
@@ -31,6 +32,36 @@ static void _init_text_import(void)
 	_text_vsn_list[0] = text_vg_vsn1_init();
 	_text_vsn_list[1] = NULL;
 	_text_import_initialised = 1;
+}
+
+/*
+ * Section filter for the vgsummary parse.  The summary needs the VG fields
+ * and the physical_volumes section.  For a sanlock VG it also needs the
+ * lvmlock LV in logical_volumes, which holds the lvmlockd global state tags.
+ * The VG fields, including lock_type, precede the sections in the metadata
+ * text, so lock_type has already been parsed when logical_volumes is reached.
+ * Any other VG does not parse logical_volumes (or anything after
+ * physical_volumes), and the LVs other than lvmlock are skipped without
+ * creating nodes.
+ */
+static enum dm_config_section_action _vgsummary_filter(const struct dm_config_node *parent,
+						       const char *name, unsigned depth,
+						       void *arg)
+{
+	const char *lock_type;
+
+	if (depth == 1 && !strcmp(name, "logical_volumes")) {
+		lock_type = dm_config_find_str(parent->child, "lock_type", NULL);
+		if (lock_type && !strcmp(lock_type, "sanlock"))
+			return DM_CONFIG_SECTION_PARSE;
+		return DM_CONFIG_SECTION_STOP;
+	}
+
+	if (depth == 2 && !strcmp(parent->key, "logical_volumes") &&
+	    strcmp(name, LOCKD_SANLOCK_LV_NAME))
+		return DM_CONFIG_SECTION_SKIP;
+
+	return DM_CONFIG_SECTION_PARSE;
 }
 
 /*
@@ -61,7 +92,8 @@ int text_read_metadata_summary(const struct format_type *fmt,
 		if (!config_file_read_fd(cft, dev, reason, offset, size,
 					 offset2, size2, checksum_fn,
 					 vgsummary->mda_checksum,
-					 checksum_only, 1, 1)) {
+					 checksum_only, 1,
+					 _vgsummary_filter, NULL)) {
 			log_warn("WARNING: Invalid metadata text from %s at %llu.",
 				 dev_name(dev), (unsigned long long)offset);
 			goto out;
@@ -156,7 +188,7 @@ struct volume_group *text_read_metadata(struct format_instance *fid,
 
 		if (!config_file_read_fd(cft, dev, MDA_CONTENT_REASON(primary_mda), offset, size,
 					 offset2, size2, checksum_fn, checksum,
-					 skip_parse, 1, 0)) {
+					 skip_parse, 1, NULL, NULL)) {
 			log_warn("WARNING: Couldn't read volume group metadata from %s.", dev_name(dev));
 			goto out;
 		}
