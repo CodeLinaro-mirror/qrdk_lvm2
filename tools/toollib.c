@@ -2639,14 +2639,6 @@ int process_each_vg(struct cmd_context *cmd,
 		process_all_vgs_on_system = 1;
 
 	/*
-	 * Needed for a current listing of the global VG namespace.
-	 */
-	if (process_all_vgs_on_system && !lock_global(cmd, "sh")) {
-		ret_max = ECMD_FAILED;
-		goto_out;
-	}
-
-	/*
 	 * Scan all devices to populate lvmcache with initial
 	 * list of PVs and VGs.
 	 */
@@ -4204,14 +4196,6 @@ int process_each_lv(struct cmd_context *cmd,
 		process_all_vgs_on_system = 1;
 
 	/*
-	 * Needed for a current listing of the global VG namespace.
-	 */
-	if (process_all_vgs_on_system && !lock_global(cmd, "sh")) {
-		ret_max = ECMD_FAILED;
-		goto_out;
-	}
-
-	/*
 	 * Scan all devices to populate lvmcache with initial
 	 * list of PVs and VGs.
 	 */
@@ -4855,12 +4839,6 @@ int process_each_pv(struct cmd_context *cmd,
 	process_all_pvs = dm_list_empty(&arg_pvnames) && dm_list_empty(&arg_tags);
 
 	process_other_devices = process_all_pvs && (cmd->cname->flags & ENABLE_ALL_DEVS) && all_is_set;
-
-	/* Needed for a current listing of the global VG namespace. */
-	if (!only_this_vgname && !lock_global(cmd, "sh")) {
-		ret_max = ECMD_FAILED;
-		goto_out;
-	}
 
 	if (!(read_flags & PROCESS_SKIP_SCAN)) {
 		if (!lvmcache_label_scan(cmd)) {
