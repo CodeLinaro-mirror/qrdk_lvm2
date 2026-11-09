@@ -153,6 +153,13 @@ node1 pvremove -y $mpath1
 
 echo "== Section 6: Devices file integration =="
 
+# The devices file does not exist on the test nodes (the root VG
+# predates it, so commands refuse to create it); create an empty file
+# so pvcreate adds the mpath device to it.
+node1 "rm -f /etc/lvm/devices/system.devices"
+node1 "mkdir -p /etc/lvm/devices"
+node1 "touch /etc/lvm/devices/system.devices"
+
 node1 pvcreate -y $mpath1
 node1 vgcreate testvg $mpath1
 

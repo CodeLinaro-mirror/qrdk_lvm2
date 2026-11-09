@@ -92,6 +92,12 @@ node1 lvmpersist read-reservation --vg testvg | grep -q "reservation: none"
 # WE: node1 holds reservation, node2 cannot start or write
 node1 lvmpersist start --ourkey $KEY1 --vg testvg
 node2 not lvmpersist start --ourkey $KEY2 $WE_FOR_MPATH --vg testvg
+
+# The failed start retains node2's key registration (lvmpersist(8)).
+# Remove it, otherwise node2 is a registrant, and with the WEAR
+# reservation used for mpath devices all registrants can write.
+node2 lvmpersist stop --ourkey $KEY2 --vg testvg
+
 node1 lvchange -ay testvg/lv1
 node2 lvchange -ay testvg/lv1
 node1 dd if=/dev/zero of=/dev/testvg/lv1 bs=4096 count=1 oflag=direct,sync
@@ -190,6 +196,12 @@ node1 lvmpersist read-reservation --vg testvg | grep -q "reservation: none"
 node1 lvmpersist start --ourkey $KEY1 --vg testvg
 node2 not lvmpersist start --ourkey $KEY2 $WE_FOR_MPATH --vg testvg
 node1 lvmpersist check-key --key $KEY1 --vg testvg
+
+# A failed start retains completed registrations (see lvmpersist(8),
+# Errors during PR start), so node2's key remains registered and must
+# be removed with lvmpersist stop.
+node1 lvmpersist check-key --key $KEY2 --vg testvg
+node2 lvmpersist stop --ourkey $KEY2 --vg testvg
 node1 not lvmpersist check-key --key $KEY2 --vg testvg
 
 #
@@ -314,13 +326,20 @@ for i in $(seq 1 5); do
 
     success_node 'lvmpersist check-key --key 0x100${NODE_NUM} --vg testvg'
 
+    # A failed start leaves the local key registered (lvmpersist(8),
+    # Errors during PR start), so the losing nodes' keys are present.
     for node_num in $NODEP_FAIL_NODES; do
-        noden ${node_num} not lvmpersist check-key --key 0x100${node_num} --vg testvg
+        noden ${node_num} lvmpersist check-key --key 0x100${node_num} --vg testvg
         noden ${node_num} not dd if=/dev/zero of=$d1 bs=4096 count=1 oflag=direct,sync
         noden ${node_num} not dd if=/dev/zero of=$d2 bs=4096 count=1 oflag=direct,sync
     done
 
     success_node 'lvmpersist stop --ourkey 0x100${NODE_NUM} --vg testvg'
+
+    # remove the keys left registered by the losing nodes
+    for node_num in $NODEP_FAIL_NODES; do
+        noden ${node_num} lvmpersist stop --ourkey 0x100${node_num} --vg testvg
+    done
 
     sleep 0.5
 done
