@@ -180,8 +180,12 @@ node1 vgremove -y testvg
 echo "== Section 7: vgimportdevices =="
 
 wipe_all
-node1 "rm $DF"
+node1 "rm -f $DF"
+node1 "touch $DF"
 
+# vgcreate does not create the devices file on these nodes (the root VG
+# predates it, so 'Not creating system devices file due to existing
+# VGs'); create an empty file first so the PVs are added to it.
 node1 vgcreate testvg $d1 $d2 ${d3:+$d3}
 node1 "rm -f $DF"
 node1 "touch $DF"
@@ -205,7 +209,8 @@ node1 vgremove -y testvg
 echo "== Section 8: vgimportdevices -a =="
 
 wipe_all
-node1 "rm $DF"
+node1 "rm -f $DF"
+node1 "touch $DF"
 
 node1 vgcreate testvg1 $d1
 node1 vgcreate testvg2 $d2
@@ -229,7 +234,8 @@ node1 vgremove -y testvg2
 echo "== Section 9: vgimportclone --importdevices =="
 
 wipe_all
-node1 "rm $DF"
+node1 "rm -f $DF"
+node1 "touch $DF"
 
 node1 pvcreate $d1
 node1 vgcreate testvg1 $d1
