@@ -422,6 +422,233 @@ bad:
 #define _lockd_send(req_name, args...)	\
 	_lockd_send_with_pvs(req_name, NULL, ##args)
 
+/*
+ * Global Mode
+ *
+ * The Global Mode (GM) selects how global state is protected:
+ *
+ * 1: global state is protected by the Global Lock (GL1).
+ * 2: global state is protected by Persistent Reservations (PR) on the devs,
+ *    with the GL (GL2) used only as a fallback when the devs do not support PR.
+ *    Requires lock type sanlock.
+ * 0: no shared VGs exist, so there is no GM (also called GMN below.)
+ *
+ * The GM is determined by the shared VGs seen on disk: each shared VG has a
+ * GM tag on its lvmlock LV (a shared VG without a GM tag was created by an
+ * older lvm and is GM1.)  A command that needs the GM gets it from its own
+ * label scan (lockd_get_scan_global_mode).  If the scan finds both GM1 and
+ * GM2 VGs (GMX, mixed), global protection is not used until the mix is
+ * resolved.  When the scan finds no shared VGs, the GM must be bootstrapped
+ * by vgcreate --shared (lockd_get_bootstrap_global_mode), and until then any
+ * other command needing global protection fails.
+ *
+ * lvmlockd does not store the GM persistently.  Each global lock request
+ * includes the GM and the name of the VG holding the global lock (found from
+ * the LOCKD_GLOBAL_LOCK_1/2 tags in the same scan), which lvmlockd uses to
+ * pick the GL1 or GL2 lease and the lockspace it lives in.  lvmlockd only
+ * remembers the values last used so that it can fail requests that conflict
+ * with them while lockspaces exist.
+ *
+ * GM1 or GM2 can be specified in lvm.conf lvmlockd_global, which can also
+ * be set to "auto" in which case the GM seen in the scan is used, and the
+ * vgcreate bootstrap mode is derived from lvm.conf persistent_reservations:
+ * GM2 when auto or full is set (falling back to GM1 for non-sanlock
+ * lock types), otherwise (none) GM1.  A config setting that conflicts
+ * with the GM seen in the scan is an error.
+ *
+ * lockd_global_devices_lock() uses the GM to decide how to protect device args
+ * that do not belong to a VG: mode 1 takes the GL, mode 2 takes PR on the devs,
+ * or the GL if no devs support PR (devs with mixed PR support are an error).
+ */
+
+/*
+ * The global mode from lvm.conf: LOCKD_GLOBAL_MODE_1/2 when lvmlockd_global
+ * is explicit, otherwise (global_mode_auto) a mode derived from the
+ * persistent_reservations policy when it demands one: none -> 1.  Otherwise 0
+ * (global_mode_auto: adopt the mode seen in the scan; auto/full only
+ * influence the bootstrap mode, see lockd_get_bootstrap_global_mode.)
+ *
+ * The returned mode is compared against the mode seen in the scan, and a
+ * conflict is an error.  Returns -1 on error.
+ */
+static int _lockd_config_global_mode(struct cmd_context *cmd)
+{
+	int mode;
+	int policy;
+
+	if ((mode = lockd_global_mode_parse(cmd)) < 0)
+		return -1;
+
+	if (mode)
+		return mode;
+
+	/* global_mode_auto */
+	if ((policy = persist_policy_get(cmd)) < 0)
+		return -1;
+
+	if (policy == PR_POLICY_NONE)
+		return LOCKD_GLOBAL_MODE_1;
+
+	return 0;
+}
+
+/*
+ * Get the global mode (0 if no shared VGs exist) and lock type of the shared
+ * VGs found by this command's label scan.  Returns 0 and prints an error if
+ * the shared VGs are inconsistent (mixed global modes or lock types.)
+ */
+
+int lockd_get_scan_global_mode(int *global_mode, const char **global_type)
+{
+	int gm_none, gm1, gm2;
+	int locktype_sanlock, locktype_other;
+
+	lvmcache_get_global_mode(&gm_none, &gm1, &gm2,
+				 &locktype_sanlock, &locktype_other);
+
+	if (!locktype_sanlock && !locktype_other) {
+		*global_mode = LOCKD_GLOBAL_MODE_0;
+		*global_type = NULL;
+		return 1;
+	}
+
+	if (locktype_sanlock && locktype_other) {
+		log_error("Shared VGs use different lock types: global protection is not available.");
+		return 0;
+	}
+
+	if (gm1 && gm2) {
+		log_error("Shared VGs use both global mode 1 and global mode 2: global protection is not available until all shared VGs use the same global mode.");
+		return 0;
+	}
+
+	if (gm_none && gm2) {
+		log_error("Shared VGs use both global mode 1 (no global mode tag) and global mode 2: global protection is not available until all shared VGs use the same global mode.");
+		return 0;
+	}
+
+	if (gm2 && !locktype_sanlock) {
+		log_error("Global mode 2 requires shared VGs with lock_type sanlock.");
+		return 0;
+	}
+
+	*global_mode = gm2 ? LOCKD_GLOBAL_MODE_2 : LOCKD_GLOBAL_MODE_1;
+	*global_type = lvmcache_get_lock_type();
+	if (!*global_type) {
+		log_error("Shared VGs use different lock types: global protection is not available.");
+		return 0;
+	}
+	return 1;
+}
+
+/*
+ * Find the VG holding the global lock for the given global mode from the
+ * LOCKD_GLOBAL_LOCK_1/2 tags seen in the scan.  Only used when the global lock
+ * is actually needed.
+ *
+ * GM1 without a LOCK_1 tag on any VG (shared VGs from older lvm) leaves
+ * gl_vgname empty, and lvmlockd searches the started lockspaces for an enabled
+ * global lock.  GM2 requires a LOCK_2 tag since the GL2 lease can only be
+ * located by the tag.  Dlm and idm global locks are not in a VG.
+ */
+
+static int _lockd_get_global_lock_vgname(int global_mode, const char *global_type,
+					 char *gl_vgname, int gl_vgname_size)
+{
+	int gl_none, gl1, gl2;
+	char found_vgname[NAME_LEN] = { 0 };
+
+	gl_vgname[0] = '\0';
+
+	if (!global_type || strcmp(global_type, "sanlock"))
+		return 1;
+
+	lvmcache_get_global_lock(&gl_none, &gl1, &gl2, found_vgname);
+
+	if (global_mode == LOCKD_GLOBAL_MODE_1) {
+		if (gl2) {
+			log_error("Global lock is not available: a VG has a global lock 2 tag in global mode 1.");
+			return 0;
+		}
+		if (gl1 > 1) {
+			log_error("Global lock is not available: multiple VGs have a global lock 1 tag.");
+			return 0;
+		}
+		if (gl1 == 1)
+			dm_strncpy(gl_vgname, found_vgname, gl_vgname_size);
+		return 1;
+	}
+
+	if (gl1) {
+		log_error("Global lock is not available: a VG has a global lock 1 tag in global mode 2.");
+		return 0;
+	}
+	if (gl2 > 1) {
+		log_error("Global lock is not available: multiple VGs have a global lock 2 tag.");
+		return 0;
+	}
+	if (!gl2) {
+		log_error("Global lock is not available: no VG has a global lock 2 tag.");
+		return 0;
+	}
+
+	dm_strncpy(gl_vgname, found_vgname, gl_vgname_size);
+	return 1;
+}
+
+/*
+ * Select the global mode for vgcreate when no shared VGs exist (bootstrap).
+ * Also verifies that the config setting does not conflict with the
+ * mode seen in the scan.
+ */
+
+int lockd_get_bootstrap_global_mode(struct cmd_context *cmd, const char *lock_type,
+				    int *global_mode)
+{
+	int lockd_type = is_lockd_type(lock_type);
+	int non_sanlock = lockd_type && strcmp(lock_type, "sanlock");
+	int config_mode;
+
+	/*
+	 * A VG that is not shared (a local VG) does not establish or use a
+	 * global mode: bootstrapping global mode 1 means no global lock exists
+	 * to take.  (The lvmlockd_global config setting applies to shared VGs.
+	 * Using global mode 2 for a local VG would require a PR key and
+	 * PR-capable devices for a VG that no other host uses.)
+	 */
+	if (!lockd_type) {
+		*global_mode = LOCKD_GLOBAL_MODE_1;
+		return 1;
+	}
+
+	config_mode = _lockd_config_global_mode(cmd);
+	if (config_mode < 0)
+		return 0;
+
+	if (config_mode) {
+		/* Explicit lvmlockd_global, or persistent_reservations=none. */
+		*global_mode = config_mode;
+	} else {
+		/* global_mode_auto with auto (the default) or full:
+		 * bootstrap GM2, so that PR is used in place of the global
+		 * lock in new environments without any user configuration. */
+		*global_mode = LOCKD_GLOBAL_MODE_2;
+	}
+
+	if (*global_mode == LOCKD_GLOBAL_MODE_2 && non_sanlock) {
+		if (config_mode == LOCKD_GLOBAL_MODE_2) {
+			/* Explicit lvmlockd_global=global_mode_2: demanded
+			 * but impossible (dlm cannot use GM2.) */
+			log_error("Global mode 2 requires a sanlock VG.");
+			return 0;
+		}
+		/* GM2 was not demanded (auto/full): fall back to GM1. */
+		*global_mode = LOCKD_GLOBAL_MODE_1;
+	}
+
+	return 1;
+}
+
 static int _lockd_retrieve_vg_pv_num(struct volume_group *vg)
 {
 	struct pv_list *pvl;
