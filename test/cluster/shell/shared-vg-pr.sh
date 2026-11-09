@@ -21,6 +21,11 @@ fi
 
 nodes 'sed -i -e "/pr_key/d" -e "/host_id/d" -e "/local {/a\\    host_id = ${NODE_NUM}" /etc/lvm/lvmlocal.conf'
 
+# Some checks rely on the global protection of dev args using PR
+# (global mode 2); the default policy (persistent_reservations=auto)
+# bootstraps global mode 2 for the first shared VG in a new environment.
+node1 "lvmconfig --type default global/persistent_reservations | grep -q 'persistent_reservations=\[\"auto\"\]'"
+
 node1 lvmconfig local/host_id
 node2 lvmconfig local/host_id
 
@@ -307,15 +312,27 @@ node1_vgremove_retry
 #
 # vgchange --setpersist: individual settings
 #
+node1_vgsetpersist_retry() {
+    local tries=0
+    until node1 vgchange --setpersist "$@" testvg; do
+        tries=$((tries + 1))
+        [ $tries -ge 10 ] && return 1
+        sleep 1
+    done
+}
+
 node1 vgcreate --shared testvg $d1 $d2
 
-node1 vgchange --setpersist y testvg
+# Retry: the lockspace was just (re)created, and sanlock may briefly
+# report unknown host state from the previous lockspace instance,
+# which setpersist rejects ("wait and retry").
+node1_vgsetpersist_retry y
 node1 vgs -o persist testvg | grep 'require,autostart'
 
-node1 vgchange --setpersist noautostart testvg
+node1_vgsetpersist_retry noautostart
 node1 vgs -o persist testvg | grep 'require'
 
-node1 vgchange --setpersist autostart testvg
+node1_vgsetpersist_retry autostart
 node1 vgs -o persist testvg | grep 'require,autostart'
 
 node1 vgchange --setpersist norequire testvg
@@ -440,7 +457,9 @@ node1_vgremove_retry
 # ============================================================
 
 #
-# vgextend: all hosts must start PR on new device before vgextend
+# vgextend: PR must not already exist on the new device.  vgextend starts
+# PR on the new device for the extending host, other hosts then run
+# vgchange --persist start.
 #
 if [ -n "$d3" ]; then
 
@@ -451,16 +470,68 @@ node2 vgchange --persist start testvg
 node2 vgchange --lockstart testvg
 KEY2=$(get_key 2)
 
+# VG keys already registered on the new dev: vgextend must fail
 node1 lvmpersist start --ourkey $KEY1 --access sh --device $d3
 node2 lvmpersist start --ourkey $KEY2 --access sh --device $d3
-
-node1 lvmpersist check-key --key $KEY1 --device $d3
-node1 lvmpersist check-key --key $KEY2 --device $d3
+node1 not vgextend testvg $d3
+node1 lvmpersist stop --ourkey $KEY1 --device $d3
+node2 lvmpersist stop --ourkey $KEY2 --device $d3
+node1 lvmpersist read-keys --device $d3 | tee out
+check_key_none out
 
 node1 vgextend testvg $d3
 
 node1 vgchange --persist check testvg | grep -q "$KEY1"
 node1 lvmpersist check-key --key $KEY1 --device $d3
+node1 not lvmpersist check-key --key $KEY2 --device $d3
+
+# node2 has not started PR on the new dev
+node2 not vgchange --persist check testvg
+
+node2 vgchange --persist start testvg
+node2 vgchange --persist check testvg
+node1 lvmpersist check-key --key $KEY1 --device $d3
+node1 lvmpersist check-key --key $KEY2 --device $d3
+
+node2 vgchange --lockstop testvg
+node2 vgchange --persist stop testvg
+
+node1_vgremove_retry
+
+fi # d3
+
+#
+# vgreduce clears PR on the removed PV (our key and other hosts' keys), after
+# writing it, so the PV can be used by another VG.
+#
+if [ -n "$d3" ]; then
+
+node1 vgcreate --shared --setpersist y testvg $d1 $d2 $d3
+KEY1=$(get_key 1)
+
+node2 vgchange --persist start testvg
+node2 vgchange --lockstart testvg
+KEY2=$(get_key 2)
+
+node1 lvmpersist check-key --key $KEY1 --device $d3
+node1 lvmpersist check-key --key $KEY2 --device $d3
+
+node1 vgreduce testvg $d3
+
+node1 lvmpersist read-keys --device $d3 | tee out
+check_key_none out
+node1 lvmpersist read-reservation --device $d3 | tee out
+check_reservation_none out
+
+# the VG keeps PR on the remaining devs
+node1 lvmpersist check-key --key $KEY1 --device $d1
+node1 lvmpersist check-key --key $KEY2 --device $d1
+node1 lvmpersist check-key --key $KEY1 --device $d2
+node1 lvmpersist check-key --key $KEY2 --device $d2
+
+# the reduced PV can be used by another VG on another host
+node2 vgcreate --shared testvg2 $d3
+node2 vgremove -y -f testvg2
 
 node2 vgchange --lockstop testvg
 node2 vgchange --persist stop testvg

@@ -152,7 +152,7 @@ verify_key_removed() {
 # Test 1: vgcreate --setlockargs persist,notimeout
 #
 # Create a shared VG with persist and notimeout lock_args,
-# verify lock_args version 2.0.0 and flags in VG metadata.
+# verify lock_args version 2.1.0 and flags in VG metadata.
 # ---------------------------------------------------------------
 
 echo "== Test 1: vgcreate --setlockargs persist,notimeout =="
@@ -160,7 +160,7 @@ echo "== Test 1: vgcreate --setlockargs persist,notimeout =="
 node1 vgcreate --shared --setpersist y --setlockargs persist,notimeout testvg $dev1 $dev2
 nodep vgchange --lockstart --persist start testvg
 
-node1 vgs -o+lockargs testvg | grep '2.0.0'
+node1 vgs -o+lockargs testvg | grep '2.1.0'
 node1 vgs -o lockargs --noheadings testvg | grep 'persist'
 node1 vgs -o lockargs --noheadings testvg | grep 'notimeout'
 
@@ -185,7 +185,7 @@ echo "== Test 2: vgchange --setlockargs persist,notimeout =="
 node1 vgcreate --shared --setpersist y testvg $dev1 $dev2
 node1 vgchange --persist start testvg
 
-node1 vgs -o+lockargs testvg | grep '1.0.0'
+node1 vgs -o+lockargs testvg | grep '1.1.0'
 
 # setlockargs requires no other hosts in lockspace
 # (do not lockstart on node2 before setlockargs,
@@ -196,7 +196,7 @@ node1 vgchange --setlockargs persist,notimeout testvg
 # lockspace was stopped by setlockargs, restart it
 node1 vgchange --lockstart --persist start testvg
 
-node1 vgs -o+lockargs testvg | grep '2.0.0'
+node1 vgs -o+lockargs testvg | grep '2.1.0'
 node1 vgs -o lockargs --noheadings testvg | grep 'persist'
 node1 vgs -o lockargs --noheadings testvg | grep 'notimeout'
 
@@ -456,7 +456,7 @@ echo "== Test 8: remove persist,notimeout =="
 node1 vgcreate --shared --setpersist y --setlockargs persist,notimeout testvg $dev1 $dev2
 node1 vgchange --persist start testvg
 
-node1 vgs -o lockargs --noheadings testvg | grep '2.0.0'
+node1 vgs -o lockargs --noheadings testvg | grep '2.1.0'
 node1 vgs -o lockargs --noheadings testvg | grep 'persist'
 
 # Remove the lockargs settings (no other hosts)
@@ -464,7 +464,7 @@ node1 vgchange --setlockargs nopersist,timeout testvg
 
 node1 vgchange --lockstart --persist start testvg
 
-node1 vgs -o lockargs --noheadings testvg | grep '1.0.0'
+node1 vgs -o lockargs --noheadings testvg | grep '1.1.0'
 
 node2 vgchange --lockstart --persist start testvg
 

@@ -110,6 +110,12 @@ restart_lvmlockd() {
     noden ${nodenum} systemctl start $LOCKD_SERVICE
     echo "Restarted lvmlockd on node ${nodenum} with options: $opts"
     sleep 2
+    # lvmlockd does not remember the global mode across a restart.  The
+    # lockspaces are adopted, but lockstart provides lvmlockd with the global
+    # mode, which is needed by later commands that take the global lock
+    # (e.g. vgremove in cleanup_vg).  The lockspace already exists, so
+    # this does not start anything new.
+    noden ${nodenum} vgchange --lockstart
 }
 
 #

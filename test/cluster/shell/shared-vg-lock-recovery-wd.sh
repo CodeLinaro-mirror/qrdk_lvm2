@@ -278,7 +278,7 @@ for i in $(seq 1 10); do
 	sleep 1
 done
 
-node1 vgs -o lockargs --noheadings testvg | grep '1.0.0'
+node1 vgs -o lockargs --noheadings testvg | grep '1.1.0'
 
 node1 vgchange --lockstart testvg
 node2 vgchange --lockstart testvg
