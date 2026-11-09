@@ -16,9 +16,103 @@
 #include "tools.h"
 
 struct pvchange_params {
+	struct dm_list devs;
+	unsigned pv_orphans_only:1;
+	unsigned vg_members_only:1;
+	unsigned scan_done:1;	/* lvmcache_label_scan was done, process_each_pv can skip it */
+	unsigned skip_orphans:1;
+	unsigned global_lock_done:1;
 	unsigned done;
 	unsigned total;
 };
+
+static int _pvchange_lock_global(struct cmd_context *cmd, int argc, char **argv,
+			         struct pvchange_params *params)
+{
+	if (!lock_global_devs_is_enabled(cmd)) {
+		if (!lockf_global(cmd, "ex"))
+			return 0;
+		params->global_lock_done = 1;
+		clear_hint_file(cmd);
+		return 1;
+	}
+
+	/* With --select the args are not devices, so there are no devs to check. */
+	if ((!argc || arg_is_set(cmd, select_ARG)) && !arg_is_set(cmd, all_ARG)) {
+		log_error("Protecting orphan PVs with PR or the global lock requires explicit PV device arguments for pvchange --uuid.");
+		return 0;
+	}
+
+	if (arg_is_set(cmd, all_ARG))
+		log_warn("WARNING: Skipping orphan PVs for pvchange --uuid --all (orphan PVs are protected with PR or the global lock.)");
+
+	/* The global flock must precede clear_hint_file()'s hints lock. */
+	if (!lockf_global(cmd, "ex"))
+		return 0;
+
+	params->global_lock_done = 1;
+
+	clear_hint_file(cmd);
+
+	if (arg_is_set(cmd, all_ARG)) {
+		params->skip_orphans = 1;
+		return 1;
+	}
+
+	/*
+	 * A full label scan is done first because lock_global_devs needs the
+	 * global mode, which is determined from the shared VGs found by
+	 * the scan.  The scan also reads the labels of the device args, which
+	 * is used to find the orphan PVs from PV_EXT_USED.  A PV usage
+	 * misclassification (the scan runs before the global protection is
+	 * held) is caught by the scan in process_each_pv, which repeats the
+	 * scan after the orphan PVs are protected, before anything is written.
+	 * Reject old pv ext versions which don't include PV_EXT_USED.
+	 */
+
+	if (!setup_devices(cmd))
+		return_0;
+
+	if (!dev_args_list_create(cmd, argc, argv, &params->devs))
+		return 0;
+
+	if (!dev_args_filter_nodata(cmd, &params->devs))
+		return_0;
+
+	dev_args_filter_clear(cmd, &params->devs);
+
+	if (!lvmcache_label_scan(cmd))
+		return_0;
+
+	if (!dev_args_filter_read(cmd, &params->devs))
+		return_0;
+
+	if (dev_args_old_ext_version(&params->devs))
+		return_0;
+
+	/*
+	 * Changing VG-owned PVs is protected by VG locks, and
+	 * changing orphan PVs is protected by global lock or PR.
+	 * To simplify, require all devs to be orphans or not, so
+	 * that all are protected with PR/GL or all are protected
+	 * with VG locks.  (Use separate commands to do them.)
+	 */
+
+	if (dev_args_all_vg_members(&params->devs)) {
+		params->vg_members_only = 1;
+		params->scan_done = 1;
+		return 1;
+	}
+
+	if (!dev_args_all_pv_orphans(&params->devs))
+		return_0;
+
+	if (!lock_global_dev_args(cmd, &params->devs))
+		return 0;
+
+	params->pv_orphans_only = 1;
+	return 1;
+}
 
 static int _pvchange_single(struct cmd_context *cmd, struct volume_group *vg,
 			    struct physical_volume *pv, struct processing_handle *handle)
@@ -36,6 +130,22 @@ static int _pvchange_single(struct cmd_context *cmd, struct volume_group *vg,
 	int tagargs = arg_is_set(cmd, addtag_ARG) + arg_is_set(cmd, deltag_ARG);
 
 	params->total++;
+
+	if (params->skip_orphans && is_orphan(pv)) {
+		log_verbose("Skipping orphan PV %s for pvchange --uuid.", pv_name);
+		return ECMD_PROCESSED;
+	}
+
+	/* In case state changed after the check above and before rereading. */
+	if (params->pv_orphans_only && !is_orphan(pv)) {
+		log_error("PV %s is no longer an orphan.", pv_name);
+		return_ECMD_FAILED;
+	}
+
+	if (params->vg_members_only && is_orphan(pv)) {
+		log_error("PV %s is no longer used by a VG.", pv_name);
+		return_ECMD_FAILED;
+	}
 
 	/*
 	 * The primary location of this check is in vg_write(), but it needs
@@ -112,15 +222,13 @@ static int _pvchange_single(struct cmd_context *cmd, struct volume_group *vg,
 		}
 	}
 
-	/*
-	 * Needed to change a property on an orphan PV.
-	 * i.e. the global lock is only needed for orphans.
-	 * Convert sh to ex.
-	 */
-	if (is_orphan(pv)) {
-		if (!lock_global_convert(cmd, "ex"))
+	if (is_orphan(pv) && !params->pv_orphans_only) {
+		if (!cmd->lockf_global_ex && !lockf_global(cmd, "ex"))
 			return_ECMD_FAILED;
 	}
+
+	if (is_orphan(pv) && !dev_open_excl(pv->dev))
+		goto_bad;
 
 	if (tagargs) {
 		/* tag or deltag */
@@ -161,8 +269,7 @@ static int _pvchange_single(struct cmd_context *cmd, struct volume_group *vg,
 			goto_bad;
 		log_verbose("Changing uuid of %s to %s.", pv_name, uuid);
 		if (!is_orphan(pv) && (!pv_write(cmd, pv, 1))) {
-			log_error("pv_write with new uuid failed "
-				  "for %s.", pv_name);
+			log_error("pv_write with new uuid failed for %s.", pv_name);
 			goto bad;
 		}
 
@@ -183,8 +290,7 @@ static int _pvchange_single(struct cmd_context *cmd, struct volume_group *vg,
 		}
 		backup(vg);
 	} else if (!(pv_write(cmd, pv, 0))) {
-		log_error("Failed to store physical volume \"%s\"",
-			  pv_name);
+		log_error("Failed to store physical volume \"%s\"", pv_name);
 		goto bad;
 	}
 
@@ -219,14 +325,7 @@ int pvchange(struct cmd_context *cmd, int argc, char **argv)
 	struct processing_handle *handle = NULL;
 	int ret;
 
-	if (!(arg_is_set(cmd, allocatable_ARG) + arg_is_set(cmd, addtag_ARG) +
-	    arg_is_set(cmd, deltag_ARG) + arg_is_set(cmd, uuid_ARG) +
-	    arg_is_set(cmd, metadataignore_ARG))) {
-		log_error("Please give one or more of -x, -uuid, "
-			  "--addtag, --deltag or --metadataignore");
-		ret = EINVALID_CMD_LINE;
-		goto out;
-	}
+	dm_list_init(&params.devs);
 
 	if (arg_is_set(cmd, uuid_ARG))
 		cmd->edit_devices_file = 1;
@@ -239,54 +338,27 @@ int pvchange(struct cmd_context *cmd, int argc, char **argv)
 
 	handle->custom_handle = &params;
 
-	if (!(arg_is_set(cmd, all_ARG)) && !argc && !handle->internal_report_for_select) {
-		log_error("Please give a physical volume path or use --select for selection.");
-		ret = EINVALID_CMD_LINE;
-		goto out;
-	}
-
-	if (arg_is_set(cmd, all_ARG) && argc) {
-		log_error("Option --all and PhysicalVolumePath are exclusive.");
-		ret = EINVALID_CMD_LINE;
-		goto out;
-	}
-
 	set_pv_notify(cmd);
 
-	/*
-	 * Changing a PV uuid is the only pvchange that invalidates hints.
-	 * Invalidating hints (clear_hint_file) is called at the start of
-	 * the command and takes the hints lock.
-	 * The global lock must always be taken first, then the hints lock
-	 * (the required lock ordering.)
-	 *
-	 * Because of these constraints, the global lock is taken ex here
-	 * for any PV uuid change, even though the global lock is technically
-	 * required only for changing an orphan PV (we don't know until later
-	 * if the PV is an orphan).  The VG lock is used when changing
-	 * non-orphan PVs.
-	 *
-	 * For changes other than uuid on an orphan PV, the global lock is
-	 * taken sh by process_each, then converted to ex in pvchange_single,
-	 * which works because the hints lock is not held.
-	 *
-	 * (Eventually, perhaps always do lock_global(ex) here to simplify.)
-	 */
 	if (arg_is_set(cmd, uuid_ARG)) {
-		if (!lock_global(cmd, "ex")) {
+		/* --uuid is the only option that can modify orphan PVs and may need global locking */
+		if (!_pvchange_lock_global(cmd, argc, argv, &params)) {
 			ret = ECMD_FAILED;
 			goto out;
 		}
-		clear_hint_file(cmd);
 	}
 
-	ret = process_each_pv(cmd, argc, argv, NULL, 0, READ_FOR_UPDATE, handle, _pvchange_single);
+	ret = process_each_pv(cmd, argc, argv, NULL, 0,
+			      READ_FOR_UPDATE | (params.scan_done ? PROCESS_SKIP_SCAN : 0),
+			      handle, _pvchange_single);
 
 	log_print_unless_silent("%u physical volume%s changed / %u physical volume%s not changed.",
 				params.done, params.done == 1 ? "" : "s",
 				params.total - params.done, (params.total - params.done) == 1 ? "" : "s");
 
 out:
+	if (params.global_lock_done)
+		unlock_global_dev_args(cmd, &params.devs);
 	destroy_processing_handle(cmd, handle);
 	return ret;
 }
