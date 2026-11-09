@@ -14,6 +14,7 @@
  */
 
 #include "tools.h"
+#include "lib/device/persist.h"
 
 struct vgreduce_params {
 	int force;
@@ -152,6 +153,9 @@ static int _vgreduce_single(struct cmd_context *cmd, struct volume_group *vg,
 			    struct physical_volume *pv,
 			    struct processing_handle *handle __attribute__((unused)))
 {
+	DM_LIST_INIT(pr_devs);
+	struct device *dev = pv->dev;
+	int pr_stop = (vg->pr & (VG_PR_REQUIRE|VG_PR_AUTOSTART)) ? 1 : 0;
 	int r;
 
 	if (!vg_check_status(vg, LVM_WRITE | RESIZEABLE_VG))
@@ -160,6 +164,17 @@ static int _vgreduce_single(struct cmd_context *cmd, struct volume_group *vg,
 	r = vgreduce_single(cmd, vg, pv, 1);
 	if (!r)
 		return ECMD_FAILED;
+
+	/*
+	 * The PV was written as an orphan, which was the last write to it.
+	 * Now drop the VG's PR on it, otherwise the PV cannot be used by
+	 * another VG until the keys are removed by hand.
+	 */
+	if (pr_stop && dev) {
+		if (!device_list_add(cmd->mem, &pr_devs, dev) ||
+		    !persist_vgreduce_clear_devs(cmd, vg, &pr_devs))
+			log_warn("WARNING: Failed to clear PR on %s.", dev_name(dev));
+	}
 
 	return ECMD_PROCESSED;
 }
