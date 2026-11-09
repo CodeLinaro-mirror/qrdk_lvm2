@@ -332,6 +332,59 @@ static struct labeller *_find_lvm_header(struct device *dev,
 }
 
 /*
+ * label_pv_flags_save/label_pv_flags_clear set and clear dev->flags
+ * to match what is found after reading the label and pv_header:
+ *
+ * DEV_LABEL_PVHDR        - LVM label_header and pv_header exist
+ * DEV_LABEL_PVHDR_V2     - the pv_header_extension is version 2
+ * DEV_LABEL_PVHDR_VGUSED - the pv_header_extension says the PV
+ * 			    is used by a VG (PV_EXT_USED is set)
+ *
+ * Only these dev flags are managed by label_pv_flags_ functions
+ * (lvmcache info and dev->pvid are not changed.)
+ *
+ * Code that reads the label sector should call
+ * label_pv_flags_save/label_pv_flags_clear to keep dev->flags up to date:
+ *
+ * - if a label is detected, call label_pv_flags_save, where pvhdr_ext is
+ *   the pv_header extension from label_check_pv_layout, or NULL if the
+ *   extension data is invalid/unknown.
+ * - if no label is detected, or a label is found with an invalid PV UUID,
+ *   call label_pv_flags_clear.
+ *
+ * The way that code is expected to use these dev flags:
+ * 1. read a dev with a function like label_read* or label_scan*, which
+ *    calls label_pv_flags_save/label_pv_flags_clear.
+ * 2. check that the dev was read was successfully (see DEV_SCAN_NOT_READ
+ *    and the return value of the reading function.)
+ * 3. check these flags
+ */
+void label_pv_flags_clear(struct device *dev)
+{
+	dev->flags &= ~(DEV_LABEL_PVHDR | DEV_LABEL_PVHDR_V2 | DEV_LABEL_PVHDR_VGUSED);
+}
+
+/* A label was found; pvhdr_ext is NULL if the extension is not known. */
+void label_pv_flags_save(struct device *dev, struct pv_header_extension *pvhdr_ext)
+{
+	uint32_t ext_version = 0;
+
+	label_pv_flags_clear(dev);
+
+	dev->flags |= DEV_LABEL_PVHDR;
+
+	if (pvhdr_ext)
+		ext_version = htole32(pvhdr_ext->version);
+
+	/* PV_EXT_USED only exists in extension version 2 and later. */
+	if (ext_version >= 2) {
+		dev->flags |= DEV_LABEL_PVHDR_V2;
+		if (htole32(pvhdr_ext->flags) & PV_EXT_USED)
+			dev->flags |= DEV_LABEL_PVHDR_VGUSED;
+	}
+}
+
+/*
  * Process/parse the headers from the data read from a device.
  * Populates lvmcache with device / mda locations / vgname
  * so that vg_read(vgname) will know which devices/locations
@@ -353,6 +406,7 @@ static int _process_block(struct cmd_context *cmd, struct dev_filter *f,
 	int ret = 0;
 
 	dev->flags &= ~DEV_SCAN_FOUND_LABEL;
+	label_pv_flags_clear(dev);
 
 	/*
 	 * The device may have signatures that exclude it from being processed,
@@ -411,6 +465,8 @@ static int _process_block(struct cmd_context *cmd, struct dev_filter *f,
 	}
 
 	dev->flags |= DEV_SCAN_FOUND_LABEL;
+	/* _text_read adds the pv_header extension info if the layout is valid. */
+	label_pv_flags_save(dev, NULL);
 	*is_lvm_device = 1;
 	label_buf = headers_buf + (label_sector * 512);
 
@@ -1505,12 +1561,20 @@ int label_scan(struct cmd_context *cmd)
 /*
  * Read the header of the disk and if it's a PV
  * save the pvid in dev->pvid.
+ *
+ * The bcache block is dropped (and the dev closed) if the dev has no
+ * usable lvm label.
  */
 int label_read_pvid(struct device *dev, int *has_pvid)
 {
 	char buf[4096] __attribute__((aligned(8))) = { 0 };
 	struct label_header *lh;
 	struct pv_header *pvh;
+	struct pv_header_extension *pvh_ext = NULL;
+
+	/* A command can read a dev label before any label scan has set up the bcache. */
+	if (!label_scan_setup_bcache())
+		return_0;
 
 	if (!label_scan_open(dev))
 		return_0;
@@ -1532,6 +1596,7 @@ int label_read_pvid(struct device *dev, int *has_pvid)
 	lh = (struct label_header *)(buf + SECTOR_SIZE);
 	if (memcmp(lh->id, LABEL_ID, sizeof(lh->id))) {
 		/* Not an lvm device */
+		label_pv_flags_clear(dev);
 		label_scan_invalidate(dev);
 		return 1;
 	}
@@ -1542,6 +1607,7 @@ int label_read_pvid(struct device *dev, int *has_pvid)
 	 */
 	if (memcmp(lh->type, LVM2_LABEL, sizeof(lh->type))) {
 		/* Not an lvm device */
+		label_pv_flags_clear(dev);
 		label_scan_invalidate(dev);
 		return 1;
 	}
@@ -1557,9 +1623,19 @@ int label_read_pvid(struct device *dev, int *has_pvid)
 		memset(dev->pvid, 0, sizeof(dev->pvid));
 		if (has_pvid)
 			*has_pvid = 0;
+		label_pv_flags_clear(dev);
 		label_scan_invalidate(dev);
 		return 1;
 	}
+
+	/*
+	 * If the pv_header layout is invalid, the dev still has a label,
+	 * but nothing is known about the extension.
+	 */
+	if (!label_check_pv_layout(lh, dev, NULL, &pvh_ext))
+		pvh_ext = NULL;
+
+	label_pv_flags_save(dev, pvh_ext);
 
 	return 1;
 }

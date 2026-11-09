@@ -45,6 +45,10 @@
 #define DEV_SCAN_NOT_READ	0x00200000	/* label_scan not able to read dev */
 #define DEV_ADDED_NVME_WWIDS	0x00400000	/* wwids have been read from libnvme */
 #define DEV_UPDATE_USE_ID	0x00800000	/* update system.devices entry to use preferred wwid */
+/* Set by label_read_pvid() and label_scan from the label/pv_header read from disk. */
+#define DEV_LABEL_PVHDR		0x01000000	/* lvm label and pv_header seen on dev */
+#define DEV_LABEL_PVHDR_V2	0x02000000	/* pv_header extension version >= 2 */
+#define DEV_LABEL_PVHDR_VGUSED	0x04000000	/* pv_header extension has PV_EXT_USED (version >= 2) */
 
 /*
  * Support for external device info.
