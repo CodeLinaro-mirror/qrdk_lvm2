@@ -36,7 +36,7 @@
 
 #define SCSI_PR_BUF_SIZE 8192 /* space for 1024 keys */
 
-#define PR_KEY_BUF_SIZE 20 /* hex string. key is 8 bytes (16 hex chars) */
+/* PR_KEY_BUF_SIZE is defined in persist.h */
 
 /* key format is 0x100000YYYYYYXXXX where XXXX=host_id, YYYYYY=generation */
 #define PR_KEY_HOST_ID(k)    ((int)((k) & 0xFFFF))
@@ -101,6 +101,157 @@ int setpersist_arg_flags(const char *str, uint32_t *flags)
 	}
 
 	return 1;
+}
+
+/*
+ * Parse the lvm.conf global/persistent_reservations value (a string
+ * list in which a single value is currently used): auto (the
+ * default), full or none.
+ * Returns PR_POLICY_*, or -1 on error.
+ */
+
+int persist_policy_get(struct cmd_context *cmd)
+{
+	const struct dm_config_node *cn;
+	const struct dm_config_value *cv;
+	const char *str = NULL;
+	int seen = 0;
+
+	if (!(cn = find_config_tree_array(cmd, global_persistent_reservations_CFG, NULL))) {
+		log_error("Invalid persistent_reservations value (empty).");
+		return -1;
+	}
+
+	for (cv = cn->v; cv; cv = cv->next) {
+		if (cv->type == DM_CFG_EMPTY_ARRAY) {
+			log_error("Invalid persistent_reservations value (empty).");
+			return -1;
+		}
+
+		if (cv->type != DM_CFG_STRING) {
+			log_error("Invalid persistent_reservations value: string expected.");
+			return -1;
+		}
+
+		str = cv->v.str;
+
+		if (!str || !*str) {
+			log_error("Invalid persistent_reservations value (empty).");
+			return -1;
+		}
+
+		if (strcmp(str, "auto") &&
+		    strcmp(str, "full") &&
+		    strcmp(str, "none")) {
+			log_error("Unknown persistent_reservations value: %s.", str);
+			return -1;
+		}
+
+		if (seen) {
+			log_error("Invalid persistent_reservations value: \"%s\" conflicts with an earlier setting.",
+				  str);
+			return -1;
+		}
+
+		seen = 1;
+	}
+
+	if (!seen) {
+		log_error("Invalid persistent_reservations value (empty).");
+		return -1;
+	}
+
+	if (!strcmp(str, "full"))
+		return PR_POLICY_FULL;
+
+	if (!strcmp(str, "none"))
+		return PR_POLICY_NONE;
+
+	return PR_POLICY_AUTO;
+}
+
+/*
+ * Parse the lvm.conf global/lvmlockd_global value (a string list) into
+ * the lvmlockd global mode: LOCKD_GLOBAL_MODE_1/2 when a mode is set
+ * explicitly, 0 for global_mode_auto (the default.)  Returns -1 on error.
+ *
+ * The list currently holds a single value, the global mode; future
+ * settings may be added as additional list elements.  A global mode
+ * value may appear only once.
+ */
+
+int lockd_global_mode_parse(struct cmd_context *cmd)
+{
+	const struct dm_config_node *cn;
+	const struct dm_config_value *cv;
+	int mode = 0;
+	int seen = 0;
+
+	if (!(cn = find_config_tree_array(cmd, global_lvmlockd_global_CFG, NULL))) {
+		log_error("Invalid global/lvmlockd_global value (empty).");
+		return -1;
+	}
+
+	for (cv = cn->v; cv; cv = cv->next) {
+		const char *str;
+
+		if (cv->type == DM_CFG_EMPTY_ARRAY) {
+			log_error("Invalid global/lvmlockd_global value (empty).");
+			return -1;
+		}
+
+		if (cv->type != DM_CFG_STRING) {
+			log_error("Invalid global/lvmlockd_global value: string expected.");
+			return -1;
+		}
+
+		str = cv->v.str;
+
+		if (!str || !*str) {
+			log_error("Invalid global/lvmlockd_global value (empty).");
+			return -1;
+		}
+
+		if (strcmp(str, "global_mode_1") &&
+		    strcmp(str, "global_mode_2") &&
+		    strcmp(str, "global_mode_auto")) {
+			log_error("Invalid global/lvmlockd_global value: %s.", str);
+			return -1;
+		}
+
+		if (seen) {
+			log_error("Invalid global/lvmlockd_global value: \"%s\" conflicts with an earlier global mode setting.",
+				  str);
+			return -1;
+		}
+
+		seen = 1;
+
+		if (!strcmp(str, "global_mode_1"))
+			mode = LOCKD_GLOBAL_MODE_1;
+		else if (!strcmp(str, "global_mode_2"))
+			mode = LOCKD_GLOBAL_MODE_2;
+		/* global_mode_auto: mode 0 */
+	}
+
+	if (!seen) {
+		log_error("Invalid global/lvmlockd_global value (empty).");
+		return -1;
+	}
+
+	return mode;
+}
+
+/* PR is not permitted on this host (persistent_reservations=none). */
+
+static int _persist_policy_none(struct cmd_context *cmd)
+{
+	if (persist_policy_get(cmd) == PR_POLICY_NONE) {
+		log_error("Persistent reservations are not permitted on this host (persistent_reservations=none).");
+		return 1;
+	}
+
+	return 0;
 }
 
 int dev_allow_pr(struct cmd_context *cmd, struct device *dev)
@@ -1082,6 +1233,15 @@ static int _get_our_key(struct cmd_context *cmd, struct volume_group *vg,
 			goto read_keys;
 		}
 
+		/*
+		 * FIXME: A matching host_id does not prove last_gen is current.
+		 * persist_vgextend_begin/update can use a stale file to register an
+		 * old generation on new PVs while existing PVs use the current one.
+		 * For vgextend, use the already validated VG key, or validate the
+		 * cached key against existing PV registrations and the current
+		 * lockspace generation.  Exclude new PVs from that validation until
+		 * their VG keys have been installed.
+		 */
 		log_debug("Our key from file: 0x%llx.", (unsigned long long) our_key_val);
 		goto done;
 
@@ -1840,6 +2000,47 @@ static int _run_stop(struct cmd_context *cmd, struct volume_group *vg, struct dm
 	return 1;
 }
 
+static int _run_clear(struct cmd_context *cmd, struct volume_group *vg, struct dm_list *devs, char *our_key_str)
+{
+	struct device_list *devl;
+	const char *devname;
+	const char **argv;
+	int args = 0;
+	int pv_count;
+	int status;
+
+	if (!(pv_count = dm_list_size(devs)))
+		return_0;
+
+	if (!(argv = dm_pool_alloc(cmd->mem, (7 + pv_count*2) * sizeof(char *))))
+		return_0;
+
+	argv[0] = LVMPERSIST_PATH;
+	argv[++args] = "clear";
+	argv[++args] = "--ourkey";
+	argv[++args] = our_key_str;
+	argv[++args] = "--vg";
+	argv[++args] = vg->name;
+
+	dm_list_iterate_items(devl, devs) {
+		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
+			return_0;
+		argv[++args] = "--device";
+		argv[++args] = devname;
+	}
+
+	argv[++args] = NULL;
+
+	/* lvmpersist clear verifies that the reservation and keys are gone. */
+
+	if (!exec_cmd(cmd, argv, &status, 1)) {
+		log_error("Persistent reservation clear failed: lvmpersist command error.");
+		return 0;
+	}
+
+	return 1;
+}
+
 /*
  * For vgremove, separate persist_stop into before and after parts:
  * - before cannot happen after normal vgremove, because the list
@@ -1942,6 +2143,37 @@ int persist_stop_devs(struct cmd_context *cmd, struct volume_group *vg, struct d
 	return 1;
 }
 
+/*
+ * vgreduce has removed these devs from the VG and finished writing them, so
+ * the PR for the VG no longer applies to them.  Clear all PR state on them
+ * (our key, the keys of other hosts using the VG, and the reservation) so that
+ * the devs can be used by another VG.  Our key must still be registered to do
+ * the clear.  This must be done after the last write to the devs.
+ */
+
+int persist_vgreduce_clear_devs(struct cmd_context *cmd, struct volume_group *vg,
+				struct dm_list *clear_devs)
+{
+	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
+	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
+	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
+	uint64_t our_key_val = 0;
+
+	if (vg_is_sanlock(vg))
+		local_key = NULL;
+
+	if (!local_key && !local_host_id)
+		return 1;
+
+	if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, &our_key_val))
+		return_0;
+
+	if (!_run_clear(cmd, vg, clear_devs, our_key_buf))
+		return_0;
+
+	return 1;
+}
+
 int persist_stop(struct cmd_context *cmd, struct volume_group *vg)
 {
 	DM_LIST_INIT(devs);
@@ -2036,6 +2268,7 @@ int persist_upgrade_ex(struct cmd_context *cmd, struct volume_group *vg, uint64_
 		new_key_val = our_key_val;
 		memcpy(new_key_buf, our_key_buf, PR_KEY_BUF_SIZE);
 	} else if (local_host_id) {
+		/* The ex access key uses 0's in place of the generation number. */
 		if (dm_snprintf(new_key_buf, sizeof(our_key_buf), "0x100000000000%04x",
 				(unsigned) local_host_id) != 18) {
 			log_error("Failed to format key string for host_id %d.", local_host_id);
@@ -2092,6 +2325,92 @@ int persist_upgrade_ex(struct cmd_context *cmd, struct volume_group *vg, uint64_
 }
 
 /*
+ * Get the key used to protect devices that do not (yet) belong to a VG, e.g.
+ * devs claimed by lock_global_devs, or new devs in vgcreate/vgextend before
+ * the VG's own key is installed.  Writes the key string to key_buf, which
+ * must be PR_KEY_BUF_SIZE.
+ *
+ * This differs from _get_our_key(), which gets the key for an existing VG:
+ *
+ * . There is no VG, so the key never has a generation: it is the configured
+ *   local pr_key, or else the host_id key with generation 0
+ *   (0x100000000000XXXX.)  _get_our_key() uses a generation for a sanlock VG
+ *   (0x100000YYYYYYXXXX), taken from the key file or read from the devices.
+ *   (_get_our_key_sanlock_start() creates a sanlock VG's first key.)
+ *
+ * . It reads no key file and no devices, so it is cheap and cannot fail
+ *   because no key is registered yet.
+ *
+ * . It fails if neither pr_key nor host_id is configured, instead of
+ *   continuing without a key.
+ *
+ * For a local VG or a non-sanlock shared VG, _get_our_key() returns this same
+ * key, so the PR taken with this key can be kept as the VG's PR.
+ */
+
+static int _get_global_pr_key(struct cmd_context *cmd, char *key_buf)
+{
+	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
+	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
+	uint64_t key_val = 0;
+
+	if (local_key) {
+		if (!_parse_prkey(local_key, &key_val)) {
+			log_error("Failed to parse local key %s.", local_key);
+			return 0;
+		}
+		if (dm_snprintf(key_buf, PR_KEY_BUF_SIZE, "0x%llx",
+				(unsigned long long)key_val) < 0)
+			return_0;
+		return 1;
+	}
+
+	if (!local_host_id) {
+		log_error("No pr_key or host_id configured (see lvmlocal.conf).");
+		return 0;
+	}
+
+	if (dm_snprintf(key_buf, PR_KEY_BUF_SIZE, "0x100000000000%04x",
+			(unsigned)local_host_id) != 18) {
+		log_error("Failed to format key string for host_id %d.", local_host_id);
+		return 0;
+	}
+
+	if (!_parse_prkey(key_buf, &key_val)) {
+		log_error("Failed to parse generated key %s.", key_buf);
+		return 0;
+	}
+
+	return 1;
+}
+
+/*
+ * The update functions stop the PR key that lock_global_devs() took on the
+ * devs, and then start PR with potentially new key and mode to match the
+ * requirements for the ongoing operation of the VG (although the key/mode
+ * could be the same as was used by lock_global_devs.)
+ * Tell unlock_global_devs() to not stop PR which has now been handed off
+ * to remain on the VG during normal operation.
+ */
+
+static void _global_pr_handed_off(struct cmd_context *cmd)
+{
+	if (cmd->global_devs.held == GLOBAL_DEVS_PR)
+		cmd->global_devs.handed_off = 1;
+}
+
+/*
+ * Remember the PR key that persist_vgcreate_begin/persist_vgextend_begin
+ * registered, so that it can be stopped if the command fails before the
+ * PR is handed off to the VG.
+ */
+static void _begin_pr_save(struct cmd_context *cmd, const char *key)
+{
+	dm_strncpy(cmd->global_devs.begin_key, key, sizeof(cmd->global_devs.begin_key));
+	cmd->global_devs.begin_pr = 1;
+}
+
+/*
  * Start PR on devices that are being used for vgcreate.
  * This is somewhat awkward because it happens early in
  * the vgcreate command, before PVs are initialized, and
@@ -2102,11 +2421,10 @@ int persist_upgrade_ex(struct cmd_context *cmd, struct volume_group *vg, uint64_
  * change the PR sh access (standard for shared VGs.)
  */
 
-int persist_vgcreate_begin(struct cmd_context *cmd, const char *vg_name, const char *local_key, int local_host_id,
+int persist_vgcreate_begin(struct cmd_context *cmd, const char *vg_name,
 			   uint32_t set_flags, struct dm_list *devs)
 {
 	struct device_list *devl;
-	uint64_t our_key_val = 0;
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	const char *devname;
 	const char **argv;
@@ -2114,32 +2432,17 @@ int persist_vgcreate_begin(struct cmd_context *cmd, const char *vg_name, const c
 	int args;
 	int status;
 
+	if (_persist_policy_none(cmd))
+		return 0;
+
 	persist_key_file_remove_name(cmd, vg_name);
 
-	if (local_key) {
-		if (!_parse_prkey(local_key, &our_key_val)) {
-			log_error("Failed to parse local key %s.", local_key);
-			return 0;
-		}
-		if (dm_snprintf(our_key_buf, sizeof(our_key_buf), "0x%llx",
-				(unsigned long long) our_key_val) < 0)
-			return_0;
-	} else if (local_host_id) {
-		if (dm_snprintf(our_key_buf, sizeof(our_key_buf), "0x100000000000%04x",
-				(unsigned) local_host_id) != 18) {
-			log_error("Failed to format key string for host_id %d.", local_host_id);
-			return 0;
-		}
-		if (!_parse_prkey(our_key_buf, &our_key_val)) {
-			log_error("Failed to parse generated key %s.", our_key_buf);
-			return 0;
-		}
-	}
+	if (!_get_global_pr_key(cmd, our_key_buf))
+		return_0;
 
 	pv_count = dm_list_size(devs);
 
-	log_debug("Start PR on %d devs with local key %llx.",
-		  pv_count, (unsigned long long) our_key_val);
+	log_debug("Start PR on %d devs with local key %s.", pv_count, our_key_buf);
 
 	args = 9 + pv_count*2;
 	if (set_flags & SETPR_PTPL)
@@ -2174,18 +2477,277 @@ int persist_vgcreate_begin(struct cmd_context *cmd, const char *vg_name, const c
 		return 0;
 	}
 
+	_begin_pr_save(cmd, our_key_buf);
+
 	return 1;
 }
 
 /*
- * At the start of creating a shared VG, before writing anything,
- * persist_vgcreate_begin() takes an ex access PR on the devices.
- * At the end of creating the shared VG (after initializing PVs and
- * writing VG metadata), persist_vgcreate_update() removes the ex
- * access PR (typically WE), and starts PR with the normal sh access
- * PR (typically WEAR), allowing other hosts to also use the new VG.
+ * Return 1 if all devices support PR.
+ * Set *any_supported if any devices support PR.
  */
-int persist_vgcreate_update(struct cmd_context *cmd, struct volume_group *vg, uint32_t set_flags)
+int persist_global_devices_supported(struct cmd_context *cmd, struct dm_list *devs,
+				     int *any_supported)
+{
+	struct device_list *devl;
+	int any_pr = 0;
+	int key_count;
+
+	if (any_supported)
+		*any_supported = 0;
+
+	dm_list_iterate_items(devl, devs) {
+		if (dev_allow_pr(cmd, devl->dev)) {
+			any_pr = 1;
+			if (any_supported)
+				*any_supported = 1;
+			break;
+		}
+	}
+
+	dm_list_iterate_items(devl, devs) {
+		if (!dev_allow_pr(cmd, devl->dev)) {
+			/* An error only if other devs support PR; otherwise the caller falls back. */
+			if (any_pr)
+				log_error("Cannot protect devices: %s does not support persistent "
+					  "reservation, which all devices must support.",
+					  dev_name(devl->dev));
+			return 0;
+		}
+
+		key_count = 0;
+		if (!dev_find_key(cmd, devl->dev, 1, 0, NULL, 0, NULL, 1, &key_count, NULL)) {
+			log_error("Failed to access persistent reservation on %s.", dev_name(devl->dev));
+			return 0;
+		}
+
+		if (key_count) {
+			log_error("Cannot use device %s: PR keys are registered.", dev_name(devl->dev));
+			log_error("See lvmpersist options read, stop, clear.");
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+/*
+ * Acquire WE PR on the devs.
+ */
+int persist_global_devices(struct cmd_context *cmd, struct dm_list *devs)
+{
+	struct device_list *devl;
+	char key_buf[PR_KEY_BUF_SIZE] = { 0 };
+	const char *devname;
+	const char **argv;
+	int dev_count;
+	int args = 0;
+	int status;
+
+	if (!(dev_count = dm_list_size(devs)))
+		return_0;
+
+	if (!_get_global_pr_key(cmd, key_buf))
+		return_0;
+
+	if (!(argv = dm_pool_alloc(cmd->mem, (7 + dev_count * 2) * sizeof(char *))))
+		return_0;
+
+	/*
+	 * Uses --prtype WE so that WE will be used on mpath devices
+	 * (--access ex translates to WEAR on mpath devices.)
+	 * We are using PR as a mutual exclusion lock here, and WEAR
+	 * won't work for that.  mpath devs will be changed to WEAR
+	 * before before normal operation begins.
+	 */
+
+	argv[args++] = LVMPERSIST_PATH;
+	argv[args++] = "start";
+	argv[args++] = "--ourkey";
+	argv[args++] = key_buf;
+	argv[args++] = "--prtype";
+	argv[args++] = "WE";
+
+	dm_list_iterate_items(devl, devs) {
+		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
+			return_0;
+		argv[args++] = "--device";
+		argv[args++] = devname;
+	}
+
+	argv[args] = NULL;
+
+	if (!exec_cmd(cmd, argv, &status, 1)) {
+		log_error("Global persistent reservation start failed: lvmpersist command error.");
+		return 0;
+	}
+
+	return 1;
+}
+
+/*
+ * Acquire WE PR on the devs if they all support PR.
+ * Returns 1 with *used_pr 1 if PR was taken on all devs.
+ * Returns 1 with *used_pr 0 if no dev supports PR (or there are no devs).
+ * Returns 0 on error, which includes only some devices support PR.
+ */
+int persist_global_devices_lock(struct cmd_context *cmd, struct dm_list *devs, int *used_pr)
+{
+	int any_support = 0;
+
+	*used_pr = 0;
+
+	if (!devs || dm_list_empty(devs))
+		return 1;
+
+	if (persist_global_devices_supported(cmd, devs, &any_support)) {
+		if (!persist_global_devices(cmd, devs)) {
+			/* lvmpersist start does not undo a partial start, so remove our key. */
+			if (!persist_global_devices_release(cmd, devs)) {
+				log_error("Failed to stop PR on devices after failed PR start.");
+				log_error("See lvmpersist options read, stop.");
+			}
+			return 0;
+		}
+		*used_pr = 1;
+		return 1;
+	}
+
+	return any_support ? 0 : 1;
+}
+
+int persist_global_devices_release(struct cmd_context *cmd, struct dm_list *devs)
+{
+	struct device_list *devl;
+	char key_buf[PR_KEY_BUF_SIZE] = { 0 };
+	const char *devname;
+	const char **argv;
+	int dev_count;
+	int args = 0;
+	int status;
+
+	if (!(dev_count = dm_list_size(devs)))
+		return_0;
+
+	if (!_get_global_pr_key(cmd, key_buf))
+		return_0;
+
+	if (!(argv = dm_pool_alloc(cmd->mem, (5 + dev_count * 2) * sizeof(char *))))
+		return_0;
+
+	argv[args++] = LVMPERSIST_PATH;
+	argv[args++] = "stop";
+	argv[args++] = "--ourkey";
+	argv[args++] = key_buf;
+
+	dm_list_iterate_items(devl, devs) {
+		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
+			return_0;
+		argv[args++] = "--device";
+		argv[args++] = devname;
+	}
+
+	argv[args] = NULL;
+
+	if (!exec_cmd(cmd, argv, &status, 1)) {
+		log_error("Global persistent reservation stop failed: lvmpersist command error.");
+		return 0;
+	}
+
+	return 1;
+}
+
+/*
+ * Common function shared by persist_vgextend_begin, persist_vgcreate_begin.
+ *
+ * Stop a PR key that persist_vgextend_begin/persist_vgcreate_begin registered,
+ * unless the PR has been handed off to the VG (in which case begin_pr was set
+ * to 0.)
+ *
+ * Stopping a key that is not registered on a device is a no-op success, so it is
+ * safe to call this with a device list that includes devices the key was never
+ * registered on.
+ *
+ * (Must be called before unlock_global_devs which zeroes cmd->global_devs.)
+ */
+static int _persist_command_end(struct cmd_context *cmd, struct dm_list *devs)
+{
+	struct device_list *devl;
+	const char *devname;
+	const char **argv;
+	const char *key = cmd->global_devs.begin_key;
+	int dev_count;
+	int args = 0;
+	int status;
+
+	/* PR was not acquired by _begin, or was handed off to the VG. */
+	if (!cmd->global_devs.begin_pr)
+		return 1;
+
+	if (!key || !key[0])
+		return 1;
+
+	if (!devs || !(dev_count = dm_list_size(devs)))
+		return 1;
+
+	if (!(argv = dm_pool_alloc(cmd->mem, (5 + dev_count * 2) * sizeof(char *))))
+		return_0;
+
+	argv[args++] = LVMPERSIST_PATH;
+	argv[args++] = "stop";
+	argv[args++] = "--ourkey";
+	argv[args++] = key;
+
+	dm_list_iterate_items(devl, devs) {
+		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
+			return_0;
+		argv[args++] = "--device";
+		argv[args++] = devname;
+	}
+
+	argv[args] = NULL;
+
+	if (!exec_cmd(cmd, argv, &status, 1)) {
+		log_error("Persistent reservation stop failed: lvmpersist command error.");
+		log_error("PR key %s remains registered.", key);
+		log_error("See lvmpersist options read, stop.");
+		return 0;
+	}
+
+	return 1;
+}
+
+int persist_vgextend_end(struct cmd_context *cmd, struct dm_list *devs)
+{
+	return _persist_command_end(cmd, devs);
+}
+
+int persist_vgcreate_end(struct cmd_context *cmd, struct dm_list *devs)
+{
+	return _persist_command_end(cmd, devs);
+}
+
+/*
+ * At the start of creating a VG that will use PR, before writing anything, PR
+ * is started on the devices with an ex access PR, either by
+ * persist_vgcreate_begin(), or by lock_global_devs() (which holds a WE PR with
+ * the global key, in which case persist_vgcreate_begin() is not used.)
+ * At the end of creating the VG (after initializing PVs and writing VG
+ * metadata), persist_vgcreate_update() removes the ex access PR (typically WE),
+ * and starts the PR that the new VG should have:
+ *
+ * - a shared VG: the normal sh access PR (typically WEAR), allowing other
+ *   hosts to also use the new VG.
+ *
+ * - a local VG: an ex access PR (WE, or WEAR for mpath devs), with ptpl if
+ *   requested.  This is only needed if the PR was started by lock_global_devs,
+ *   which does not use ptpl or WEAR.  If the PR was started by
+ *   persist_vgcreate_begin, it is already the PR that a local VG should have.
+ *
+ * start_pr is set if the vgcreate command wants PR started.
+ */
+int persist_vgcreate_update(struct cmd_context *cmd, struct volume_group *vg,
+			    uint32_t set_flags, int start_pr)
 {
 	DM_LIST_INIT(devs);
 	struct device_list *devl;
@@ -2201,12 +2763,19 @@ int persist_vgcreate_update(struct cmd_context *cmd, struct volume_group *vg, ui
 	int args = 0;
 	int pv_count;
 	int status;
-	int setpersist_on;
+	int stop_done = 0;
 
-	setpersist_on = (set_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART)) ? 1 : 0;
-
-	if (!setpersist_on)
+	if (!start_pr)
 		return 1;
+
+	/*
+	 * A local VG keeps the PR in place that was started from persist_vgcreate_begin.
+	 * Setting begin_pr=0 tells persist_vgcreate_end to not release it.
+	 */
+	if (!vg_is_shared(vg) && (cmd->global_devs.held != GLOBAL_DEVS_PR)) {
+		cmd->global_devs.begin_pr = 0;
+		return 1;
+	}
 
 	if (vg_is_sanlock(vg)) {
 		if (!local_host_id)
@@ -2270,8 +2839,32 @@ int persist_vgcreate_update(struct cmd_context *cmd, struct volume_group *vg, ui
 
 	log_debug("Stop PR on %d devs with local key %s.", pv_count, our_key_buf_stop);
 
-	if (!_run_stop(cmd, vg, &devs, our_key_buf_stop, 0))
+	/*
+	 * lock_global_devs registered the global key on these devs (when PR is
+	 * being used for global locking), and that key is stopped here, so that
+	 * the VG's own PR can be started below.
+	 * (When PR is not used for global locking, persist_vgcreate_begin has
+	 * registered the global key instead of lock_global_devs.)
+	 *
+	 * After the global key has been stopped, mark it "handed off" so that
+	 * unlock_global_devs will no longer attempt to stop it.  It's handed
+	 * off to the VG, so VG-oriented commands become responsible for managing
+	 * the PR, not global-locking.
+	 *
+	 * If this stop fails, we don't set handed off, and attempt the PR start
+	 * for the VG PR below.  If that VG start fails, then the error path at
+	 * the end of the command would call unlock_global_devs which would again
+	 * attempt to stop the global key (since handed off is not set.)
+	 * If that PR start succeeds, after this PR stop fails, then we may be
+	 * left with an extra registered key that we don't want (see below.)
+	 */
+	if (!_run_stop(cmd, vg, &devs, our_key_buf_stop, 0)) {
 		log_warn("WARNING: failed to stop PR with key %s.", our_key_buf_stop);
+	} else {
+		stop_done = 1;
+		_global_pr_handed_off(cmd);    /* unlock_global_devs shouldn't release the PR */
+		cmd->global_devs.begin_pr = 0; /* persist_vgcreate_end shouldn't release the PR */
+	}
 
 	log_debug("Start PR on %d devs with local key %llx.",
 		  pv_count, (unsigned long long) our_key_val);
@@ -2309,20 +2902,52 @@ int persist_vgcreate_update(struct cmd_context *cmd, struct volume_group *vg, ui
 		return 0;
 	}
 
+	/*
+	 * VG PR start succeeded, the PR that the VG should have is in place.
+	 *
+	 * The PR now "belongs" to the VG, and no longer "belongs" to
+	 * lock_global_devs or persist_vgcreate_begin (either of which
+	 * may have originally acquired the PR).  So, unlock_global_devs
+	 * or persist_vgcreate_end should not attempt to release the PR.
+	 */
+	_global_pr_handed_off(cmd);    /* unlock_global_devs shouldn't release the PR */
+	cmd->global_devs.begin_pr = 0; /* persist_vgcreate_end shouldn't release the PR */
+
+	/*
+	 * Unusual error case: the stop above failed, so the PR key that was
+	 * acquired from lock_global_dev or persist_vgcreate_begin may still
+	 * be registered.  If still registered, that key should be removed.
+	 * Should we check if it's still registered here?  Try again to stop it?
+	 *
+	 * The key that failed to stop above was likely different from the VG PR
+	 * key that is now registered (although it could potentially have been the
+	 * same, making this error case a moot point, thus the strcmp here.)
+	 */
+	if (!stop_done && strcmp(our_key_buf, our_key_buf_stop)) {
+		log_warn("WARNING: Failed to stop PR key %s; check if registered and manually remove.",
+			 our_key_buf_stop);
+	}
+
 	/* key file is an optimization, not an error condition */
-	if (!_write_key_file(cmd, vg, our_key_val))
+	if (vg_is_shared(vg) && !_write_key_file(cmd, vg, our_key_val))
 		stack;
 
 	return 1;
 }
 
-int persist_start_extend(struct cmd_context *cmd, struct volume_group *vg)
+/*
+ * vgextend only handles PR on new devs when VG_PR_REQUIRE is set.
+ * When REQUIRE is set, then persist_is_started() has already run and
+ * verified that PR is started on existing devices, now do new devs.
+ */
+
+int persist_vgextend_begin(struct cmd_context *cmd, struct volume_group *vg,
+			   struct dm_list *devs)
 {
 	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
 	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
-	struct pv_list *pvl;
+	struct device_list *devl;
 	struct device *dev = NULL;
-	struct device *check_dev = NULL;
 	uint64_t our_key_val = 0;
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	const char *access = vg_is_shared(vg) ? "sh" : "ex";
@@ -2333,65 +2958,32 @@ int persist_start_extend(struct cmd_context *cmd, struct volume_group *vg)
 	int pv_count = 0;
 	int errors = 0;
 	int found = 0;
+
+	if (_persist_policy_none(cmd))
+		return 0;
 	int n = 0;
 
 	if (vg_is_sanlock(vg))
 		local_key = NULL;
 
-	/*
-	 * PR is not in use without pr_key or host_id set.
-	 */
-	if (!local_key && !local_host_id)
-		return 1;
-
-	/*
-	 * If there is no valid PR key, then PR must not be in use.
-	 */
-	if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, &our_key_val))
-		return 1;
-
-	dm_list_iterate_items(pvl, &vg->pvs) {
-		if (!(dev = pvl->pv->dev))
-			continue;
-		if (dm_list_empty(&dev->aliases))
-			continue;
-		check_dev = dev;
-		break;
+	if (!local_key && !local_host_id) {
+		log_error("No pr_key or host_id configured (see lvmlocal.conf).");
+		return 0;
 	}
-	if (!check_dev)
-		return 1;
 
-	/*
-	 * If REQUIRE is set, then persist_is_started() has already run and
-	 * verified that PR is started on existing devices, now do new devs.
-	 */
-	if (vg->pr & VG_PR_REQUIRE)
-		goto do_extend;
+	if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, &our_key_val))
+		return_0;
 
-	/*
-	 * If REQUIRE is not set, PR could still be in use.  Check if our key
-	 * is registered on any device.  If so, then PR is in use.  If not, PR
-	 * not in use.
-	 */
-	if (!dev_find_key(cmd, check_dev, 1, our_key_val, &found, 0, NULL, 0, NULL, NULL))
-		return 1;
-	if (!found)
-		return 1;
-
- do_extend:
-
-	dm_list_iterate_items(pvl, &vg->pv_write_list) {
-		if (!(dev = pvl->pv->dev))
-			continue;
+	dm_list_iterate_items(devl, devs) {
+		dev = devl->dev;
 		if (!dev_allow_pr(cmd, dev)) {
 			log_error("Persistent reservation not supported for device type %s.", dev_name(dev));
 			return 0;
 		}
 	}
 
-	dm_list_iterate_items(pvl, &vg->pv_write_list) {
-		if (!(dev = pvl->pv->dev))
-			continue;
+	dm_list_iterate_items(devl, devs) {
+		dev = devl->dev;
 		if (dm_list_empty(&dev->aliases))
 			continue;
 		pv_count++;
@@ -2421,9 +3013,8 @@ int persist_start_extend(struct cmd_context *cmd, struct volume_group *vg)
 	if (vg->pr & VG_PR_PTPL)
 		argv[++args] = "--ptpl";
 
-	dm_list_iterate_items(pvl, &vg->pv_write_list) {
-		if (!(dev = pvl->pv->dev))
-			continue;
+	dm_list_iterate_items(devl, devs) {
+		dev = devl->dev;
 		if (dm_list_empty(&dev->aliases))
 			continue;
 		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(dev))))
@@ -2439,9 +3030,14 @@ int persist_start_extend(struct cmd_context *cmd, struct volume_group *vg)
 		return 0;
 	}
 
-	dm_list_iterate_items(pvl, &vg->pv_write_list) {
-		if (!(dev = pvl->pv->dev))
-			continue;
+	/*
+	 * Save the key before verifying the registration so that
+	 * a partial registration can be cleaned up on error path.
+	 */
+	_begin_pr_save(cmd, our_key_buf);
+
+	dm_list_iterate_items(devl, devs) {
+		dev = devl->dev;
 		if (dm_list_empty(&dev->aliases))
 			continue;
 
@@ -2473,6 +3069,62 @@ int persist_start_extend(struct cmd_context *cmd, struct volume_group *vg)
 	return 1;
 }
 
+int persist_vgextend_update(struct cmd_context *cmd, struct volume_group *vg,
+			    struct dm_list *devs)
+{
+	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
+	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
+	char global_key_buf[PR_KEY_BUF_SIZE] = { 0 };
+	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
+
+	/*
+	 * Update the PR on newly extended devs.
+	 * lock_global_devs already took WE PR, and the PR may need to
+	 * be updated to a different PR type (WE to WEAR, i.e. for a shared
+	 * VG, or mpath devs), and the PR key may need to be updated to
+	 * include the proper sanlock generation.
+	 *
+	 * - all devs in a shared vg need PR type WEAR
+	 * - for devs in a local vg, only new mpath devs need WEAR,
+	 *   the other new devs can keep using WE as used by lock_global_devs,
+	 *   although the PR key probably requires updating
+	 * - WE needs to be released before WEAR is acquired
+	 * - the WE -> WEAR transition happens after vg_write/vg_commit so
+	 *   that releasing the WE does not leave the device exposed and
+	 *   unprotected for a short window
+	 */
+	if (!_get_global_pr_key(cmd, global_key_buf))
+		return_0;
+
+	if (!_run_stop(cmd, vg, devs, global_key_buf, 0))
+		return_0;
+
+	/*
+	 * With the global key stopped, mark it handed off so that
+	 * unlock_global_devs will not attempt to stop it.
+	 */
+	_global_pr_handed_off(cmd);
+
+	/* Remove the generation-zero keys before looking up the VG's key. */
+	if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, NULL))
+		return_0;
+
+	/* Start again with a new key/mode. */
+	if (persist_vgextend_begin(cmd, vg, devs)) {
+		/* The PR on the new devs is the VG's PR now; it is not released on unlock. */
+		cmd->global_devs.begin_pr = 0;
+		return 1;
+	}
+
+	/* Start may have installed the VG key on only some of the new devs. */
+	if (!_run_stop(cmd, vg, devs, our_key_buf, 1))
+		log_warn("WARNING: failed to stop PR with key %s on new devices.", our_key_buf);
+
+	return 0;
+}
+
+/* Start PR on a VG, i.e. for each PV register local key and add reservation. */
+
 int persist_start(struct cmd_context *cmd, struct volume_group *vg,
 		  const char *remkey, const char *update_our_key)
 {
@@ -2493,6 +3145,9 @@ int persist_start(struct cmd_context *cmd, struct volume_group *vg,
 	int args = 0;
 	int pv_count = 0;
 	int status;
+
+	if (_persist_policy_none(cmd))
+		return 0;
 
 	if (update_our_key) {
 		memcpy(our_key_buf, update_our_key, PR_KEY_BUF_SIZE);
