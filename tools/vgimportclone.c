@@ -229,7 +229,7 @@ int vgimportclone(struct cmd_context *cmd, int argc, char **argv)
 
 	cmd->disable_pr_required = 1;
 
-	if (!lock_global(cmd, "ex"))
+	if (!lockf_global(cmd, "ex"))
 		return ECMD_FAILED;
 
 	clear_hint_file(cmd);

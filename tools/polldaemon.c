@@ -413,7 +413,7 @@ static int _poll_for_all_vgs(struct cmd_context *cmd,
 	while (1) {
 		parms->outstanding_count = 0;
 		r = process_each_vg(cmd, 0, NULL, NULL, NULL, READ_FOR_UPDATE, 0, handle, _poll_vg);
-		if (!lock_global(cmd, "un"))
+		if (!lockf_global(cmd, "un"))
 			stack;
 		if (r != ECMD_PROCESSED) {
 			stack;

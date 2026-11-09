@@ -195,7 +195,7 @@ int vgrename(struct cmd_context *cmd, int argc, char **argv)
 	if (!(vp.vg_name_new = dm_pool_strdup(cmd->mem, vg_name_new)))
 		return_ECMD_FAILED;
 
-	if (!lock_global(cmd, "ex"))
+	if (!lockf_global(cmd, "ex"))
 		return_ECMD_FAILED;
 
 	clear_hint_file(cmd);

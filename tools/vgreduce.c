@@ -249,7 +249,7 @@ int vgreduce(struct cmd_context *cmd, int argc, char **argv)
 	argv++;
 	argc--;
 
-	if (!lock_global(cmd, "ex"))
+	if (!lockf_global(cmd, "ex"))
 		return_ECMD_FAILED;
 
 	clear_hint_file(cmd);
