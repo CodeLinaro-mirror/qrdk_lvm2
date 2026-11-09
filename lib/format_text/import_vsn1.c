@@ -1322,13 +1322,56 @@ static int _read_desc(struct dm_pool *mem,
 }
 
 /*
+ * For sanlock VGs, the summary needs to read tags from the "lvmlock" LV.
+ */
+static int _read_vgsummary_lock_type(const struct dm_config_node *vgn,
+				     struct lvmcache_vgsummary *vgsummary)
+{
+	const struct dm_config_node *lockn;
+	const struct dm_config_value *cv;
+
+	if (!(lockn = dm_config_find_node(vgn, "logical_volumes/" LOCKD_SANLOCK_LV_NAME))) {
+		log_debug("vgsummary %s sanlock vg has no lvmlock node", vgsummary->vgname);
+		return 1;
+	}
+
+	/* config lookups search the chain of siblings, so pass the first child */
+	if (!(lockn = lockn->child)) {
+		log_debug("vgsummary %s lvmlock section is empty", vgsummary->vgname);
+		return 1;
+	}
+
+	if (!dm_config_get_list(lockn, "tags", &cv)) {
+		log_debug("vgsummary %s lvmlock has no tags", vgsummary->vgname);
+		return 1;
+	}
+
+	for (; cv; cv = cv->next) {
+		if (cv->type != DM_CFG_STRING)
+			continue;
+		log_debug("vgsummary %s lvmlock tag %s", vgsummary->vgname, cv->v.str);
+		if (!strcmp(cv->v.str, LOCKD_GLOBAL_MODE_1_TAG))
+			vgsummary->lockd_global_mode_1 = 1;
+		else if (!strcmp(cv->v.str, LOCKD_GLOBAL_MODE_2_TAG))
+			vgsummary->lockd_global_mode_2 = 1;
+		else if (!strcmp(cv->v.str, LOCKD_GLOBAL_LOCK_1_TAG))
+			vgsummary->lockd_global_lock_1 = 1;
+		else if (!strcmp(cv->v.str, LOCKD_GLOBAL_LOCK_2_TAG))
+			vgsummary->lockd_global_lock_2 = 1;
+	}
+
+	return 1;
+}
+
+/*
  * It is used to read vgsummary information about a VG
  * before locking and reading the VG via vg_read().
  * read_vgsummary: read VG metadata before VG is locked
- *                 and save the data in struct vgsummary
+ *                 and save the data in struct vgsummary,
+ *                 this is meant to be quicker than read_vg
+ *                 because the full vg is not needed
  * read_vg: read VG metadata after VG is locked
  *          and save the data in struct volume_group
- * FIXME: why are these separate?
  */
 static int _read_vgsummary(const struct format_type *fmt, const struct dm_config_tree *cft,
 			   struct lvmcache_vgsummary *vgsummary)
@@ -1376,6 +1419,10 @@ static int _read_vgsummary(const struct format_type *fmt, const struct dm_config
 
 	if (dm_config_get_str(vgn, "lock_type", &str) &&
 	    (!(vgsummary->lock_type = dm_pool_strdup(mem, str))))
+		return_0;
+
+	if ((vgsummary->lock_type && !strcmp(vgsummary->lock_type, "sanlock")) &&
+	    !_read_vgsummary_lock_type(vgn, vgsummary))
 		return_0;
 
 	if (!_read_int32(vgn, "seqno", &vgsummary->seqno)) {

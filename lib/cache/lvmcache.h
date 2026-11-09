@@ -59,6 +59,10 @@ struct lvmcache_vgsummary {
 	unsigned mda_ignored:1;
 	unsigned zero_offset:1;
 	unsigned mismatch:1; /* lvmcache sets if this summary differs from previous values */
+	unsigned lockd_global_mode_1:1;
+	unsigned lockd_global_mode_2:1;
+	unsigned lockd_global_lock_1:1;
+	unsigned lockd_global_lock_2:1;
 	struct dm_list pvsummaries;
 };
 
@@ -174,6 +178,10 @@ int lvmcache_found_duplicate_vgnames(void);
 bool lvmcache_has_duplicate_local_vgname(const char *vgid, const char *vgname);
 
 int lvmcache_contains_lock_type_sanlock(struct cmd_context *cmd);
+void lvmcache_get_global_mode(int *gm_none, int *gm1, int *gm2,
+			      int *locktype_sanlock, int *locktype_other);
+const char *lvmcache_get_lock_type(void);
+void lvmcache_get_global_lock(int *gl_none, int *gl1, int *gl2, char *gl_vgname);
 
 void lvmcache_get_max_name_lengths(struct cmd_context *cmd,
 			unsigned *pv_max_name_len, unsigned *vg_max_name_len);
