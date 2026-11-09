@@ -144,8 +144,6 @@ int lockd_vg_is_busy(struct cmd_context *cmd, struct volume_group *vg);
 
 /* locking */
 
-int lockd_global_create(struct cmd_context *cmd, const char *def_mode, const char *vg_lock_type);
-int lockd_global(struct cmd_context *cmd, const char *def_mode);
 int lockd_vg(struct cmd_context *cmd, const char *vg_name, const char *def_mode,
 	     uint32_t flags, struct lockd_state *lks);
 int lockd_vg_update(struct volume_group *vg);
@@ -333,24 +331,6 @@ static inline int lockd_vg_is_started(struct cmd_context *cmd, struct volume_gro
 static inline int lockd_vg_is_busy(struct cmd_context *cmd, struct volume_group *vg)
 {
 	return 0;
-}
-
-static inline int lockd_global_create(struct cmd_context *cmd, const char *def_mode, const char *vg_lock_type)
-{
-	/*
-	 * When lvm is built without lvmlockd support, creating a VG with
-	 * a shared lock type should fail.
-	 */
-	if (is_lockd_type(vg_lock_type)) {
-		log_error("Using a shared lock type requires lvmlockd.");
-		return 0;
-	}
-	return 1;
-}
-
-static inline int lockd_global(struct cmd_context *cmd, const char *def_mode)
-{
-	return 1;
 }
 
 static inline int lockd_vg(struct cmd_context *cmd, const char *vg_name, const char *def_mode,
