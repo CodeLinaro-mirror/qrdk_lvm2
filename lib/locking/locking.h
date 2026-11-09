@@ -77,7 +77,8 @@ int activate_lvs(struct cmd_context *cmd, struct dm_list *lvs, unsigned exclusiv
 
 int lockf_global(struct cmd_context *cmd, const char *mode);
 int lockf_global_nonblock(struct cmd_context *cmd, const char *mode);
-int lock_global(struct cmd_context *cmd, const char *mode);
-int lock_global_convert(struct cmd_context *cmd, const char *mode);
+int lock_global_devs_is_enabled(struct cmd_context *cmd);
+int lock_global_devs(struct cmd_context *cmd, struct dm_list *devs);
+int unlock_global_devs(struct cmd_context *cmd, struct dm_list *devs);
 
 #endif

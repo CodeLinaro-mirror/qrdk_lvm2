@@ -25,6 +25,7 @@
 #include "lib/mm/memlock.h"
 #include "lib/config/defaults.h"
 #include "lib/cache/lvmcache.h"
+#include "lib/device/persist.h"
 #include "lib/display/display.h"
 #include "lib/misc/lvm-signal.h"
 
@@ -387,39 +388,121 @@ int lockf_global_nonblock(struct cmd_context *cmd, const char *mode)
 	return _lockf_global(cmd, mode, 1);
 }
 
-int lock_global(struct cmd_context *cmd, const char *mode)
+/*
+ * Whether devs that are not owned by a VG are protected between hosts
+ * (by PR or the global lock).  This is the case when lvmlockd is used,
+ * where its global mode selects PR or the global lock, or when
+ * persistent_reservations=full, which uses PR without lvmlockd.
+ */
+
+int lock_global_devs_is_enabled(struct cmd_context *cmd)
 {
-	if (!lockf_global(cmd, mode))
+	/*
+	 * lvmlockd always uses either the Global Lock or PR to protect global devs.
+	 */
+	if (lvmlockd_use())
+		return 1;
+
+	/*
+	 * When not using lvmlockd, persistent_reservations=full means that
+	 * PR is used on dev_args (if all support PR).
+	 */
+	return (persist_policy_get(cmd) == PR_POLICY_FULL);
+}
+
+/*
+ * Protect devices from concurrent use between different hosts,
+ * either using Persistent Reservations on the devices, or by
+ * using a Global Lock from the lock manager (through lvmlockd.)
+ *
+ * Outside of the context of shared storage, these devices do
+ * not need any protection at all, because there is no other
+ * host that may be using them concurrently, and this function
+ * is a no-op (lock_global_devs_is_enabled returns 0).
+ *
+ * The devices protected here do not belong to a VG, and are
+ * referred to as "global devices" in the context of locking.
+ *
+ * In the context of specific commands that use these devices,
+ * they are also referred to as "device args", or dev_args
+ * (see dev_args.c) because they are the non-VG devices named
+ * as args on the command line.
+ *
+ * When using lvmlockd, use PR on the devices, or use
+ * the Global Lock (GL), depending on the lvmlockd Global Mode.
+ * (Old lvm versions only used GL, so the Global Mode detects
+ * when GL needs to be used to remain compatible with them.)
+ *
+ * When not using lvmlockd, and persistent_reservations=full in
+ * the lvm config, use PR on the devices.
+ * A user sets persistent_reservations=full to enable PR when
+ * they know that their devices are on shared storage, and they
+ * are not using lvmlockd because they are not using shared VGs.
+ */
+
+int lock_global_devs(struct cmd_context *cmd, struct dm_list *devs)
+{
+	int used_gl = 0, used_pr = 0;
+	int ret;
+
+	if (!cmd->lockf_global_ex && !lockf_global(cmd, "ex"))
 		return 0;
 
-	if (!lockd_global(cmd, mode)) {
-		(void) lockf_global(cmd, "un");
-		return 0;
+	/*
+	 * Nothing to do if lvmlockd is not used, and persistent_reservations
+	 * are not enabled outside of lvmlockd.
+	 */
+	if (!lock_global_devs_is_enabled(cmd))
+		return 1;
+
+	if (lvmlockd_use()) {
+		/*
+		 * With lvmlockd, take PR on devs (calls persist_global_devices_lock),
+		 * or acquire the Global Lock (GL) from lvmlockd.
+		 * PR or GL depends on the Global Mode which is configured or detected.
+		 */
+		ret = lockd_global_devices_lock(cmd, devs, cmd->global_devs.bootstrap, &used_gl, &used_pr);
+	} else {
+		/*
+		 * Without lvmlockd, take PR on devs (when they all support PR.)
+		 */
+		ret = persist_global_devices_lock(cmd, devs, &used_pr);
 	}
+
+	if (!ret)
+		return 0;
+
+	cmd->global_devs.held = used_pr ? GLOBAL_DEVS_PR :
+				used_gl ? GLOBAL_DEVS_GL : GLOBAL_DEVS_NONE;
+	cmd->global_devs.handed_off = 0;
 
 	return 1;
 }
 
 /*
- * The global lock is already held, convert it to another mode.
- *
- * Currently only used for sh->ex.
- *
- * (The lockf_global_ex flag would need overriding
- * to handle ex->sh.)
+ * Release whatever lock_global_devs() acquired.  This is driven by the state
+ * in cmd->global_devs and is safe to call on any exit path, including when
+ * nothing was acquired.
  */
 
-int lock_global_convert(struct cmd_context *cmd, const char *mode)
+int unlock_global_devs(struct cmd_context *cmd, struct dm_list *devs)
 {
-	/* some uncommon cases like pvchange -a can call this multiple times */
-	if (cmd->lockf_global_ex && !strcmp(mode, "ex"))
-		return 1;
+	enum global_devs_held held = cmd->global_devs.held;
+	int handed_off = cmd->global_devs.handed_off;
+	int ret = 1;
 
-	if (!strcmp(mode, "ex") && !lockf_global(cmd, "ex"))
-		return 0;
+	memset(&cmd->global_devs, 0, sizeof(cmd->global_devs));
 
-	if (!lockd_global(cmd, mode))
-		return 0;
+	if (held == GLOBAL_DEVS_PR && !handed_off &&
+	    !lockd_global_devices_unlock(cmd, devs, 0, 1))
+		ret = 0;
 
-	return 1;
+	if (held == GLOBAL_DEVS_GL &&
+	    !lockd_global_devices_unlock(cmd, devs, 1, 0))
+		ret = 0;
+
+	if (cmd->lockf_global_ex && !lockf_global(cmd, "un"))
+		ret = 0;
+
+	return ret;
 }
