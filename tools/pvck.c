@@ -3081,7 +3081,7 @@ static int _pvck_mf(struct metadata_file *mf, struct cmd_context *cmd, int argc,
 	if (arg_is_set(cmd, repairtype_ARG) || arg_is_set(cmd, repair_ARG)) {
 		pv_name = argv[0];
 
-		if (!lock_global(cmd, "ex"))
+		if (!lockf_global(cmd, "ex"))
 			return ECMD_FAILED;
 
 		clear_hint_file(cmd);

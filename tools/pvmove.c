@@ -1069,7 +1069,7 @@ int pvmove(struct cmd_context *cmd, int argc, char **argv)
 		 * and we do not want or need the global lock held during
 		 * that time.
 		 */
-		lock_global(cmd, "un");
+		lockf_global(cmd, "un");
 	}
 
 	return pvmove_poll(cmd, pv_name, lvid ? lvid->s : NULL,

@@ -108,7 +108,7 @@ int vgremove(struct cmd_context *cmd, int argc, char **argv)
 		return EINVALID_CMD_LINE;
 	}
 
-	if (!lock_global(cmd, "ex"))
+	if (!lockf_global(cmd, "ex"))
 		return_ECMD_FAILED;
 
 	clear_hint_file(cmd);

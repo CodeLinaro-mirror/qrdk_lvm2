@@ -122,7 +122,7 @@ int vgcfgrestore(struct cmd_context *cmd, int argc, char **argv)
 		}
 	}
 
-	if (!lock_global(cmd, "ex"))
+	if (!lockf_global(cmd, "ex"))
 		return ECMD_FAILED;
 
 	if (!lock_vol(cmd, vg_name, LCK_VG_WRITE, NULL)) {
