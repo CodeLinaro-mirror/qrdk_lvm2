@@ -55,9 +55,9 @@ struct parser {
 	int no_dup_node_check;	/* whether to disable dup node checking */
 	const char *key;        /* last obtained key */
 	unsigned ignored_creation_time;
-	unsigned section_indent;
 	unsigned depth;
-	const char *stop_after_section;
+	dm_config_section_filter_fn filter;
+	void *filter_arg;
 };
 
 struct config_output {
@@ -182,7 +182,8 @@ static struct dm_config_node *_config_reverse(struct dm_config_node *head)
 }
 
 static int _do_dm_config_parse(struct dm_config_tree *cft, const char *start, const char *end,
-			       int no_dup_node_check, const char *section)
+			       int no_dup_node_check,
+			       dm_config_section_filter_fn filter, void *filter_arg)
 {
 	/* Cut at the first NUL; we never write one, so this bounds hostile input. */
 	const char *nul = memchr(start, '\0', end - start);
@@ -194,7 +195,8 @@ static int _do_dm_config_parse(struct dm_config_tree *cft, const char *start, co
 		.fb = start,
 		.fe = nul ? nul : end,
 		.line = 1,
-		.stop_after_section = section,
+		.filter = filter,
+		.filter_arg = filter_arg,
 		.no_dup_node_check = no_dup_node_check
 	};
 
@@ -209,12 +211,69 @@ static int _do_dm_config_parse(struct dm_config_tree *cft, const char *start, co
 
 int dm_config_parse(struct dm_config_tree *cft, const char *start, const char *end)
 {
-	return _do_dm_config_parse(cft, start, end, 0, NULL);
+	return _do_dm_config_parse(cft, start, end, 0, NULL, NULL);
 }
 
 int dm_config_parse_without_dup_node_check(struct dm_config_tree *cft, const char *start, const char *end)
 {
-	return _do_dm_config_parse(cft, start, end, 1, NULL);
+	return _do_dm_config_parse(cft, start, end, 1, NULL, NULL);
+}
+
+/*
+ * Parse only the parts of the config that the filter selects.
+ *
+ * The filter is called each time the parser reaches a section (name { ... }),
+ * before any node is created for it.  'parent' is the enclosing node and
+ * contains the children parsed so far, so the filter can look at values that
+ * precede the section (e.g. dm_config_find_str(parent->child, "lock_type", ...)).
+ * 'depth' is 0 for a top-level section, 1 for its subsections, and so on.
+ *
+ * The filter returns DM_CONFIG_SECTION_PARSE to parse the section normally,
+ * DM_CONFIG_SECTION_SKIP to skip over it without creating any nodes, or
+ * DM_CONFIG_SECTION_STOP to skip it and the rest of the enclosing top-level
+ * section.  STOP is only honoured for a subsection of a top-level section
+ * (depth 1), where the end of the enclosing section is found by searching
+ * back from the end of the buffer for a "\n}\n" line, otherwise it acts as SKIP.
+ * That search assumes that a single top-level section is the last thing in
+ * the buffer, as in LVM metadata: if further top-level sections follow the
+ * enclosing one, they are skipped as well, and if the buffer does not end
+ * with a newline after the final '}', the pattern is not found and STOP
+ * degrades to SKIP.  Values following the enclosing top-level section are
+ * still parsed.
+ *
+ * The filter must not keep 'name' beyond the call (it may point to a
+ * transient buffer), and must not rely on the order of the parent's
+ * children, which is not defined until parsing is finished.
+ *
+ * This function is automatically running without_dup_node_check.
+ */
+int dm_config_parse_filtered(struct dm_config_tree *cft, const char *start, const char *end,
+			     dm_config_section_filter_fn filter, void *arg)
+{
+	return _do_dm_config_parse(cft, start, end, 1, filter, arg);
+}
+
+struct only_section_arg {
+	const char *section;
+	int found;
+};
+
+static enum dm_config_section_action _only_section_filter(const struct dm_config_node *parent,
+							  const char *name, unsigned depth,
+							  void *arg)
+{
+	struct only_section_arg *b = arg;
+
+	if (depth != 1)
+		return DM_CONFIG_SECTION_PARSE;
+
+	if (b->found)
+		return DM_CONFIG_SECTION_STOP;
+
+	if (!strcmp(name, b->section))
+		b->found = 1;
+
+	return DM_CONFIG_SECTION_PARSE;
 }
 
 /*
@@ -225,7 +284,9 @@ int dm_config_parse_without_dup_node_check(struct dm_config_tree *cft, const cha
  */
 int dm_config_parse_only_section(struct dm_config_tree *cft, const char *start, const char *end, const char *section)
 {
-	return _do_dm_config_parse(cft, start, end, 1, section);
+	struct only_section_arg arg = { .section = section };
+
+	return _do_dm_config_parse(cft, start, end, 1, _only_section_filter, &arg);
 }
 
 struct dm_config_tree *dm_config_from_string(const char *config_settings)
@@ -627,13 +688,65 @@ static struct dm_config_node *_find_or_make_node(struct dm_pool *mem,
 	return NULL;
 }
 
+/*
+ * Skip over a section without creating nodes.  The current token is the
+ * opening brace; on return the current token is the one after the matching
+ * closing brace.
+ */
+static int _skip_section(struct parser *p)
+{
+	unsigned level = 0;
+
+	do {
+		if (p->t == TOK_SECTION_B)
+			level++;
+		else if (p->t == TOK_SECTION_E)
+			level--;
+		else if (p->t == TOK_EOF) {
+			log_error("Parse error at byte %" PRIptrdiff_t " (line %d): "
+				  "unexpected end of section.",
+				  p->tb - p->fb + 1, p->line);
+			return 0;
+		}
+		_get_token(p, p->t);
+	} while (level);
+
+	return 1;
+}
+
+/*
+ * Skip the rest of the enclosing top-level section by searching back from
+ * the end of the buffer for its closing "\n}\n".  On success the current
+ * token is that closing brace.  On failure the parser state is left
+ * untouched, so that DM_CONFIG_SECTION_STOP can fall back to skipping only
+ * the current section.
+ *
+ * The pattern being matched spans te[-2] through te[0], so the scan must
+ * stop while te[-2] is still within the buffer.
+ */
+static int _skip_to_top_section_end(struct parser *p)
+{
+	const char *te;
+
+	for (te = p->fe - 1; te > p->tb + 2; --te) {
+		if ((te[-2] == '\n') &&
+		    (te[-1] == '}') &&
+		    (te[ 0] == '\n')) {
+			p->te = te;
+			p->t = TOK_SECTION_E;
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 static struct dm_config_node *_section(struct parser *p, struct dm_config_node *parent)
 {
 	/* IDENTIFIER SECTION_B_CHAR VALUE* SECTION_E_CHAR */
 
 	struct dm_config_node *root;
 	struct dm_config_value *value;
-	const char *te;
 	char *str;
 	size_t len;
 	unsigned depth;
@@ -675,6 +788,21 @@ static struct dm_config_node *_section(struct parser *p, struct dm_config_node *
 		return NULL;
 	}
 
+	if (p->filter && (p->t == TOK_SECTION_B)) {
+		switch (p->filter(parent, str, p->depth, p->filter_arg)) {
+		case DM_CONFIG_SECTION_STOP:
+			if ((p->depth == 1) && _skip_to_top_section_end(p))
+				return parent;
+			/* fall through */
+		case DM_CONFIG_SECTION_SKIP:
+			if (!_skip_section(p))
+				return_NULL;
+			return parent;
+		default:
+			break;
+		}
+	}
+
 	/* Every '/' in identifier nests a section just like SECTION_B_CHAR */
 	depth = dm_count_chars(str, strlen(str), '/');
 	if (p->t == TOK_SECTION_B)
@@ -691,8 +819,6 @@ static struct dm_config_node *_section(struct parser *p, struct dm_config_node *
 		return_NULL;
 
 	if (p->t == TOK_SECTION_B) {
-		if (p->stop_after_section)
-			++p->section_indent;
 		match(TOK_SECTION_B);
 		p->depth += depth;
 		while (p->t != TOK_SECTION_E) {
@@ -703,22 +829,6 @@ static struct dm_config_node *_section(struct parser *p, struct dm_config_node *
 		}
 		p->depth -= depth;
 		match(TOK_SECTION_E);
-		if (p->stop_after_section && (--p->section_indent == 1)) {
-			if (!strcmp(str, p->stop_after_section)) {
-				/* Found stopping section name -> parsing is finished.
-				 * Now try to find the sequence "\n}\n" from end of b
-				 * parsed buffer to continue filling remaining nodes.
-				 * When missing, keep current token and parse the rest. */
-				for (te = p->fe - 1; te > p->tb; --te)
-					if ((te[-2] == '\n') &&
-					    (te[-1] == '}') &&
-					    (te[ 0] == '\n')) {
-						p->te = te;
-						p->t = TOK_SECTION_E;
-						break;
-					}
-			}
-		}
 	} else {
 		match(TOK_EQ);
 		p->key = root->key;

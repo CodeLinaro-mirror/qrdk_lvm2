@@ -3918,7 +3918,56 @@ struct dm_config_tree *dm_config_create(void);
 struct dm_config_tree *dm_config_from_string(const char *config_settings);
 int dm_config_parse(struct dm_config_tree *cft, const char *start, const char *end);
 int dm_config_parse_without_dup_node_check(struct dm_config_tree *cft, const char *start, const char *end);
+
+/*
+ * Parse the top-level section values and the named first-level subsection
+ * of it.  Once a first-level subsection following the named one is reached,
+ * the rest of the top-level section is skipped.  Values that follow the
+ * named subsection within the top-level section are still parsed, since
+ * only sections trigger the stop.  Text following the top-level section
+ * is parsed.  Runs without duplicate node checking.
+ */
 int dm_config_parse_only_section(struct dm_config_tree *cft, const char *start, const char *end, const char *section);
+
+enum dm_config_section_action {
+	DM_CONFIG_SECTION_PARSE = 0,	/* parse the section */
+	DM_CONFIG_SECTION_SKIP,		/* skip the section without creating nodes */
+	/*
+	 * Skip the section and the rest of the enclosing top-level section.
+	 * Only honoured at depth 1; at any other depth it acts as SKIP
+	 * (see dm_config_parse_filtered).
+	 */
+	DM_CONFIG_SECTION_STOP
+};
+
+/*
+ * Called when the parser reaches a section (name { ... }), before any
+ * node is created for it.  parent is the enclosing section's node and
+ * holds the values parsed so far, so values preceding the section can be
+ * looked up by key, e.g. dm_config_find_str(parent->child, "lock_type", ...).
+ * The order of parent's children is not defined during parsing; look
+ * values up by key rather than walking the sibling list.  depth is 0 for
+ * a top-level section, 1 for its subsections, and so on.  name is only
+ * valid for the duration of the call and must be copied if it is needed
+ * afterwards.
+ */
+typedef enum dm_config_section_action (*dm_config_section_filter_fn)(const struct dm_config_node *parent,
+								     const char *name,
+								     unsigned depth, void *arg);
+
+/*
+ * Parse only the parts of the config that the filter selects.  Runs
+ * without duplicate node checking.
+ *
+ * DM_CONFIG_SECTION_STOP finds the end of the enclosing top-level section
+ * by searching back from the end of the buffer for the last "\n}\n" line.
+ * This assumes that a single top-level section is the last thing in the
+ * buffer, as in LVM metadata: if further top-level sections follow the
+ * enclosing one, they are skipped as well, and if the buffer does not end
+ * with a newline after the final '}', STOP degrades to SKIP.
+ */
+int dm_config_parse_filtered(struct dm_config_tree *cft, const char *start, const char *end,
+			     dm_config_section_filter_fn filter, void *arg);
 
 void *dm_config_get_custom(struct dm_config_tree *cft);
 void dm_config_set_custom(struct dm_config_tree *cft, void *custom);

@@ -319,6 +319,150 @@ static void test_comment_line_numbers(void *fixture)
 	T_ASSERT(strstr(buf, "line 3") != NULL);
 }
 
+static const char *vgtext =
+	"vg0 {\n"
+	"\tid = \"vgid\"\n"
+	"\tlock_type = \"%s\"\n"
+	"\tphysical_volumes {\n"
+	"\t\tpv0 {\n"
+	"\t\t\tid = \"pvid\"\n"
+	"\t\t}\n"
+	"\t}\n"
+	"\tlogical_volumes {\n"
+	"\t\tlv1 {\n"
+	"\t\t\tid = \"lv1id\"\n"
+	"\t\t\tsegment1 {\n"
+	"\t\t\t\ttype = \"striped\"\n"
+	"\t\t\t}\n"
+	"\t\t}\n"
+	"\t\tlvmlock {\n"
+	"\t\t\ttags = [\"T1\"]\n"
+	"\t\t}\n"
+	"\t\tlv2 {\n"
+	"\t\t\tid = \"lv2id\"\n"
+	"\t\t}\n"
+	"\t}\n"
+	"}\n"
+	"creation_host = \"host\"\n";
+
+static enum dm_config_section_action _filter(const struct dm_config_node *parent,
+					     const char *name, unsigned depth, void *arg)
+{
+	const char *lock_type;
+
+	if (depth == 1 && !strcmp(name, "logical_volumes")) {
+		lock_type = dm_config_find_str(parent->child, "lock_type", NULL);
+		return (lock_type && !strcmp(lock_type, "sanlock")) ?
+			DM_CONFIG_SECTION_PARSE : DM_CONFIG_SECTION_STOP;
+	}
+
+	if (depth == 2 && !strcmp(parent->key, "logical_volumes") && strcmp(name, "lvmlock"))
+		return DM_CONFIG_SECTION_SKIP;
+
+	return DM_CONFIG_SECTION_PARSE;
+}
+
+static struct dm_config_tree *_parse_vg(const char *lock_type, dm_config_section_filter_fn fn)
+{
+	struct dm_config_tree *cft = dm_config_create();
+	char buf[1024];
+
+	T_ASSERT(cft);
+	snprintf(buf, sizeof(buf), vgtext, lock_type);
+	T_ASSERT(dm_config_parse_filtered(cft, buf, buf + strlen(buf), fn, NULL));
+
+	return cft;
+}
+
+static void test_filtered_sanlock(void *fixture)
+{
+	struct dm_config_tree *cft = _parse_vg("sanlock", _filter);
+	const struct dm_config_node *vg = cft->root;
+
+	T_ASSERT(!strcmp(vg->key, "vg0"));
+	T_ASSERT(!strcmp(dm_config_find_str(vg->child, "lock_type", ""), "sanlock"));
+	T_ASSERT(!strcmp(dm_config_find_str(vg->child, "physical_volumes/pv0/id", ""), "pvid"));
+	T_ASSERT(dm_config_has_node(vg->child, "logical_volumes/lvmlock"));
+	T_ASSERT(!dm_config_has_node(vg->child, "logical_volumes/lv1"));
+	T_ASSERT(!dm_config_has_node(vg->child, "logical_volumes/lv2"));
+	T_ASSERT(!strcmp(dm_config_find_str(cft->root, "creation_host", ""), "host"));
+
+	dm_config_destroy(cft);
+}
+
+static void test_filtered_stop(void *fixture)
+{
+	struct dm_config_tree *cft = _parse_vg("none", _filter);
+	const struct dm_config_node *vg = cft->root;
+
+	T_ASSERT(!strcmp(dm_config_find_str(vg->child, "physical_volumes/pv0/id", ""), "pvid"));
+	T_ASSERT(!dm_config_has_node(vg->child, "logical_volumes"));
+	T_ASSERT(!strcmp(dm_config_find_str(cft->root, "creation_host", ""), "host"));
+
+	dm_config_destroy(cft);
+}
+
+static void test_only_section(void *fixture)
+{
+	struct dm_config_tree *cft = dm_config_create();
+	char buf[1024];
+
+	snprintf(buf, sizeof(buf), vgtext, "none");
+	T_ASSERT(dm_config_parse_only_section(cft, buf, buf + strlen(buf), "physical_volumes"));
+	T_ASSERT(dm_config_has_node(cft->root->child, "physical_volumes/pv0"));
+	T_ASSERT(!dm_config_has_node(cft->root->child, "logical_volumes"));
+	T_ASSERT(!strcmp(dm_config_find_str(cft->root, "creation_host", ""), "host"));
+
+	dm_config_destroy(cft);
+}
+
+static enum dm_config_section_action _stop_at_depth1(const struct dm_config_node *parent,
+						     const char *name, unsigned depth,
+						     void *arg)
+{
+	if (depth == 1)
+		return DM_CONFIG_SECTION_STOP;
+
+	return DM_CONFIG_SECTION_PARSE;
+}
+
+/*
+ * Without a newline after the final '}' the stop search cannot find
+ * "\n}\n" and DM_CONFIG_SECTION_STOP degrades to DM_CONFIG_SECTION_SKIP,
+ * so the stopped sections are skipped but the enclosing section and the
+ * values preceding them are still parsed.  The empty sub0 section also
+ * checks that the failed stop search does not disturb the parser state
+ * before the section is skipped.
+ */
+static void test_filtered_stop_no_trailing_newline(void *fixture)
+{
+	struct dm_config_tree *cft = dm_config_create();
+	static const char buf[] =
+		"vg0 {\n"
+		"\tid = \"vgid\"\n"
+		"\tsub0 {}\n"
+		"\tsub1 {\n"
+		"\t\ta = 1\n"
+		"\t}\n"
+		"\tsub2 {\n"
+		"\t\tb = 2\n"
+		"\t}\n"
+		"}";
+	const struct dm_config_node *vg;
+
+	T_ASSERT(cft);
+	T_ASSERT(dm_config_parse_filtered(cft, buf, buf + strlen(buf), _stop_at_depth1, NULL));
+
+	vg = cft->root;
+	T_ASSERT(!strcmp(vg->key, "vg0"));
+	T_ASSERT(!strcmp(dm_config_find_str(vg->child, "id", ""), "vgid"));
+	T_ASSERT(!dm_config_has_node(vg->child, "sub0"));
+	T_ASSERT(!dm_config_has_node(vg->child, "sub1"));
+	T_ASSERT(!dm_config_has_node(vg->child, "sub2"));
+
+	dm_config_destroy(cft);
+}
+
 #define T(path, desc, fn) register_test(ts, "/metadata/config/" path, desc, fn)
 
 void config_tests(struct dm_list *all_tests)
@@ -335,6 +479,11 @@ void config_tests(struct dm_list *all_tests)
 	T("comment-nul", "a NUL ends the parse, even inside a comment", test_nul_ends_parse);
 	T("clone", "duplicating a config tree", test_clone);
 	T("cascade", "cascade", test_cascade);
+	T("filtered-sanlock", "filtered parse keeping a section", test_filtered_sanlock);
+	T("filtered-stop", "filtered parse stopping at a section", test_filtered_stop);
+	T("filtered-stop-no-nl", "filtered stop degrading to skip without trailing newline",
+	  test_filtered_stop_no_trailing_newline);
+	T("only-section", "parse only a section", test_only_section);
 
 	dm_list_add(all_tests, &ts->list);
 }
