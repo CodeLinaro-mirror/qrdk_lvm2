@@ -1,4 +1,5 @@
 config shared-sanlock-3node-4scsi-caw-io2-512.conf
+run shell/shared-vg-dev-args-pr.sh
 run shell/shared-vg-pr.sh
 run shell/shared-vg-lock-recovery-pr.sh
 run shell/shared-vg-lock-recovery-wd.sh
