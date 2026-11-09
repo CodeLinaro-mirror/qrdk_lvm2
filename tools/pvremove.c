@@ -17,27 +17,14 @@
 
 int pvremove(struct cmd_context *cmd, int argc, char **argv)
 {
-	struct processing_handle *handle;
-	struct pvcreate_params pp;
-	int ret;
+	DM_LIST_INIT(devs); /* dev args */
+	struct device_arg *da;
+	force_t force = arg_force_value(cmd);
+	int repeat = 0;
+	int ret = ECMD_FAILED;
 
-	if (!argc) {
-		log_error("Please enter a physical volume path");
-		return EINVALID_CMD_LINE;
-	}
-
-	pvcreate_params_set_defaults(&pp);
-
-	pp.is_remove = 1;
-	pp.force = arg_force_value(cmd);
-	pp.yes = arg_count(cmd, yes_ARG);
-	pp.pv_count = argc;
-	pp.pv_names = argv;
-
-	/* Needed to change the set of orphan PVs. */
-	if (!lock_global(cmd, "ex")) {
-		/* Let pvremove -ff skip locks */
-		if (pp.force == DONT_PROMPT_OVERRIDE)
+	if (!lockf_global(cmd, "ex")) {
+		if (force == DONT_PROMPT_OVERRIDE) /* -ff */
 			log_warn("WARNING: Skipping global lock for force.");
 		else
 			return_ECMD_FAILED;
@@ -45,29 +32,93 @@ int pvremove(struct cmd_context *cmd, int argc, char **argv)
 
 	clear_hint_file(cmd);
 
-	if (!lvmcache_label_scan(cmd))
-		return_ECMD_FAILED;
+	set_pv_notify(cmd);
+
+	/* setup_devices locks the devices file ex, held until device_ids_write. */
+	cmd->edit_devices_file = 1;
 
 	/* When forcibly clearing a PV we don't care about a VG lock. */
-	if (pp.force == DONT_PROMPT_OVERRIDE)
+	if (force == DONT_PROMPT_OVERRIDE)
 		cmd->lockd_vg_disable = 1;
 
-	if (!(handle = init_processing_handle(cmd, NULL))) {
-		log_error("Failed to initialize processing handle.");
-		return ECMD_FAILED;
-	}
+ repeat_label_scan:
+	if (!lvmcache_label_scan(cmd))
+		goto out;
 
 	/*
-	 * pvremove uses the same toollib function as pvcreate,
-	 * but sets "is_remove" which changes the check function,
-	 * and the actual create vs remove step.
+	 * Devs that are rejected or cannot be used for some reason are skipped
+	 * (da->failed is set), and the remaining devs are processed.
+	 *
+	 * If scan is repeated, state saved in the prior devs list is reused.
 	 */
+	if (dm_list_empty(&devs) && !dev_args_list_create_available(cmd, argc, argv, &devs))
+		goto out;
 
-	if (!pvcreate_each_device(cmd, handle, &pp))
-		ret = ECMD_FAILED;
-	else
+	/* The command rejects devs excluded by filters, e.g. not in the devices file. */
+	dev_args_filter_read(cmd, &devs);
+
+	/* Verify devs are PVs, are orphans (or -ff). */
+	dev_args_accepted_for_pvremove(cmd, &devs);
+
+	if (dev_args_all_failed(&devs))
+		goto out;
+
+	/* Repeat checks if things may have changed during user prompt. */
+	if (!pvremove_user_prompt(cmd, &devs, &repeat))
+		goto out;
+
+	if (repeat)
+		goto repeat_label_scan;
+
+	if (dev_args_all_failed(&devs))
+		goto out;
+
+	/* This lock can acquire PR on the devs. */
+	if (lock_global_devs_is_enabled(cmd) && !lock_global_dev_args(cmd, &devs))
+		goto out;
+
+	/*
+	 * Reopen the devs excl and reread them, and verify they are still
+	 * accepted (a concurrent vgextend/vgcreate may have claimed a dev).
+	 */
+	dev_args_label_scan_excl(cmd, &devs);
+
+	dev_args_accepted_for_pvremove(cmd, &devs);
+
+	if (dev_args_all_failed(&devs))
+		goto out;
+
+	/*
+	 * Remove the PV label from each dev.  Other signatures on the devs
+	 * are not wiped (the user is not prompted about them), and the start
+	 * of the devs is not zeroed; pvremove only removes the PV label.
+	 */
+	if (!dev_args_label_remove(cmd, &devs)) {
+		if (sigint_caught()) {
+			log_error("Interrupted while removing labels.");
+			goto out;
+		}
+	}
+
+	dm_list_iterate_items(da, &devs) {
+		if (da->failed)
+			continue;
+
+		/* pvremove -ff clears an unused duplicate. */
+		if (force == DONT_PROMPT_OVERRIDE && da->is_unused_dup_dev)
+			lvmcache_del_dev_from_duplicates(da->dev);
+
+		log_print_unless_silent("Labels on physical volume \"%s\" successfully wiped.", da->name);
+	}
+
+	/* Clear the erased PVID from the device entry. */
+	dev_args_update_devices_file(cmd, &devs, NULL, 1);
+
+	if (!dev_args_any_failed(&devs))
 		ret = ECMD_PROCESSED;
+out:
+	if (!unlock_global_dev_args(cmd, &devs))
+		ret = ECMD_FAILED;
 
-	destroy_processing_handle(cmd, handle);
 	return ret;
 }

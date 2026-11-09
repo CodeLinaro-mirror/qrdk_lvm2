@@ -36,6 +36,101 @@ const char *command_name(struct cmd_context *cmd)
 	return cmd->command->name;
 }
 
+static struct device_arg *_device_arg_find_name(struct dm_list *devs, const char *name)
+{
+	struct device_arg *da;
+
+	dm_list_iterate_items(da, devs) {
+		if (!strcmp(da->name, name))
+			return da;
+	}
+
+	return NULL;
+}
+
+static struct device_arg *_device_arg_find_dev(struct dm_list *devs, struct device *dev)
+{
+	struct device_arg *da;
+
+	dm_list_iterate_items(da, devs) {
+		if (da->dev == dev)
+			return da;
+	}
+
+	return NULL;
+}
+
+/*
+ * Create a device_arg for each device named in argv.
+ *
+ * If "available" is not set, all args must resolve to a device.  If it is set,
+ * an arg that does not resolve is reported, and is not an error for this
+ * function; its device_arg has no dev and is marked failed.
+ *
+ * If "unique" is set, the same name given twice is an error.  Otherwise, an
+ * arg for a dev that is already in the list is ignored.
+ */
+static int _dev_args_list_create(struct cmd_context *cmd, int argc, char **argv,
+				 struct dm_list *devs, int available, int unique)
+{
+	struct device_arg *da;
+	struct device *dev;
+	char *name;
+	unsigned i;
+
+	dm_list_init(devs);
+
+	for (i = 0; i < argc; i++) {
+		if (!(name = dm_pool_strdup(cmd->mem, argv[i])))
+			return_0;
+
+		dm_unescape_colons_and_at_signs(name, NULL, NULL);
+
+		if (unique && _device_arg_find_name(devs, name)) {
+			log_error("Duplicate device name found on input: %s.", name);
+			return 0;
+		}
+
+		if (!(dev = dev_cache_get_existing(cmd, name, NULL))) {
+			if (!available) {
+				log_error("Cannot use %s: %s", name, devname_error_reason(name));
+				return 0;
+			}
+			log_error("No device found for %s.", name);
+		} else if (_device_arg_find_dev(devs, dev))
+			continue;
+
+		if (!(da = dm_pool_zalloc(cmd->mem, sizeof(*da))))
+			return_0;
+
+		da->name = name;
+		da->dev = dev;
+		da->failed = !dev;
+		dm_list_init(&da->sigs);
+		dm_list_add(devs, &da->list);
+	}
+
+	return 1;
+}
+
+int dev_args_list_create(struct cmd_context *cmd, int argc, char **argv,
+			 struct dm_list *devs)
+{
+	return _dev_args_list_create(cmd, argc, argv, devs, 0, 0);
+}
+
+int dev_args_list_create_unique(struct cmd_context *cmd, int argc, char **argv,
+				struct dm_list *devs)
+{
+	return _dev_args_list_create(cmd, argc, argv, devs, 0, 1);
+}
+
+int dev_args_list_create_available(struct cmd_context *cmd, int argc, char **argv,
+				   struct dm_list *devs)
+{
+	return _dev_args_list_create(cmd, argc, argv, devs, 1, 1);
+}
+
 static void _sigchld_handler(int sig __attribute__((unused)))
 {
 	int saved_errno = errno;

@@ -99,9 +99,10 @@ static int _pvcreate_restore_params_from_backup(struct cmd_context *cmd,
 
 int pvcreate(struct cmd_context *cmd, int argc, char **argv)
 {
-	struct processing_handle *handle;
 	struct pvcreate_params pp;
-	int ret;
+	struct dm_list devs; /* dev args */
+	int repeat = 0;
+	int ret = ECMD_FAILED;
 
 	/*
 	 * Five kinds of pvcreate param values:
@@ -133,30 +134,100 @@ int pvcreate(struct cmd_context *cmd, int argc, char **argv)
 
 	/* FIXME Also needs to check any 2nd metadata area isn't inside the data area! */
 
-	pp.pv_count = argc;
-	pp.pv_names = argv;
+	dm_list_init(&devs);
 
-	/* Needed to change the set of orphan PVs. */
-	if (!lock_global(cmd, "ex"))
+	if (!lockf_global(cmd, "ex"))
 		return_ECMD_FAILED;
 
 	clear_hint_file(cmd);
 
+	set_pv_notify(cmd);
+
 	cmd->create_edit_devices_file = 1;
 
 	if (!lvmcache_label_scan(cmd))
-		return_ECMD_FAILED;
+		goto out;
 
-	if (!(handle = init_processing_handle(cmd, NULL))) {
-		log_error("Failed to initialize processing handle.");
-		return ECMD_FAILED;
+	/*
+	 * pvcreate can use some of the devs: each of these marks the devs that
+	 * fail, and the command continues if any dev is left.
+	 */
+	if (!dev_args_list_create_available(cmd, argc, argv, &devs))
+		goto out;
+
+	cmd->use_full_md_check = 1;    /* ensure pvcreate doesn't overwrite md component */
+	cmd->filter_deviceid_skip = 1; /* pvcreate args are added to the devices file */
+
+	dev_args_filter_clear(cmd, &devs);
+	dev_args_filter_nodata(cmd, &devs);
+	dev_args_filter_clear(cmd, &devs);
+
+ repeat_label_scan:
+	dev_args_label_scan(cmd, &devs);
+	dev_args_filter_read(cmd, &devs);
+
+	/* Verify devs are appropriate targets for pvcreate. */
+	dev_args_accepted_for_pvcreate(cmd, &devs, &pp);
+
+	if (dev_args_all_failed(&devs))
+		goto out;
+
+	/* Repeat checks if things may have changed during user prompt. */
+	if (!pvcreate_user_prompt(cmd, &devs, &repeat))
+		goto out;
+
+	if (repeat)
+		goto repeat_label_scan;
+
+	cmd->use_full_md_check = 0;
+	cmd->filter_deviceid_skip = 0;
+
+	if (dev_args_all_failed(&devs))
+		goto out;
+
+	/* This lock can acquire PR on the devs. */
+	if (lock_global_devs_is_enabled(cmd) && !lock_global_dev_args(cmd, &devs))
+		goto out;
+
+	/*
+	 * Reopen the devs excl and reread them, and verify they are still
+	 * accepted (another command may have used a dev.)
+	 */
+	cmd->filter_deviceid_skip = 1;
+	dev_args_label_scan_excl(cmd, &devs);
+	cmd->filter_deviceid_skip = 0;
+
+	dev_args_accepted_for_pvcreate(cmd, &devs, &pp);
+
+	if (dev_args_all_failed(&devs))
+		goto out;
+
+	/*
+	 * Write the new PVs.
+	 * If wipe_and_zero is interrupted, stop before writing any PVs.
+	 * Skip devs that fail to be wiped/zeroed, and use the remaining.
+	 */
+	if (!dev_args_wipe_and_zero(cmd, &devs)) {
+		if (sigint_caught()) {
+			log_error("Interrupted before writing new PVs.");
+			goto out;
+		}
 	}
 
-	if (!pvcreate_each_device(cmd, handle, &pp))
-		ret = ECMD_FAILED;
-	else
-		ret = ECMD_PROCESSED;
+	dev_args_pv_setup_and_zero(cmd, &devs, &pp.pva, &pp.pvs);
+	dev_args_pv_write(cmd, &devs, &pp.pvs);
 
-	destroy_processing_handle(cmd, handle);
+	/* Add devs to the devices file. */
+	dev_args_update_devices_file(cmd, &devs, &pp.pvs, 0);
+
+	if (!dev_args_any_failed(&devs))
+		ret = ECMD_PROCESSED;
+out:
+	cmd->use_full_md_check = 0;
+	cmd->filter_deviceid_skip = 0;
+
+	if (!unlock_global_dev_args(cmd, &devs))
+		ret = ECMD_FAILED;
+
 	return ret;
 }
