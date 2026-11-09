@@ -339,17 +339,17 @@ void sync_local_dev_names(struct cmd_context *cmd)
 }
 
 /*
- * The lockf_global_ex flag is used to prevent changing
- * an explicitly acquired ex global lock to sh in process_each.
+ * The global flock is local to the host.  It is only taken ex, to serialize
+ * commands on this host that change global state (devices not in a VG, VG
+ * names).  Commands that only read are not blocked by it, and do not take it.
+ *
+ * The lockf_global_ex flag is set while the flock is held ex.
  */
 
-static int _lockf_global(struct cmd_context *cmd, const char *mode, int convert, int nonblock)
+static int _lockf_global(struct cmd_context *cmd, const char *mode, int nonblock)
 {
 	uint32_t flags = 0;
 	int ret;
-
-	if (convert)
-		flags |= LCK_CONVERT;
 
 	if (nonblock)
 		flags |= LCK_NONBLOCK;
@@ -366,14 +366,6 @@ static int _lockf_global(struct cmd_context *cmd, const char *mode, int convert,
 		if (ret)
 			cmd->lockf_global_ex = 1;
 
-	} else if (!strcmp(mode, "sh")) {
-		if (cmd->lockf_global_ex)
-			return 1;
-
-		flags |= LCK_READ;
-
-		ret = lock_vol(cmd, VG_GLOBAL, flags, NULL);
-
 	} else if (!strcmp(mode, "un")) {
 		ret = lock_vol(cmd, VG_GLOBAL, LCK_UNLOCK, NULL);
 		cmd->lockf_global_ex = 0;
@@ -387,21 +379,12 @@ static int _lockf_global(struct cmd_context *cmd, const char *mode, int convert,
 
 int lockf_global(struct cmd_context *cmd, const char *mode)
 {
-	return _lockf_global(cmd, mode, 0, 0);
-}
-
-int lockf_global_convert(struct cmd_context *cmd, const char *mode)
-{
-	/* some uncommon cases like pvchange -a can call this multiple times */
-	if (cmd->lockf_global_ex && !strcmp(mode, "ex"))
-		return 1;
-
-	return _lockf_global(cmd, mode, 1, 0);
+	return _lockf_global(cmd, mode, 0);
 }
 
 int lockf_global_nonblock(struct cmd_context *cmd, const char *mode)
 {
-	return _lockf_global(cmd, mode, 0, 1);
+	return _lockf_global(cmd, mode, 1);
 }
 
 int lock_global(struct cmd_context *cmd, const char *mode)
@@ -428,7 +411,11 @@ int lock_global(struct cmd_context *cmd, const char *mode)
 
 int lock_global_convert(struct cmd_context *cmd, const char *mode)
 {
-	if (!lockf_global_convert(cmd, mode))
+	/* some uncommon cases like pvchange -a can call this multiple times */
+	if (cmd->lockf_global_ex && !strcmp(mode, "ex"))
+		return 1;
+
+	if (!strcmp(mode, "ex") && !lockf_global(cmd, "ex"))
 		return 0;
 
 	if (!lockd_global(cmd, mode))
