@@ -1542,17 +1542,6 @@ int vgchange_locktype_cmd(struct cmd_context *cmd, int argc, char **argv)
 		return 0;
 	}
 
-	/*
-	 * This is a special case where taking the global lock is
-	 * not needed to protect global state, because the change is
-	 * only to an existing VG.  But, taking the global lock ex is
-	 * helpful in this case to trigger a global cache validation
-	 * on other hosts, to cause them to see the new system_id or
-	 * lock_type.
-	 */
-	if (!lockd_global(cmd, "ex"))
-		log_warn("WARNING: no global lock held in lvmlockd.");
-
 process:
 	if (!(handle = init_processing_handle(cmd, NULL))) {
 		log_error("Failed to initialize processing handle.");
@@ -1606,20 +1595,10 @@ int vgchange_lock_start_stop_cmd(struct cmd_context *cmd, int argc, char **argv)
 	/*
 	 * Starting lockspaces.  For VGs not yet started, locks are not
 	 * available to acquire, and for VGs already started, there's nothing
-	 * to do, so disable VG locks.  Try to acquire the global lock sh to
-	 * validate the cache (if no gl is available, lockd_gl will force a
-	 * cache validation).  If the global lock is available, it can be
-	 * beneficial to hold sh to serialize lock-start with vgremove of the
-	 * same VG from another host.
+	 * to do, so disable VG locks.
 	 */
 	if (arg_is_set(cmd, lockstart_ARG)) {
 		cmd->lockd_vg_disable = 1;
-
-		if (!lockd_global(cmd, "sh"))
-			log_debug("No global lock for lock start.");
-
-		/* Disable the lockd_gl in process_each_vg. */
-		cmd->lockd_gl_disable = 1;
 	} else {
 		/* If the VG was started when it was exported, allow it to be stopped. */
 		cmd->include_exported_vgs = 1;
@@ -1632,9 +1611,6 @@ int vgchange_lock_start_stop_cmd(struct cmd_context *cmd, int argc, char **argv)
 	/* Wait for lock-start ops that were initiated in vgchange_lockstart. */
 
 	if (arg_is_set(cmd, lockstart_ARG) && vp.lock_start_count) {
-		if (!lockd_global(cmd, "un"))
-			stack;
-
 		if ((cmd->lockopt & LOCKOPT_NOWAIT) || (cmd->lockopt & LOCKOPT_AUTONOWAIT)) {
 			log_print_unless_silent("Starting locking.  VG can only be read until locks are ready.");
 		} else {
