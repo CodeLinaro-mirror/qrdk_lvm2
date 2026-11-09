@@ -1170,6 +1170,25 @@ int fs_get_blkid(const char *pathname, struct fs_info *fsi)
 }
 #endif
 
+static int _sig_add(struct cmd_context *cmd, struct dm_list *sigs,
+		    const char *type, const char *offset)
+{
+	struct dev_signature *sig;
+
+	if (!(sig = dm_pool_zalloc(cmd->mem, sizeof(*sig))))
+		return_0;
+
+	if (!(sig->type = dm_pool_strdup(cmd->mem, type)))
+		return_0;
+
+	if (offset && !(sig->offset = dm_pool_strdup(cmd->mem, offset)))
+		return_0;
+
+	dm_list_add(sigs, &sig->list);
+
+	return 1;
+}
+
 #ifdef BLKID_WIPING_SUPPORT
 
 static inline int _type_in_flag_list(const char *type, uint32_t flag_list)
@@ -1183,59 +1202,137 @@ static inline int _type_in_flag_list(const char *type, uint32_t flag_list)
 #define MSG_FAILED_SIG_LENGTH "Failed to get length of the %s signature on %s."
 #define MSG_WIPING_SKIPPED " Wiping skipped."
 
-static int _blkid_wipe(blkid_probe probe, struct device *dev, const char *name,
-		       uint32_t types_to_exclude, uint32_t types_no_prompt,
-		       int yes, force_t force)
+/*
+ * Result of examining one signature found by a blkid probe, returned by
+ * _blkid_get_signature() and _blkid_wipe() (where BLKID_SIG_FOUND also
+ * means the signature was wiped).
+ */
+enum sig_result {
+	BLKID_SIG_ERROR = 0,	/* error, the caller should fail */
+	BLKID_SIG_FOUND,	/* signature found to wipe or list */
+	BLKID_SIG_SKIP,		/* signature skipped: excluded type, or its offset/length
+				   cannot be found and wiping can continue without it */
+	BLKID_SIG_UNKNOWN_TYPE,	/* the probe found a signature but its type could not
+				   be determined (neither TYPE nor PTTYPE set) */
+};
+
+/*
+ * Create a blkid probe configured to detect the signatures that
+ * _wipe_known_signatures_with_blkid wipes and _find_known_signatures_with_blkid
+ * lists.  Keeping the setup in one place ensures that both functions detect
+ * the same set of signatures.
+ */
+static blkid_probe _blkid_probe_setup(struct device *dev)
+{
+	blkid_probe probe;
+
+	if (dm_list_empty(&dev->aliases))
+		return NULL;
+
+	if (!(probe = blkid_new_probe_from_filename(dev_name(dev)))) {
+		log_error("Failed to create a new blkid probe for device %s.", dev_name(dev));
+		return NULL;
+	}
+
+	blkid_probe_enable_partitions(probe, 1);
+	blkid_probe_set_partitions_flags(probe, BLKID_PARTS_MAGIC);
+
+	blkid_probe_enable_superblocks(probe, 1);
+	blkid_probe_set_superblocks_flags(probe, BLKID_SUBLKS_LABEL |
+						 BLKID_SUBLKS_UUID |
+						 BLKID_SUBLKS_TYPE |
+						 BLKID_SUBLKS_USAGE |
+						 BLKID_SUBLKS_VERSION |
+						 BLKID_SUBLKS_MAGIC |
+						 BLKID_SUBLKS_BADCSUM);
+
+	return probe;
+}
+
+/*
+ * Get the signature found by the probe.
+ * Returns BLKID_SIG_FOUND if there is a signature to wipe,
+ * BLKID_SIG_SKIP if the signature is skipped (excluded type, or its offset/length
+ * cannot be found and wiping can continue without it),
+ * BLKID_SIG_UNKNOWN_TYPE if the probe found a signature but its type could not
+ * be determined,
+ * BLKID_SIG_ERROR on error.
+ */
+static enum sig_result _blkid_get_signature(blkid_probe probe, const char *name,
+					    uint32_t types_to_exclude, force_t force,
+					    const char **type, const char **offset,
+					    size_t *len, const char **usage)
+{
+	const char *magic = NULL;
+
+	*type = NULL;
+	*offset = NULL;
+	*usage = NULL;
+	*len = 0;
+
+	if (!blkid_probe_lookup_value(probe, "TYPE", type, NULL)) {
+		if (_type_in_flag_list(*type, types_to_exclude))
+			return BLKID_SIG_SKIP;
+		if (blkid_probe_lookup_value(probe, "SBMAGIC_OFFSET", offset, NULL)) {
+			if (force < DONT_PROMPT) {
+				log_error(MSG_FAILED_SIG_OFFSET, *type, name);
+				return BLKID_SIG_ERROR;
+			}
+
+			log_warn("WARNING: " MSG_FAILED_SIG_OFFSET MSG_WIPING_SKIPPED, *type, name);
+			return BLKID_SIG_SKIP;
+		}
+		if (blkid_probe_lookup_value(probe, "SBMAGIC", &magic, len)) {
+			if (force < DONT_PROMPT) {
+				log_error(MSG_FAILED_SIG_LENGTH, *type, name);
+				return BLKID_SIG_ERROR;
+			}
+
+			log_warn("WARNING: " MSG_FAILED_SIG_LENGTH MSG_WIPING_SKIPPED, *type, name);
+			return BLKID_SIG_SKIP;
+		}
+	} else if (!blkid_probe_lookup_value(probe, "PTTYPE", type, NULL)) {
+		if (blkid_probe_lookup_value(probe, "PTMAGIC_OFFSET", offset, NULL)) {
+			if (force < DONT_PROMPT) {
+				log_error(MSG_FAILED_SIG_OFFSET, *type, name);
+				return BLKID_SIG_ERROR;
+			}
+
+			log_warn("WARNING: " MSG_FAILED_SIG_OFFSET MSG_WIPING_SKIPPED, *type, name);
+			return BLKID_SIG_SKIP;
+		}
+		if (blkid_probe_lookup_value(probe, "PTMAGIC", &magic, len)) {
+			if (force < DONT_PROMPT) {
+				log_error(MSG_FAILED_SIG_LENGTH, *type, name);
+				return BLKID_SIG_ERROR;
+			}
+
+			log_warn("WARNING: " MSG_FAILED_SIG_LENGTH MSG_WIPING_SKIPPED, *type, name);
+			return BLKID_SIG_SKIP;
+		}
+		*usage = "partition table";
+	} else {
+		log_error("blkid found a signature on %s but its type could not be determined.", name);
+		return BLKID_SIG_UNKNOWN_TYPE;
+	}
+
+	return BLKID_SIG_FOUND;
+}
+
+static enum sig_result _blkid_wipe(blkid_probe probe, struct device *dev, const char *name,
+				   uint32_t types_to_exclude, uint32_t types_no_prompt,
+				   int yes, force_t force)
 {
 #define _MSG_WIPING "Wiping %s signature on %s."
-	const char *offset = NULL, *type = NULL, *magic = NULL,
+	const char *offset = NULL, *type = NULL,
 		   *usage = NULL, *label = NULL, *uuid = NULL;
 	loff_t offset_value;
 	size_t len = 0;
+	enum sig_result r;
 
-	if (!blkid_probe_lookup_value(probe, "TYPE", &type, NULL)) {
-		if (_type_in_flag_list(type, types_to_exclude))
-			return 2;
-		if (blkid_probe_lookup_value(probe, "SBMAGIC_OFFSET", &offset, NULL)) {
-			if (force < DONT_PROMPT) {
-				log_error(MSG_FAILED_SIG_OFFSET, type, name);
-				return 0;
-			}
-
-			log_warn("WARNING: " MSG_FAILED_SIG_OFFSET MSG_WIPING_SKIPPED, type, name);
-			return 2;
-		}
-		if (blkid_probe_lookup_value(probe, "SBMAGIC", &magic, &len)) {
-			if (force < DONT_PROMPT) {
-				log_error(MSG_FAILED_SIG_LENGTH, type, name);
-				return 0;
-			}
-
-			log_warn("WARNING: " MSG_FAILED_SIG_LENGTH MSG_WIPING_SKIPPED, type, name);
-			return 2;
-		}
-	} else if (!blkid_probe_lookup_value(probe, "PTTYPE", &type, NULL)) {
-		if (blkid_probe_lookup_value(probe, "PTMAGIC_OFFSET", &offset, NULL)) {
-			if (force < DONT_PROMPT) {
-				log_error(MSG_FAILED_SIG_OFFSET, type, name);
-				return 0;
-			}
-
-			log_warn("WARNING: " MSG_FAILED_SIG_OFFSET MSG_WIPING_SKIPPED, type, name);
-			return 2;
-		}
-		if (blkid_probe_lookup_value(probe, "PTMAGIC", &magic, &len)) {
-			if (force < DONT_PROMPT) {
-				log_error(MSG_FAILED_SIG_LENGTH, type, name);
-				return 0;
-			}
-
-			log_warn("WARNING: " MSG_FAILED_SIG_LENGTH MSG_WIPING_SKIPPED, type, name);
-			return 2;
-		}
-		usage = "partition table";
-	} else
-		return_0;
+	if ((r = _blkid_get_signature(probe, name, types_to_exclude, force,
+				      &type, &offset, &len, &usage)) != BLKID_SIG_FOUND)
+		return r;
 
 	offset_value = strtoll(offset, NULL, 10);
 
@@ -1254,7 +1351,7 @@ static int _blkid_wipe(blkid_probe probe, struct device *dev, const char *name,
 		    yes_no_prompt("WARNING: %s signature detected on %s at offset %s. "
 				  "Wipe it? [y/n]: ", type, name, offset) == 'n') {
 			log_error("Aborted wiping of %s.", type);
-			return 0;
+			return BLKID_SIG_ERROR;
 		}
 		log_print_unless_silent(_MSG_WIPING, type, name);
 	} else
@@ -1262,10 +1359,10 @@ static int _blkid_wipe(blkid_probe probe, struct device *dev, const char *name,
 
 	if (!dev_write_zeros(dev, offset_value, len)) {
 		log_error("Failed to wipe %s signature on %s.", type, name);
-		return 0;
+		return BLKID_SIG_ERROR;
 	}
 
-	return 1;
+	return BLKID_SIG_FOUND;
 }
 
 static int _wipe_known_signatures_with_blkid(struct device *dev, const char *name,
@@ -1275,7 +1372,7 @@ static int _wipe_known_signatures_with_blkid(struct device *dev, const char *nam
 {
 	blkid_probe probe = NULL;
 	int found = 0, left = 0, wiped_tmp;
-	int r_wipe;
+	enum sig_result r_wipe;
 	int r = 0;
 
 	if (!wiped)
@@ -1284,28 +1381,11 @@ static int _wipe_known_signatures_with_blkid(struct device *dev, const char *nam
 
 	/* TODO: Should we check for valid dev - _dev_is_valid(dev)? */
 
-	if (dm_list_empty(&dev->aliases))
-		goto_out;
-
-	if (!(probe = blkid_new_probe_from_filename(dev_name(dev)))) {
-		log_error("Failed to create a new blkid probe for device %s.", dev_name(dev));
+	if (!(probe = _blkid_probe_setup(dev)))
 		goto out;
-	}
-
-	blkid_probe_enable_partitions(probe, 1);
-	blkid_probe_set_partitions_flags(probe, BLKID_PARTS_MAGIC);
-
-	blkid_probe_enable_superblocks(probe, 1);
-	blkid_probe_set_superblocks_flags(probe, BLKID_SUBLKS_LABEL |
-						 BLKID_SUBLKS_UUID |
-						 BLKID_SUBLKS_TYPE |
-						 BLKID_SUBLKS_USAGE |
-						 BLKID_SUBLKS_VERSION |
-						 BLKID_SUBLKS_MAGIC |
-						 BLKID_SUBLKS_BADCSUM);
 
 	while (!blkid_do_probe(probe)) {
-		if ((r_wipe = _blkid_wipe(probe, dev, name, types_to_exclude, types_no_prompt, yes, force)) == 1) {
+		if ((r_wipe = _blkid_wipe(probe, dev, name, types_to_exclude, types_no_prompt, yes, force)) == BLKID_SIG_FOUND) {
 			(*wiped)++;
 			if (blkid_probe_step_back(probe)) {
 				log_error("Failed to step back blkid probe to check just wiped signature.");
@@ -1313,7 +1393,7 @@ static int _wipe_known_signatures_with_blkid(struct device *dev, const char *nam
 			}
 		}
 		/* do not count excluded types */
-		if (r_wipe != 2)
+		if (r_wipe != BLKID_SIG_SKIP)
 			found++;
 	}
 
@@ -1326,6 +1406,46 @@ static int _wipe_known_signatures_with_blkid(struct device *dev, const char *nam
 	else
 		log_warn("%d existing signature%s left on the device.",
 			  left, left > 1 ? "s" : "");
+out:
+	if (probe)
+		blkid_free_probe(probe);
+	return r;
+}
+
+/*
+ * Look for the same signatures that _wipe_known_signatures_with_blkid would
+ * ask about, without wiping them.  Signatures that would be wiped without
+ * prompting (types_no_prompt) are not listed.
+ */
+static int _find_known_signatures_with_blkid(struct cmd_context *cmd, struct device *dev,
+					     const char *name, uint32_t types_to_exclude,
+					     uint32_t types_no_prompt, force_t force,
+					     struct dm_list *sigs)
+{
+	const char *type, *offset, *usage;
+	size_t len;
+	blkid_probe probe = NULL;
+	enum sig_result r_sig;
+	int r = 0;
+
+	if (!(probe = _blkid_probe_setup(dev)))
+		goto out;
+
+	while (!blkid_do_probe(probe)) {
+		r_sig = _blkid_get_signature(probe, name, types_to_exclude, force,
+					     &type, &offset, &len, &usage);
+
+		if (r_sig == BLKID_SIG_ERROR || r_sig == BLKID_SIG_UNKNOWN_TYPE)
+			goto out;
+
+		if (r_sig == BLKID_SIG_SKIP || _type_in_flag_list(type, types_no_prompt))
+			continue;
+
+		if (!_sig_add(cmd, sigs, type, offset))
+			goto_out;
+	}
+
+	r = 1;
 out:
 	if (probe)
 		blkid_free_probe(probe);
@@ -1388,6 +1508,25 @@ static int _wipe_known_signatures_with_lvm(struct cmd_context *cmd, struct devic
 	return 1;
 }
 
+static int _find_signature(struct cmd_context *cmd, struct device *dev, const char *type,
+			   const char *name, struct dm_list *sigs,
+			   int (*signature_detection_fn)(struct cmd_context *cmd, struct device *dev, uint64_t *offset_found, int full))
+{
+	uint64_t offset_found = 0;
+	int found;
+
+	found = signature_detection_fn(cmd, dev, &offset_found, 1);
+	if (found == -1) {
+		log_error("Fatal error while trying to detect %s on %s.", type, name);
+		return 0;
+	}
+
+	if (found && !_sig_add(cmd, sigs, type, NULL))
+		return_0;
+
+	return 1;
+}
+
 int wipe_known_signatures(struct cmd_context *cmd, struct device *dev,
 			  const char *name, uint32_t types_to_exclude,
 			  uint32_t types_no_prompt, int yes, force_t force,
@@ -1411,6 +1550,42 @@ int wipe_known_signatures(struct cmd_context *cmd, struct device *dev,
 					       types_to_exclude,
 					       types_no_prompt,
 					       yes, force, wiped);
+}
+
+/*
+ * List the signatures that wipe_known_signatures() would ask about, without
+ * wiping anything, so that the questions can be asked before the devices are
+ * protected.  Returns 0 on error, and in the same cases that
+ * wipe_known_signatures() would fail before asking.
+ */
+int dev_find_known_signatures(struct cmd_context *cmd, struct device *dev,
+			      const char *name, uint32_t types_to_exclude,
+			      uint32_t types_no_prompt, force_t force,
+			      struct dm_list *sigs)
+{
+	int blkid_wiping_enabled = find_config_tree_bool(cmd, allocation_use_blkid_wiping_CFG, NULL);
+
+	dm_list_init(sigs);
+
+#ifdef BLKID_WIPING_SUPPORT
+	if (blkid_wiping_enabled)
+		return _find_known_signatures_with_blkid(cmd, dev, name,
+							 types_to_exclude,
+							 types_no_prompt,
+							 force, sigs);
+#endif
+	if (blkid_wiping_enabled) {
+		log_warn("WARNING: allocation/use_blkid_wiping=1 configuration setting is set "
+			 "while LVM is not compiled with blkid wiping support.");
+		log_warn("WARNING: Falling back to native LVM signature detection.");
+	}
+
+	if (!_find_signature(cmd, dev, "software RAID md superblock", name, sigs, dev_is_md_component) ||
+	    !_find_signature(cmd, dev, "swap signature", name, sigs, dev_is_swap) ||
+	    !_find_signature(cmd, dev, "LUKS signature", name, sigs, dev_is_luks))
+		return 0;
+
+	return 1;
 }
 
 #ifdef __linux__

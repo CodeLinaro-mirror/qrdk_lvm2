@@ -78,6 +78,16 @@ int wipe_known_signatures(struct cmd_context *cmd, struct device *dev, const cha
 			  uint32_t types_to_exclude, uint32_t types_no_prompt,
 			  int yes, force_t force, int *wiped);
 
+struct dev_signature {
+	struct dm_list list;
+	const char *type;
+	const char *offset;	/* NULL when not known (native detection) */
+};
+
+int dev_find_known_signatures(struct cmd_context *cmd, struct device *dev, const char *name,
+			      uint32_t types_to_exclude, uint32_t types_no_prompt,
+			      force_t force, struct dm_list *sigs);
+
 /* Type-specific device properties */
 unsigned long dev_md_stripe_width(struct dev_types *dt, struct device *dev);
 int dev_is_md_with_end_superblock(struct dev_types *dt, struct device *dev);
