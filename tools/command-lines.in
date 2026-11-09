@@ -1870,6 +1870,11 @@ OO: --select String
 ID: vgchange_setlockargs
 DESC: Set or clear lock_args flags to control lock manager behavior.
 
+vgchange --locksettings String VG|Tag|Select
+OO: --select String
+ID: vgchange_locksettings
+DESC: Set the global mode or global lock of a shared VG.
+
 vgchange --lockstart
 OO: --select String, --persist start
 OP: VG|Tag|Select ...

@@ -744,6 +744,44 @@ lvmlockctl --gl-enable <vgname>
 (Using a small sanlock VG dedicated to holding the global lock can avoid
 the case where the global lock must be manually enabled after a vgremove.)
 .
+.SS Global mode of sanlock VGs
+
+Each sanlock VG records the global mode it uses as tags on its lvmlock LV
+(LOCKD_GLOBAL_MODE_1 or LOCKD_GLOBAL_MODE_2), and in its lock_args version
+(1.1.0 or 2.1.0).  A VG without these tags was created by an older version
+of lvm, and uses global mode 1 (the original global lock, GLLK).
+Global mode 2 uses the GL2LK in the one VG that has the
+LOCKD_GLOBAL_LOCK_2 tag.  The GLLK is disabled in every VG using global
+mode 2, so old versions of lvm can still use the VG, but find no global
+lock to acquire.  Commands find the global mode from the VGs they
+see, so all shared VGs must use the same global mode.  A mix of global
+modes makes commands needing the global lock fail until the VGs are made
+to match.  Hosts that cannot see all of the shared VGs cannot detect a mix.
+
+The global mode of an existing VG is changed with:
+
+.B vgchange --locksettings global_mode=1|2
+.I VG
+
+The command updates the lock_args version, the lvmlock LV tags, and the
+global lock leases in the VG.  It requires that the lockspace is stopped
+on all other hosts, and that no LVs in the VG are active.  The lockspace
+is stopped on the local host at the end of the command, and is restarted
+with vgchange --lockstart.
+
+Converting to global mode 1 enables the GLLK in the VG being converted if
+no other VG has the LOCKD_GLOBAL_LOCK_1 tag and all other VGs use global
+mode 2, and sets the LOCKD_GLOBAL_LOCK_1 tag on it.  Otherwise the GLLK is
+left as it is.
+
+The command can be repeated on a VG already using global mode 2 to
+repair the tags, e.g. to assign the LOCKD_GLOBAL_LOCK_2 tag to a VG
+after the VG that held it was removed.
+
+Old versions of lvm do not know about global mode 2, so shared VGs must
+be converted to global mode 2 only after all hosts use a version of lvm
+that supports it.
+
 .SS Internal lvmlock LV
 .
 A sanlock VG contains a hidden LV called "lvmlock" that holds the sanlock

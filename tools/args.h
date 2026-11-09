@@ -409,6 +409,22 @@ arg(lockopt_ARG, '\0', "lockopt", string_VAL, 0, 0,
     "Used to pass options for special cases to lvmlockd.\n"
     "See \\fBlvmlockd\\fP(8) for more information.\n")
 
+arg(locksettings_ARG, '\0', "locksettings", string_VAL, 0, 0,
+    "Change lock settings of a shared VG that are stored with the VG.\n"
+    "These settings are only allowed for lock_type sanlock.\n"
+    "The VG must be started only on the host running the command\n"
+    "(lockspace stopped on all other hosts, and no active LVs.)\n"
+    "global_mode=1: use the original global lock (GLLK) in this VG,\n"
+    "which is compatible with old versions of lvm.\n"
+    "global_mode=2: use the new global lock (GL2LK) scheme.\n"
+    "The command can be repeated to repair the lock tags of a VG,\n"
+    "e.g. to assign the GL2LK to this VG when no VG holds it.\n"
+    "global_lock=enable: enable the global lock in this VG.\n"
+    "global_lock=disable: disable the global lock in this VG.\n"
+    "The global lock can only be enabled in one VG at a time,\n"
+    "so it may need to be disabled in another VG first.\n"
+    "See \\fBlvmlockd\\fP(8) for more information.\n")
+
 arg(lockstart_ARG, '\0', "lockstart", 0, 0, 0,
     "Start the lockspace of a shared VG in lvmlockd.\n"
     "lvmlockd locks become available for the VG, allowing LVM to use the VG.\n"

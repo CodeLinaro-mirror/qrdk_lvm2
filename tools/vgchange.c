@@ -2042,10 +2042,10 @@ static int _vgchange_setlockargs_single(struct cmd_context *cmd, const char *vg_
 	 * persist_upgrade_stop releases the PR.
 	 */
 	if (!lockd_setlockargs(cmd, vg, set, &our_key_held))
-		return_ECMD_FAILED;
+		goto bad;
 
 	if (!vg_write(vg) || !vg_commit(vg))
-		return_ECMD_FAILED;
+		goto bad;
 
 	if (our_key_held && !persist_upgrade_stop(cmd, vg, our_key_held))
 		log_warn("Failed to stop PR.");
@@ -2053,6 +2053,13 @@ static int _vgchange_setlockargs_single(struct cmd_context *cmd, const char *vg_
 	log_print_unless_silent("Volume group \"%s\" successfully changed.", vg->name);
 
 	return ECMD_PROCESSED;
+
+ bad:
+	/* PR was acquired when our_key_held is set. */
+	if (our_key_held && !persist_upgrade_stop(cmd, vg, our_key_held))
+		log_warn("Failed to stop PR.");
+
+	return ECMD_FAILED;
 }
 
 int vgchange_setlockargs_cmd(struct cmd_context *cmd, int argc, char **argv)
@@ -2067,6 +2074,343 @@ int vgchange_setlockargs_cmd(struct cmd_context *cmd, int argc, char **argv)
 	}
 
 	ret = process_each_vg(cmd, argc, argv, NULL, NULL, flags, 0, handle, &_vgchange_setlockargs_single);
+
+	destroy_processing_handle(cmd, handle);
+	return ret;
+}
+
+
+/*
+ * vgchange --locksettings global_mode=1|2 VG
+ * vgchange --locksettings global_lock=enable|disable VG
+ *
+ * The settings are stored as tags on the lvmlock LV, and in the
+ * lock_args version (see lvmlockd.h).
+ *
+ * global_mode sets the global mode that a shared VG is using.  The GL2LK
+ * is formatted if the VG was created by an old version of lvm.  The same
+ * command repairs the tags, e.g. when the VG holding the
+ * LOCKD_GLOBAL_LOCK_2 tag has been removed, it assigns the tag to this VG.
+ *
+ * global_lock enables/disables the global lock in a VG, which is tracked
+ * by the LOCKD_GLOBAL_LOCK_1|2 tag matching the global mode the VG is
+ * using.  In global mode 1, the GLLK lease on the lvmlock LV is also
+ * enabled/disabled.  The GL may only be enabled in one VG at a time, so
+ * moving it to another VG requires disabling it in the VG holding it
+ * first.
+ *
+ * Both commands are run on a single host while the lockspace is stopped on
+ * all other hosts (enforced by lvmlockd) so that every host starting the
+ * VG afterward sees the new state.
+ */
+
+struct locksettings {
+	int global_mode;	/* LOCKD_GLOBAL_MODE_1 or LOCKD_GLOBAL_MODE_2 */
+	int global_lock;	/* LOCKD_GLOBAL_LOCK_ENABLE or LOCKD_GLOBAL_LOCK_DISABLE */
+};
+
+static int _parse_locksettings(struct cmd_context *cmd, struct locksettings *settings)
+{
+	const char *str = arg_str_value(cmd, locksettings_ARG, NULL);
+
+	if (!str)
+		return 0;
+
+	memset(settings, 0, sizeof(*settings));
+
+	if (!strcmp(str, "global_mode=1"))
+		settings->global_mode = LOCKD_GLOBAL_MODE_1;
+	else if (!strcmp(str, "global_mode=2"))
+		settings->global_mode = LOCKD_GLOBAL_MODE_2;
+	else if (!strcmp(str, "global_lock=enable"))
+		settings->global_lock = LOCKD_GLOBAL_LOCK_ENABLE;
+	else if (!strcmp(str, "global_lock=disable"))
+		settings->global_lock = LOCKD_GLOBAL_LOCK_DISABLE;
+	else {
+		log_error("Invalid --locksettings value \"%s\", use global_mode=1|2 or global_lock=enable|disable.", str);
+		return 0;
+	}
+
+	return 1;
+}
+
+static int _lvmlock_lv_tag(struct logical_volume *lv, const char *tag, int add)
+{
+	if (!!str_list_match_item(&lv->tags, tag) == !!add)
+		return 1;
+
+	return lv_change_tag(lv, tag, add);
+}
+
+static int _vgchange_global_mode_single(struct cmd_context *cmd, const char *vg_name,
+					 struct volume_group *vg,
+					 int global_mode)
+{
+	struct logical_volume *lv = vg->sanlock_lv;
+	uint64_t our_key_held = 0;
+	char gl_vgname[NAME_LEN + 1] = { 0 };
+	int gl_none, gl1, gl2;
+	int has_mode_1, has_mode_2, has_lock_1, has_lock_2;
+	int others_have_lock_1, others_have_lock_2;
+	int gm_none, gm1, gm2, ls_sanlock, ls_other;
+	int others_not_gm2;
+	int gl_owner = 0;
+	int gl1_enable = 0;
+	int gl_enabled = 0;
+	int minor;
+
+	if (!vg->lock_type || strcmp(vg->lock_type, "sanlock")) {
+		log_error("VG lock type sanlock is required for --locksettings.");
+		return ECMD_FAILED;
+	}
+
+	if (!lv) {
+		log_error("VG %s has no lvmlock LV.", vg->name);
+		return ECMD_FAILED;
+	}
+
+	has_mode_1 = str_list_match_item(&lv->tags, LOCKD_GLOBAL_MODE_1_TAG) ? 1 : 0;
+	has_mode_2 = str_list_match_item(&lv->tags, LOCKD_GLOBAL_MODE_2_TAG) ? 1 : 0;
+	has_lock_1 = str_list_match_item(&lv->tags, LOCKD_GLOBAL_LOCK_1_TAG) ? 1 : 0;
+	has_lock_2 = str_list_match_item(&lv->tags, LOCKD_GLOBAL_LOCK_2_TAG) ? 1 : 0;
+
+	/* The counts come from the label scan and include this VG's own tags. */
+	lvmcache_get_global_lock(&gl_none, &gl1, &gl2, gl_vgname);
+	others_have_lock_1 = (gl1 - has_lock_1) > 0;
+	others_have_lock_2 = (gl2 - has_lock_2) > 0;
+
+	/* Other VGs that use global mode 1, or are untagged (old lvm, global mode 1.) */
+	lvmcache_get_global_mode(&gm_none, &gm1, &gm2, &ls_sanlock, &ls_other);
+	others_not_gm2 = (gm_none + gm1) - (has_mode_1 ? 1 : 0) - ((!has_mode_1 && !has_mode_2) ? 1 : 0);
+
+	minor = lockd_lockargs_minor(vg->lock_args);
+	if (minor < 0) {
+		log_error("VG %s has invalid lock_args \"%s\".", vg->name, vg->lock_args ? vg->lock_args : "");
+		return ECMD_FAILED;
+	}
+
+	if (has_lock_2 && others_have_lock_2)
+		log_warn("WARNING: Multiple VGs have the %s tag.", LOCKD_GLOBAL_LOCK_2_TAG);
+
+	if (global_mode == LOCKD_GLOBAL_MODE_2) {
+		/* This VG holds GL2LK if it already does, or if no other VG does. */
+		gl_owner = has_lock_2 || !others_have_lock_2;
+
+		if (minor && has_mode_2 && !has_mode_1 && !has_lock_1 && (has_lock_2 || others_have_lock_2)) {
+			log_warn("WARNING: VG %s is already using global mode 2.", vg->name);
+			return ECMD_PROCESSED;
+		}
+	}
+
+	/*
+	 * For global mode 1, the GLLK is enabled in this VG only if no other
+	 * VG could already have the GLLK enabled: no other VG has the
+	 * LOCKD_GLOBAL_LOCK_1 tag, and all other VGs use global mode 2 (the
+	 * GLLK is disabled in global mode 2.)  Otherwise the GLLK is left as
+	 * it is.  The on-disk GLLK name decides whether this VG gets the
+	 * LOCKD_GLOBAL_LOCK_1 tag (the tag is only a hint), so global mode 1
+	 * is always applied to refresh the tags.
+	 */
+	if (global_mode == LOCKD_GLOBAL_MODE_1)
+		gl1_enable = !others_have_lock_1 && !others_not_gm2;
+
+	/*
+	 * lockd_set_global_mode gets exclusive PR (if the VG is using PR),
+	 * stops the lockspace, updates the leases on the lvmlock LV that
+	 * is written below.  If lockd_set_global_mode got the ex PR, then
+	 * persist_upgrade_stop releases the PR.
+	 */
+	if (!lockd_set_global_mode(cmd, vg, global_mode, gl1_enable, &gl_enabled, &our_key_held))
+		goto bad;
+
+	if (global_mode == LOCKD_GLOBAL_MODE_2) {
+		if (!_lvmlock_lv_tag(lv, LOCKD_GLOBAL_MODE_1_TAG, 0) ||
+		    !_lvmlock_lv_tag(lv, LOCKD_GLOBAL_LOCK_1_TAG, 0) ||
+		    !_lvmlock_lv_tag(lv, LOCKD_GLOBAL_MODE_2_TAG, 1) ||
+		    !_lvmlock_lv_tag(lv, LOCKD_GLOBAL_LOCK_2_TAG, gl_owner))
+			goto bad;
+	} else {
+		if (!_lvmlock_lv_tag(lv, LOCKD_GLOBAL_MODE_2_TAG, 0) ||
+		    !_lvmlock_lv_tag(lv, LOCKD_GLOBAL_LOCK_2_TAG, 0) ||
+		    !_lvmlock_lv_tag(lv, LOCKD_GLOBAL_MODE_1_TAG, 1) ||
+		    !_lvmlock_lv_tag(lv, LOCKD_GLOBAL_LOCK_1_TAG, gl_enabled))
+			goto bad;
+	}
+
+	if (!vg_write(vg) || !vg_commit(vg))
+		goto bad;
+
+	if (our_key_held && !persist_upgrade_stop(cmd, vg, our_key_held))
+		log_warn("Failed to stop PR.");
+
+	/* FIXME: should this recommend running lvmlockctl --gl-enable or a different command? */
+	if ((global_mode == LOCKD_GLOBAL_MODE_1) && !gl_enabled && !others_have_lock_1)
+		log_warn("WARNING: No VG has the global lock enabled.");
+
+	log_print_unless_silent("Volume group \"%s\" successfully changed.", vg->name);
+	log_print_unless_silent("The lockspace is stopped, use vgchange --lockstart to restart it.");
+
+	return ECMD_PROCESSED;
+
+ bad:
+	/* PR was acquired when our_key_held is set. */
+	if (our_key_held && !persist_upgrade_stop(cmd, vg, our_key_held))
+		log_warn("Failed to stop PR.");
+
+	return ECMD_FAILED;
+}
+
+/*
+ * vgchange --locksettings global_lock=enable|disable VG
+ *
+ * Enable or disable the global lock in a shared VG.  The VG holding
+ * the global lock is tracked by the LOCKD_GLOBAL_LOCK_1|2 tag on the
+ * lvmlock LV, matching the global mode the VG is using (a VG with no
+ * global mode tags was created by an older lvm and uses global mode 1.)
+ *
+ * In global mode 1, the command also enables/disables the GLLK lease
+ * on the lvmlock LV.  In global mode 2, the GLLK is always disabled,
+ * and the GL2LK lease needs no change.
+ */
+static int _vgchange_global_lock_single(struct cmd_context *cmd, const char *vg_name,
+					struct volume_group *vg,
+					int global_lock)
+{
+	struct logical_volume *lv = vg->sanlock_lv;
+	char gl_vgname[NAME_LEN + 1] = { 0 };
+	int gl_none, gl1, gl2;
+	int has_mode_1, has_mode_2, has_lock_1, has_lock_2;
+	int others_have_lock;
+	int global_mode;
+	const char *lock_tag;
+	uint64_t our_key_held = 0;
+	int gl_enabled = 0;
+	int enable = (global_lock == LOCKD_GLOBAL_LOCK_ENABLE);
+	int minor;
+
+	if (!vg->lock_type || strcmp(vg->lock_type, "sanlock")) {
+		log_error("VG lock type sanlock is required for --locksettings.");
+		return ECMD_FAILED;
+	}
+
+	if (!lv) {
+		log_error("VG %s has no lvmlock LV.", vg->name);
+		return ECMD_FAILED;
+	}
+
+	has_mode_1 = str_list_match_item(&lv->tags, LOCKD_GLOBAL_MODE_1_TAG) ? 1 : 0;
+	has_mode_2 = str_list_match_item(&lv->tags, LOCKD_GLOBAL_MODE_2_TAG) ? 1 : 0;
+	has_lock_1 = str_list_match_item(&lv->tags, LOCKD_GLOBAL_LOCK_1_TAG) ? 1 : 0;
+	has_lock_2 = str_list_match_item(&lv->tags, LOCKD_GLOBAL_LOCK_2_TAG) ? 1 : 0;
+
+	if (has_mode_1 && has_mode_2) {
+		log_error("VG %s has both %s and %s tags.",
+			  vg->name, LOCKD_GLOBAL_MODE_1_TAG, LOCKD_GLOBAL_MODE_2_TAG);
+		return ECMD_FAILED;
+	}
+
+	/* A VG with no global mode tags uses global mode 1. */
+	global_mode = has_mode_2 ? LOCKD_GLOBAL_MODE_2 : LOCKD_GLOBAL_MODE_1;
+	lock_tag = (global_mode == LOCKD_GLOBAL_MODE_2) ? LOCKD_GLOBAL_LOCK_2_TAG : LOCKD_GLOBAL_LOCK_1_TAG;
+
+	/* The counts come from the label scan and include this VG's own tags. */
+	lvmcache_get_global_lock(&gl_none, &gl1, &gl2, gl_vgname);
+
+	if (global_mode == LOCKD_GLOBAL_MODE_2)
+		others_have_lock = (gl2 - has_lock_2) > 0;
+	else
+		others_have_lock = (gl1 - has_lock_1) > 0;
+
+	minor = lockd_lockargs_minor(vg->lock_args);
+	if (minor < 0) {
+		log_error("VG %s has invalid lock_args \"%s\".", vg->name, vg->lock_args ? vg->lock_args : "");
+		return ECMD_FAILED;
+	}
+
+	if (enable) {
+		/* The GL may only be enabled in one VG at a time. */
+		if (others_have_lock) {
+			if (gl_vgname[0])
+				log_error("The global lock is enabled in VG %s, disable it there first.", gl_vgname);
+			else
+				log_error("The global lock is enabled in another VG, disable it there first.");
+			return ECMD_FAILED;
+		}
+	} else {
+		if ((has_lock_1 || has_lock_2) && others_have_lock)
+			log_warn("WARNING: Multiple VGs have the %s tag.", lock_tag);
+	}
+
+	/*
+	 * lockd_set_global_lock gets exclusive PR (if the VG is using PR),
+	 * stops the lockspace, and updates the leases on the lvmlock LV:
+	 * the GLLK is enabled/disabled in global mode 1.  If
+	 * lockd_set_global_lock got the ex PR, then persist_upgrade_stop
+	 * releases it.
+	 */
+	if (!lockd_set_global_lock(cmd, vg, global_mode, global_lock, &gl_enabled, &our_key_held))
+		goto bad;
+
+	/* The GLLK is enabled in this VG, so it holds the GL lock tag. */
+	if (enable && (global_mode == LOCKD_GLOBAL_MODE_1) && !gl_enabled) {
+		log_error("VG %s failed to enable the global lock lease.", vg->name);
+		goto bad;
+	}
+
+	if (!_lvmlock_lv_tag(lv, lock_tag, enable))
+		goto bad;
+
+	if (!vg_write(vg) || !vg_commit(vg))
+		goto bad;
+
+	if (our_key_held && !persist_upgrade_stop(cmd, vg, our_key_held))
+		log_warn("Failed to stop PR.");
+
+	if (!enable && !others_have_lock)
+		log_warn("WARNING: No VG has the global lock enabled.");
+
+	log_print_unless_silent("Volume group \"%s\" successfully changed.", vg->name);
+	log_print_unless_silent("The lockspace is stopped, use vgchange --lockstart to restart it.");
+
+	return ECMD_PROCESSED;
+
+ bad:
+	/* PR was acquired when our_key_held is set. */
+	if (our_key_held && !persist_upgrade_stop(cmd, vg, our_key_held))
+		log_warn("Failed to stop PR.");
+
+	return ECMD_FAILED;
+}
+
+static int _vgchange_locksettings_single(struct cmd_context *cmd, const char *vg_name,
+					 struct volume_group *vg,
+					 struct processing_handle *handle)
+{
+	struct locksettings *settings = handle->custom_handle;
+
+	if (settings->global_lock)
+		return _vgchange_global_lock_single(cmd, vg_name, vg, settings->global_lock);
+
+	return _vgchange_global_mode_single(cmd, vg_name, vg, settings->global_mode);
+}
+
+int vgchange_locksettings_cmd(struct cmd_context *cmd, int argc, char **argv)
+{
+	struct processing_handle *handle;
+	struct locksettings settings;
+	uint32_t flags = READ_FOR_UPDATE;
+	int ret;
+
+	if (!_parse_locksettings(cmd, &settings))
+		return EINVALID_CMD_LINE;
+
+	if (!(handle = init_processing_handle(cmd, NULL))) {
+		log_error("Failed to initialize processing handle.");
+		return ECMD_FAILED;
+	}
+	handle->custom_handle = &settings;
+
+	ret = process_each_vg(cmd, argc, argv, NULL, NULL, flags, 0, handle, &_vgchange_locksettings_single);
 
 	destroy_processing_handle(cmd, handle);
 	return ret;
