@@ -237,7 +237,6 @@ void opt_array_to_str(struct cmd_context *cmd, const uint16_t *opts, int count,
 		      char *buf, int len);
 
 int pvcreate_params_from_args(struct cmd_context *cmd, struct pvcreate_params *pp);
-int pvcreate_each_device(struct cmd_context *cmd, struct processing_handle *handle, struct pvcreate_params *pp);
 void dev_args_filter_clear(struct cmd_context *cmd, struct dm_list *devs);
 int dev_args_filter_nodata(struct cmd_context *cmd, struct dm_list *devs);
 int dev_args_filter_read(struct cmd_context *cmd, struct dm_list *devs);

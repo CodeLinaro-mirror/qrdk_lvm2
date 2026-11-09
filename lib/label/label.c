@@ -1566,8 +1566,8 @@ int label_read_pvid(struct device *dev, int *has_pvid)
 	struct pv_header *pvh;
 	struct pv_header_extension *pvh_ext = NULL;
 
-	/* A command can read a dev label before any label scan has set up the bcache. */
-	if (!label_scan_setup_bcache())
+	/* A command can read a dev label before any label scan has set up the blkio. */
+	if (!label_scan_setup_blkio())
 		return_0;
 
 	if (!label_scan_open(dev))
