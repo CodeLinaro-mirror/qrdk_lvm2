@@ -471,10 +471,14 @@ run_single_group() {
             if [ "${CLUSTER_REVERT_ON_FAIL:-0}" = "1" ] && [ "$test_status" != "failed" ] && [ "$test_status" != "known" ]; then
                 cluster_log "Skipping revert (test passed, -R mode)"
             else
-                cluster_log "Reverting cluster to 'new' snapshot"
+                # CLUSTER_REVERT_SNAPSHOT overrides the snapshot to revert to
+                # (the default 'new' snapshot has the build from cluster
+                # creation; a named snapshot can hold a rebuilt lvm).
+                local revert_snapshot="${CLUSTER_REVERT_SNAPSHOT:-new}"
+                cluster_log "Reverting cluster to '$revert_snapshot' snapshot"
 
                 local revert_log="/tmp/cluster_revert_$$.log"
-                if ! cluster_vms_restart_from_snapshot "$cluster_id" "new" > "$revert_log" 2>&1; then
+                if ! cluster_vms_restart_from_snapshot "$cluster_id" "$revert_snapshot" > "$revert_log" 2>&1; then
                     cat "$revert_log" >&2
                     rm -f "$revert_log"
                     cluster_error "Failed to revert cluster - cannot continue safely"
@@ -969,13 +973,11 @@ cmd_run() {
     # Dispatch based on test location (resolve relative paths like ../shell/)
     local resolved_script
     resolved_script=$(realpath "$test_script" 2>/dev/null || echo "$test_script")
-    local exit_code
+    local exit_code=0
     if [[ "$resolved_script" == */test/shell/* ]]; then
-        cluster_run_shell_test "$test_script"
-        exit_code=$?
+        cluster_run_shell_test "$test_script" || exit_code=$?
     else
-        cluster_run_test "$test_script"
-        exit_code=$?
+        cluster_run_test "$test_script" || exit_code=$?
     fi
 
     if [ $exit_code -eq 0 ]; then
