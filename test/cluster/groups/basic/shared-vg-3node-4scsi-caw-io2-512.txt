@@ -47,5 +47,8 @@ run shell/stress-shared-vg-create-remove-same-error.sh
 run shell/stress-shared-vg-create-remove-same.sh
 run shell/stress-shared-vg-create-remove-separate.sh
 
+run shell/shared-vg-fixes-devargs.sh
+run shell/shared-vg-fixes-leases.sh
+
 run shell/shared-vg-global-mode.sh
 run shell/shared-vg-global-lock.sh
