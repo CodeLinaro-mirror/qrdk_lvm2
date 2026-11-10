@@ -5,3 +5,4 @@ run shell/local-vg-multipath.sh
 run shell/local-vg-device-id.sh
 run shell/local-vg-boot-activation.sh
 run shell/local-vg-devices-import.sh
+run shell/local-vg-fixes-pr-release.sh
