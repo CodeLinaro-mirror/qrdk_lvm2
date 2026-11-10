@@ -17,6 +17,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "vdo_limits.h"
 
 //----------------------------------------------------------------
 
