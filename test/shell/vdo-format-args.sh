@@ -59,7 +59,7 @@ test_vdo_format() {
 
 	# Create VDO with sparse index
 	lvcreate --vdo -L25G -V50G -n $lv1 $vg/vdopool \
-		--vdosettings "use_sparse_index=1 use_kernel_format=$use_kernel"
+		--vdosettings "use_sparse_index=1"
 
 	check lv_field $vg/vdopool vdo_use_sparse_index "enabled"
 
@@ -82,7 +82,7 @@ test_vdo_format() {
 
 	# Create VDO without sparse index (default dense)
 	lvcreate --vdo -L25G -V50G -n $lv1 $vg/vdopool \
-		--vdosettings "use_kernel_format=$use_kernel"
+		--vdosettings ""
 
 	check lv_field $vg/vdopool vdo_use_sparse_index ""
 
@@ -104,7 +104,7 @@ test_vdo_format() {
 
 	# Validate slab size setting with non-default value
 	lvcreate --vdo -L25G -V50G -n $lv1 $vg/vdopool \
-		--vdosettings "slab_size_mb=256 use_kernel_format=$use_kernel"
+		--vdosettings "slab_size_mb=256"
 
 	check lv_field $vg/vdopool vdo_slab_size "256.00m"
 
@@ -134,7 +134,7 @@ test_index_memory_size() {
 	# 256 MB -- standard boundary, 0.25 GiB bucket
 	lvcreate --vdo -L25G -V50G -n $lv1 $vg/vdopool \
 		--config 'allocation/vdo_index_memory_size_mb=256' \
-		--vdosettings "use_kernel_format=$use_kernel"
+		--vdosettings ""
 	check lv_field $vg/vdopool vdo_index_memory_size "256.00m"
 	lvremove -ff $vg
 
@@ -143,7 +143,7 @@ test_index_memory_size() {
 	# sent 0.25 to the kernel, causing a false "Pool too small" rejection.
 	lvcreate --vdo -L25G -V50G -n $lv1 $vg/vdopool \
 		--config 'allocation/vdo_index_memory_size_mb=300' \
-		--vdosettings "use_kernel_format=$use_kernel"
+		--vdosettings ""
 	check lv_field $vg/vdopool vdo_index_memory_size "300.00m"
 
 	# Deactivate and reactivate to verify on-disk format consistency
@@ -154,28 +154,28 @@ test_index_memory_size() {
 	# 512 MB -- standard boundary, 0.50 GiB bucket
 	lvcreate --vdo -L25G -V50G -n $lv1 $vg/vdopool \
 		--config 'allocation/vdo_index_memory_size_mb=512' \
-		--vdosettings "use_kernel_format=$use_kernel"
+		--vdosettings ""
 	check lv_field $vg/vdopool vdo_index_memory_size "512.00m"
 	lvremove -ff $vg
 
 	# 600 MB -- non-standard, rounds up to 0.75 GiB (768 MB) bucket
 	lvcreate --vdo -L25G -V50G -n $lv1 $vg/vdopool \
 		--config 'allocation/vdo_index_memory_size_mb=600' \
-		--vdosettings "use_kernel_format=$use_kernel"
+		--vdosettings ""
 	check lv_field $vg/vdopool vdo_index_memory_size "600.00m"
 	lvremove -ff $vg
 
 	# > 1 TiB -- must be rejected (max is 1048576 MB = 1 TiB)
 	not lvcreate --vdo -L25G -V50G -n $lv1 $vg/vdopool \
 		--config 'allocation/vdo_index_memory_size_mb=1048577' \
-		--vdosettings "use_kernel_format=$use_kernel" 2>&1 | tee out
+		--vdosettings "" 2>&1 | tee out
 	grep "out of range" out
 
 	# Pool too small for the given index config -- must print minimum required size
 	# (both kernel and userspace formatting share the same pre-check)
 	not lvcreate --vdo -L1G -V2G -n $lv1 $vg/vdopool \
 		--config 'allocation/vdo_index_memory_size_mb=768' \
-		--vdosettings "use_sparse_index=1 use_kernel_format=$use_kernel" 2>&1 | tee out
+		--vdosettings "use_sparse_index=1" 2>&1 | tee out
 	grep "needs at least" out
 	lvremove -ff $vg || true
 }
@@ -184,46 +184,10 @@ aux prepare_vg 1 1000000
 
 VPOOL="$vg-vdopool-vpool"
 
-# Test kernel formatting if available
-if test "$KERNEL_FORMAT" -eq 1; then
-	test_vdo_format 1 "Kernel formatting"
-	test_index_memory_size 1 "Kernel formatting"
-
-	# Verify use_kernel_format is in metadata for kernel-formatted VDO
-	lvcreate --vdo -L25G -V50G -n $lv1 $vg/vdopool \
-		--vdosettings "use_kernel_format=1"
-	vgcfgbackup -f vgbackup $vg
-	grep "use_kernel_format" vgbackup
-	lvremove -ff $vg
-fi
-
 if aux have_vdoformat; then
 	# Test userspace vdoformat tool
 	test_vdo_format 0 "Userspace vdoformat"
 	test_index_memory_size 0 "Userspace vdoformat"
-
-	# Verify use_kernel_format is NOT in metadata for userspace-formatted VDO
-	lvcreate --vdo -L25G -V50G -n $lv1 $vg/vdopool \
-		--vdosettings "use_kernel_format=0"
-	vgcfgbackup -f vgbackup $vg
-	not grep "use_kernel_format" vgbackup
-	lvremove -ff $vg
-else
-	# Without vdoformat we cannot create VDO volume
-	not lvcreate --vdo -L25G -V50G -n $lv1 $vg/vdopool \
-		--vdosettings "use_kernel_format=0"
-	lvremove -ff $vg
-fi
-
-# Test fallback: requesting kernel format on system without support
-if test "$KERNEL_FORMAT" -eq 0; then
-	lvcreate -v --vdo -L25G -V50G -n $lv1 $vg/vdopool \
-		--vdosettings "use_kernel_format=1" 2>&1 | tee lvcreate.out
-	grep "using vdoformat" lvcreate.out
-	# Metadata should NOT have use_kernel_format (fallback to vdoformat)
-	vgcfgbackup -f vgbackup $vg
-	not grep "use_kernel_format" vgbackup
-	lvremove -ff $vg
 fi
 
 vgremove -ff $vg
