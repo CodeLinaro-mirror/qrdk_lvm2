@@ -335,7 +335,9 @@ int dm_get_status_mirror(struct dm_pool *mem, const char *params,
  *
  * dm-raid 1.9.0 and 1.9.1 can report fewer characters than the device
  * count they advertise; 1.9.2 and later report one character per device.
- * A caller that needs the positions has to compare the two counts first.
+ * A caller that needs the positions has to compare the two counts first,
+ * or parse with dm_get_status_raid_aligned(), which maps a short string
+ * onto the slots of the device table or fails.
  */
 struct dm_status_raid {
 	uint64_t reserved;
@@ -357,6 +359,16 @@ struct dm_status_raid {
 
 int dm_get_status_raid(struct dm_pool *mem, const char *params,
 		       struct dm_status_raid **status);
+
+/*
+ * dm_get_status_raid() with the health characters aligned to the device
+ * slots of @dinfo; with @dinfo NULL the status is returned as parsed.
+ * Reads the device table when an old kernel reports a short health string.
+ */
+int dm_get_status_raid_aligned(struct dm_pool *mem,
+			       const struct dm_info *dinfo,
+			       const char *params,
+			       struct dm_status_raid **status);
 
 /* Parse params from STATUS call for cache target */
 struct dm_status_cache {

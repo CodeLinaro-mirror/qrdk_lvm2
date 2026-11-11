@@ -227,6 +227,199 @@ bad:
 }
 
 /*
+ * Put the health characters of a short status back at the slots of the
+ * raid table line @params.  Called only when @s reports fewer characters
+ * than devices; see dm_get_status_raid_aligned().
+ *
+ * Succeeds only when every slot takes exactly one character and none is
+ * left over, so the caller can index the result by slot; a slot whose data
+ * device the table shows as '-' takes '-'.  Returns 0 when the table does
+ * not describe the slots the status counted, when the characters do not
+ * line up with them, or on allocation failure.
+ */
+static int _raid_health_from_table(struct dm_pool *mem,
+				   struct dm_status_raid *s,
+				   const char *params,
+				   const char *devname)
+{
+	char *health;
+	const char *p, *h;
+	unsigned num_params, num_devs, i;
+	int used = 0, missing;
+
+	/* Table: <raid_type> <#raid_params> [params...] <#devs> [<meta> <data>]... */
+	if (sscanf(params, "%*s %u", &num_params) != 1 ||
+	    !(p = _skip_fields(params, 2 + num_params)) ||
+	    sscanf(p, " %u%n", &num_devs, &used) != 1) {
+		log_error("Failed to parse the raid table of %s.", devname);
+		return 0;
+	}
+	p += used;
+
+	/* The table must describe the slots the target counted in <#devs>. */
+	if (num_devs != s->advertised_dev_count) {
+		log_error("Raid table of %s has %u devices, its status reports %u; "
+			  "cannot align the health characters.",
+			  devname, num_devs, s->advertised_dev_count);
+		return 0;
+	}
+
+	if (!(health = dm_pool_zalloc(mem, num_devs + 1))) {
+		log_error("Failed to allocate RAID health string for %s.", devname);
+		return 0;
+	}
+
+	/* p is at the space after <#devs>, which the first skip uses up. */
+	for (i = 0, h = s->dev_health; i < num_devs; i++) {
+		/*
+		 * Only the data device tells whether the slot holds a
+		 * device: a missing metadata device alone is normal for
+		 * raid0, which lvm2 builds as "- <data>", so a slot whose
+		 * data device is missing takes '-' and gives its character
+		 * to no slot.  dm_get_status_raid_aligned() says what a
+		 * slot filled with '-' means.
+		 */
+		if (!(p = _skip_fields(p, 1)))	/* metadata device */
+			goto bad;
+
+		if (!(p = _skip_fields(p, 1)))	/* data device */
+			goto bad;
+
+		missing = (*p == '-');
+
+		if (!missing && !*h)
+			goto bad;
+
+		health[i] = missing ? '-' : *h;
+
+		if (!missing)
+			h++;
+	}
+
+	if (*h)		/* a character found no slot */
+		goto bad;
+
+	log_debug_activation("Kernel dm-raid health %s of %s does not fit its "
+			     "table, using %s.",
+			     s->dev_health, devname, health);
+
+	s->dev_health = health;
+	s->dev_count = num_devs;
+
+	return 1;
+bad:
+	log_error("Raid health characters of %s do not line up with its table.",
+		  devname);
+	dm_pool_free(mem, health);
+
+	return 0;
+}
+
+/*
+ * dm-raid before 1.9.2 (Linux 4.11) builds the health string from the list
+ * of devices it kept rather than from the slots of the table, so a slot
+ * with no device contributes no character and the string is shorter than
+ * the device count of the table.  The characters still follow the slots
+ * that have a device, in slot order, so walking the device tuples puts
+ * every character back at its own slot and fills the other slots.  The
+ * table is the target's rendering of its current state, because
+ * DM_DEVICE_TABLE is a status call with the table flag, so its slots
+ * describe the array the status was taken from.  The table is read here
+ * and not by the caller: it must hold a single raid target, every caller
+ * needs that same check, and the need for the table is known only after
+ * the status is parsed.
+ *
+ * A slot with no device is either one userspace passed as '- -' or one
+ * whose device the constructor released after failing to read its
+ * superblock.  The release drops the device from the status list and from
+ * the rendering, so a target before 1.9.2 prints the same '- -' for both
+ * and neither the status nor the table can say which one a gap is.  Such
+ * a slot takes '-', the character 1.9.2 and later print for a slot with
+ * no device, and a caller that knows which slots it passed as '- -' can
+ * name the released ones.  When the characters already cover every slot
+ * they are already at their slot, so no correction is needed there.
+ *
+ * Success means one character per slot, so a caller can index dev_health
+ * by slot without checking the counts.  When the table cannot be read or
+ * does not line up with the characters, the parsed status is released and
+ * the call fails: a caller that needs positions cannot use such a status.
+ */
+int dm_get_status_raid_aligned(struct dm_pool *mem,
+				const struct dm_info *dinfo,
+				const char *params,
+				struct dm_status_raid **status)
+{
+	struct dm_status_raid *s;
+	struct dm_task *dmt = NULL;
+	const char *devname;
+	uint64_t start, length;
+	char *type, *tparams;
+	void *next;
+	int r = 0;
+
+	if (status)
+		*status = NULL;
+
+	if (!dm_get_status_raid(mem, params, &s))
+		return 0;
+
+	/*
+	 * One character per device, or no device whose table could map a
+	 * short one: hand back what the parser produced.
+	 */
+	if (!dinfo || s->dev_count == s->advertised_dev_count) {
+		if (status)
+			*status = s;
+		return 1;
+	}
+
+	if (!(dmt = dm_task_create(DM_DEVICE_TABLE))) {
+		log_error("Failed to create a task to read the table of %u:%u.",
+			  dinfo->major, dinfo->minor);
+		goto out;
+	}
+
+	if (!dm_task_set_major_minor(dmt, dinfo->major, dinfo->minor, 1) ||
+	    !dm_task_no_open_count(dmt) ||
+	    !dm_task_no_flush(dmt) ||
+	    !dm_task_run(dmt)) {
+		log_error("Failed to read the table of %u:%u.",
+			  dinfo->major, dinfo->minor);
+		goto out;
+	}
+
+	next = dm_get_next_target(dmt, NULL, &start, &length, &type, &tparams);
+	if (next) {
+		log_error("More than one table line found for %u:%u.",
+			  dinfo->major, dinfo->minor);
+		goto out;
+	}
+
+	if (!type || !tparams || strcmp(type, "raid")) {
+		log_error("Expected raid segment type but got %s instead.",
+			  type ? type : "NULL");
+		goto out;
+	}
+
+	devname = dm_task_get_name(dmt);
+	if (!_raid_health_from_table(mem, s, tparams,
+				     devname ? devname : "raid device"))
+		goto out;
+
+	if (status)
+		*status = s;
+	r = 1;
+out:
+	if (dmt)
+		dm_task_destroy(dmt);
+
+	if (!r)
+		dm_pool_free(mem, s);
+
+	return r;
+}
+
+/*
  * <metadata block size> <#used metadata blocks>/<#total metadata blocks>
  * <cache block size> <#used cache blocks>/<#total cache blocks>
  * <#read hits> <#read misses> <#write hits> <#write misses>
