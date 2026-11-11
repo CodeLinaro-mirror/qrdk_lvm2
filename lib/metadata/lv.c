@@ -1259,7 +1259,21 @@ static int _lv_raid_integrity_image_in_sync(const struct logical_volume *lv_iori
 }
 
 /*
- * _lv_raid_healthy
+ * A dead slot needs a repair instead of a refresh when its LV is virtual:
+ * an error segment from vgreduce --removemissing will not come back on a
+ * refresh, the missing device has to be replaced.  An area with no LV is
+ * missing as well, so classify it before looking at the LV.
+ */
+static raid_need_t _raid_dead_slot_need(const struct logical_volume *slv)
+{
+	if (!slv || lv_is_virtual(slv))
+		return RAID_NEED_REPAIR;
+
+	return RAID_NEED_REFRESH;
+}
+
+/*
+ * lv_raid_healthy
  * @lv: A RAID_IMAGE, RAID_META, or RAID logical volume.
  *
  * Returns:
@@ -1269,10 +1283,11 @@ static int _lv_raid_integrity_image_in_sync(const struct logical_volume *lv_iori
 int lv_raid_healthy(const struct logical_volume *lv, raid_need_t *need)
 {
 	unsigned s;
-	char *raid_health;
-	size_t raid_health_len;
-	struct lv_segment *seg, *raid_seg = NULL;
+	struct lv_status_raid *status = NULL;
+	struct dm_status_raid *raid;
+	struct lv_segment *raid_seg;
 	raid_need_t r_need = RAID_NEED_ERROR;
+	int r = 0;
 
 	/*
 	 * If the LV is not active locally,
@@ -1281,108 +1296,74 @@ int lv_raid_healthy(const struct logical_volume *lv, raid_need_t *need)
 	if (!lv_is_active(lv))
 		return 1;  /* assume healthy */
 
-	if (!lv_is_raid_type(lv)) {
-		log_error(INTERNAL_ERROR "%s is not of RAID type", lv->name);
-		goto out_need;
-	}
-
 	if (lv_is_raid(lv))
 		raid_seg = first_seg(lv);
-	else if ((seg = first_seg(lv)))
-		raid_seg = get_only_segment_using_this_lv(seg->lv);
+	else
+		raid_seg = get_only_segment_using_this_lv(lv);
 
-	if (!raid_seg) {
-		log_error("Failed to find RAID segment for %s", lv->name);
-		goto out_need;
+	if (!raid_seg || !seg_is_raid(raid_seg)) {
+		log_debug(INTERNAL_ERROR "Failed to find RAID segment for %s.",
+			  display_lvname(lv));
+		goto out;
 	}
 
-	if (!seg_is_raid(raid_seg)) {
-		log_error(INTERNAL_ERROR "%s on %s is not a RAID segment.",
-			  raid_seg->lv->name, lv->name);
-		goto out_need;
-	}
+	if (!lv_raid_status(raid_seg->lv, &status))
+		goto_out;
 
-	if (!lv_raid_dev_health(raid_seg->lv, &raid_health)) {
-		stack;
-		goto out_need;
-	}
-
-	raid_health_len = strlen(raid_health);
-
-	if (lv_is_raid(lv)) {
-		if (raid_seg->area_count == raid_health_len) {
-			/*
-			 * Counts match - positions correspond.
-			 * Check each leg - only report unhealthy if a device is down
-			 * but the metadata expects it to be on a real device (not error segment).
-			 * If a device shows 'D' but the corresponding image LV is virtual
-			 * (error segment from vgreduce --removemissing), that's expected and
-			 * doesn't need a refresh.
-			 */
-			for (s = 0; s < raid_seg->area_count; s++) {
-				if (raid_health[s] == 'D') {
-					if (lv_is_virtual(seg_lv(raid_seg, s)))
-						r_need = RAID_NEED_REPAIR;
-					else
-						r_need = RAID_NEED_REFRESH;
-					goto out_need;
-				}
-			}
-			return 1;
-		}
-
-		/*
-		 * Counts don't match (reshape in progress) - can't reliably
-		 * correlate health positions with metadata, fall back to
-		 * behavior where any 'D' means unhealthy.
-		 */
-		if (strchr(raid_health, 'D')) {
-			r_need = RAID_NEED_REFRESH_OR_REPAIR;
-			goto out_need;
-		}
-		return 1;
-	}
-
-	/* Find out which sub-LV this is. */
-	for (s = 0; s < raid_seg->area_count; s++)
-		if ((lv_is_raid_image(lv) && (seg_lv(raid_seg, s) == lv)) ||
-		    (lv_is_raid_metadata(lv) && (seg_metalv(raid_seg, s) == lv)))
-			break;
-	if (s == raid_seg->area_count) {
-		log_error(INTERNAL_ERROR
-			  "sub-LV %s was not found in raid segment",
-			  lv->name);
-		goto out_need;
-	}
-
-	if (raid_seg->area_count == raid_health_len) {
-		/* Counts match - positions correspond */
-		/* If sub-LV is virtual (error segment), 'D' is expected - not unhealthy */
-		if (raid_health[s] == 'D') {
-			if (lv_is_virtual(lv))
-				r_need = RAID_NEED_REPAIR;
-			else
-				r_need = RAID_NEED_REFRESH;
-			goto out_need;
-		}
-		return 1;
-	}
+	raid = status->raid;
 
 	/*
-	 * Counts don't match (reshape in progress) - can't reliably
-	 * correlate health position with sub-LV, fall back to
-	 * behavior where any 'D' means unhealthy.
+	 * A reshape reports the new device count before the metadata drops
+	 * the areas it freed, so a healthy array can report a count that
+	 * does not match the segment.  Positions cannot be mapped then, so
+	 * only a dead character is decisive.
 	 */
-	if (strchr(raid_health, 'D')) {
-		r_need = RAID_NEED_REFRESH_OR_REPAIR;
-		goto out_need;
-	}
-	return 1;
+	if (raid->dev_count != raid_seg->area_count) {
+		if (strchr(raid->dev_health, 'D')) {
+			r_need = RAID_NEED_REFRESH_OR_REPAIR;
+			goto out;
+		}
 
-out_need:
-	if (need)
+		r = 1;
+		goto out;
+	}
+
+	if (!raid_status_covers_segment(raid_seg, raid))
+		goto_out;
+
+	if (lv_is_raid(lv)) {
+		for (s = 0; s < raid_seg->area_count; s++)
+			if (raid->dev_health[s] == 'D') {
+				r_need = _raid_dead_slot_need(seg_lv(raid_seg, s));
+				goto out;
+			}
+		r = 1;
+		goto out;
+	}
+
+	/* The caller asked about this sub-LV, so classify its own slot. */
+	for (s = 0; s < raid_seg->area_count; s++)
+		if ((lv_is_raid_image(lv) && (seg_lv(raid_seg, s) == lv)) ||
+		    (lv_is_raid_metadata(lv) && (seg_metalv(raid_seg, s) == lv))) {
+			if (raid->dev_health[s] == 'D') {
+				r_need = _raid_dead_slot_need(lv);
+				goto out;
+			}
+			r = 1;
+			goto out;
+		}
+
+	log_debug(INTERNAL_ERROR "Sub-LV %s was not found in RAID segment.",
+		  display_lvname(lv));
+
+out:
+	if (status)
+		dm_pool_destroy(status->mem);
+
+	if (!r && need)
 		*need = r_need;
-	return 0;
+
+	return r;
 }
 
 /* Helper: check for any sub LVs after a disk removing reshape */
