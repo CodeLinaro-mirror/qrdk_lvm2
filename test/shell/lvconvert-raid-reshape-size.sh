@@ -12,33 +12,116 @@
 #
 
 #
-# Due to MD constraints, three issues must be considered when modifying stripe counts that alter the RAID-mapped device size:
-# - on a stripe adding reshape, the initial size remains until after the end when the device capacity is increased
-# - on a stripe removing reshape, the initial size is reduced before the reshape is allowed to start
-# - size changes are being reported asynchronously by the kernel, which requires polling for it for split seconds
-# - the held size can only be sampled while the kernel still reports the reshape running,
-#   hence the reshape is deliberately slowed down and sampled before and after the size read
+# Two device size rules are checked here.  Both are asynchronous:
+# - a stripe adding reshape keeps the size the LV had before it started
+#   until the reshape finished, then the kernel grows it
+# - a stripe removing reshape shrinks the size before the reshape starts,
+#   so that size can be read at any time
+#
+# The size an adding reshape holds is only observable while the kernel still
+# reports the reshape running, which is what the delay and the background
+# lvconvert below are for.  A removing reshape needs neither, so it runs in
+# the foreground and without a delay.
+#
+# Sampling the held size
+# ----------------------
+#
+# lvconvert is started in the background and the LV is polled every 50 ms
+# until the size moves: 'dmsetup status' reports the sync action, 'blockdev'
+# the size.  Only a sample with 'reshape' reported both before and after the
+# size read counts, and the size then has to be the pre-reshape one.  The
+# polling does not stop when the command returns: on raid4/5/6 md starts the
+# reshape only then, and on raid10 it can still be running.
+#
+# Samples reported as 'frozen' are skipped.  dm-raid freezes the sync thread
+# in raid_ctr() until resume, and while the device is suspended dm core
+# already exposes the size of the new table, until raid_preresume()
+# restores the size of the running array on resume - so the size read there
+# says nothing about the reshape.
+#
+# Slowing the reshape down with dm-delay
+# --------------------------------------
+#
+# Without a delay the reshape can finish between two samples, and the test
+# then fails without having looked at the held size.  Delaying the writes of
+# one PV with dm-delay buys the window with time instead of space: a few MiB
+# are enough to keep the reshape busy long enough, so the test stays small
+# enough for CI machines.  A reshape writes every stripe to all its members,
+# so delaying one member holds the whole array back.  The per-layout 'ms'
+# below is the knob for that.  The window has to outlast a poll period and
+# not just any sample, since a sample only counts when it reads the size
+# between two 'reshape' readings taken one period apart; raid4/5/6 get such
+# a window from the checkpoint rule below and need little of the delay,
+# while on raid10 the delay is all there is.  20 ms was enough on an idle
+# machine and too little on an instrumented build, which polls about three
+# times slower.
+#
+# raid4/5/6: the size is held by a window between two counters
+# (drivers/md/raid5.c):
+#
+#   reshape_progress  is advanced once per chunk, when the chunk is
+#                     scheduled in reshape_request(), i.e. before its
+#                     writes have completed
+#   reshape_safe      is advanced only on a metadata checkpoint, where it is
+#                     set to reshape_progress
+#
+# get_reshape_loc() reports everything between the two counters as
+# LOC_INSIDE_RESHAPE and refuses I/O there (STRIPE_SCHEDULE_AND_RETRY, the
+# bio is parked on conf->wait_for_reshape) until a checkpoint collapses the
+# window.  A checkpoint happens only when copying one more chunk would
+# overwrite the source of an earlier one, or every 10 seconds
+# ("time_after(jiffies, conf->reshape_checkpoint + 10*HZ)"), so a reshape
+# that takes a couple of seconds gets a single one, at its end, and the
+# window then spans everything it has copied.
+#
+# That matters because udev runs blkid over the LV as soon as an event
+# arrives, and blkid reads the first ~2.5 MiB and the last ~1.5 MiB of the
+# LV.  With a shrink the window starts at its end and grows downwards, so
+# the last-MiB read is inside it from the first chunk on; with a grow the
+# same happens to the first-MiB read.  Such a read waits for the next
+# checkpoint, and while it waits it holds bd_mutex, which stalls every other
+# access to the LV - that is the multi-second "waiting for zero" seen at the
+# end of lvconvert.
+#
+# raid10: drivers/md/raid10.c has no such window.  reshape_request() raises
+# the array barrier for every batch it copies, at most RESYNC_SECTORS
+# (64 KiB) or the rest of the stripe chunk, and reshape_request_write()
+# writes the batch to every member (conf->copies * 2 bios), so regular I/O
+# waits in wait_barrier() for each batch.  I/O spanning reshape_progress
+# waits in regular_request_wait() as well.  The region size is only the
+# write intent bitmap chunk; it changes neither the batch nor the delay, so
+# --regionsize does not help here.
 #
 
 LVM_SKIP_LARGE_TESTS=${LVM_SKIP_LARGE_TESTS:-1}
 SKIP_FSCK=${SKIP_FSCK:-1}
 SKIP_RESIZE=${SKIP_RESIZE:-0}
 
-# With the use of 'hack' --noudevsync we need to also make sure our device paths are
-# present in the system, otherwise we will not be able to open created LVs
-# since we are not wait for udev to create them.
-# FIXME: it would be better to not need this
-declare -a UDEVOPTS=( "--noudevsync" "--config" "activation/verify_udev_operations=1" )
+# Left empty on purpose: the test runs with udev sync and samples the held
+# size while the command runs, so the options
+#	"--noudevsync" "--config" "activation/verify_udev_operations=1"
+# are not wanted, and they would also require making sure the device paths
+# exist without udev.
+declare -a UDEVOPTS=()
 
-# Timeout in seconds to check for size updates happening during/after.
+# Timeout in seconds for polling a held size, and for waiting for a size
+# update afterwards.
 CHECK_SIZE_TIMEOUT=5
+
+# Held-size polling: the delay between two samples, in ms, and how many
+# samples fit into CHECK_SIZE_TIMEOUT.  The sleep argument and the count are
+# both derived from POLL_DELAY_MS so they cannot disagree.
+POLL_DELAY_MS=50
+POLL_INTERVAL=$(printf '0.%03u' "$POLL_DELAY_MS")
+POLL_COUNT=$(( CHECK_SIZE_TIMEOUT * 1000 / POLL_DELAY_MS ))
 
 # List of stripes to add or remove
 tst_stripes=""
 
-# Delay on first 'PV' to keep a reshape running long enough to reliably sample
-# the size it holds.  Needs to be varied depending on layout as they come with
-# different reshape overhead.
+# Write delay in ms applied to the delayed range of the first 'PV' while
+# stripes are added, where the size the reshape holds has to be sampled
+# before the reshape ends.  Needs to be varied depending on layout as they
+# come with different reshape overhead.
 ms=0
 
 # PV numbers and size
@@ -56,24 +139,9 @@ test "$(aux total_mem)" -gt 1048576 || skip "Not enough RAM for this test"
 
 aux have_fs ext4 || skip
 
-test "$SKIP_RESIZE" -eq 1 || ( which resize2fs || skip )
-
-# Delay its first 'PV' so that size can be evaluated before reshape finished too quick.
-function _delay_dev
-{
-	local dev=$1
-	local offset=$(( $(get first_extent_sector "$dev") + 2048 ))
-
-	aux delay_dev "$dev" "$ms" "$ms" "$offset"
-}
-
-# Reset delay
-function _restore_dev
-{
-	local dev=$1
-
-	aux enable_dev "$dev"
-}
+test "$SKIP_RESIZE" -eq 1 ||
+	command -v resize2fs >/dev/null ||
+	skip "resize2fs not available"
 
 # Optimized filesystem check function with better error handling
 function _skip_or_fsck
@@ -106,15 +174,15 @@ function _get_stripes_and_delay
 	0)
 		case "$raid_type" in
 		raid[45]*)
-			ms=300
+			ms=20
 			tst_stripes="5 4 11 9 15 13 19 18 22 21 25 23 28 30 31 29 33 31 34 33 37 45 41 50 55 60 63 30 15 10 8 3"
 			;;
 		raid6*)
-			ms=250
+			ms=20
 			tst_stripes="5 4 11 9 15 13 19 18 22 21 25 23 28 30 31 29 33 31 34 33 37 45 41 50 55 60 62 30 15 10 8 3"
 			;;
 		raid10*)
-			ms=300
+			ms=50
 			tst_stripes="5 8 9 11 13 14 15 19 20 22 23 25 27 28 29 32"
 			;;
 		esac
@@ -122,15 +190,15 @@ function _get_stripes_and_delay
 	*)
 		case "$raid_type" in
 		raid[45]*)
-			ms=300
+			ms=20
 			tst_stripes="5 4 8 7 11 9 15 19 18 10"
 			;;
 		raid6*)
-			ms=250
+			ms=20
 			tst_stripes="5 4 8 7 11 9 15 18 10 5"
 			;;
 		raid10*)
-			ms=300
+			ms=50
 			tst_stripes="5 6 7 8 9 10"
 			;;
 		esac
@@ -195,98 +263,115 @@ function _check_size
 	[[ lv_size -eq calc_size ]]
 }
 
-# Report the dm-raid synchronization action ('idle', 'reshape', 'resync', ...)
-# the kernel currently exposes for @vg/@lv.
-function _sync_action
-{
-	local token
-	local prev=
-
-	for token in $(dmsetup status "$1-$2")
-	do
-		[ -n "$prev" ] && { echo "$token"; return; }
-		case "$token" in
-		*/*) prev=1 ;;
-		esac
-	done
-}
-
-# True when the kernel still reports the reshape of @vg/@lv as running.
-function _is_reshaping
-{
-	[ "$(_sync_action "$1" "$2")" = reshape ]
-}
-
-# Verify @lv still exposes @old_size while its reshape is ongoing.
+# Poll @lv while the lvconvert starting a reshape runs and shortly after it,
+# and verify it exposes @old_size while its reshape is ongoing.
 #
-# Sample the size and then check the reshape to still be running: the
-# kernel grows the size only once the reshape finished, so a sample
-# taken while the reshape runs has to still be @old_size.
+# The kernel grows the size only once the reshape finished, so a sample
+# taken while the reshape runs has to still be @old_size.  The action is
+# read before and after the size and both readings have to report 'reshape':
+# the reshape end can overtake a single read, and right after a reload
+# dm-raid reports no reshape for a moment before the sync thread starts (the
+# transient _raid_status_read_stable() in raid_manip.c waits it out).  The
+# second reading is reused as the first one of the next poll.
 #
-# Right after a reload dm-raid reports no reshape for a moment before
-# the sync thread starts -- the same transient _raid_status_read_stable()
-# in raid_manip.c waits out -- hence retry with a backoff.  A size that
-# moved away from @old_size means the reshape finished and can no
-# longer be sampled.
+# A poll reported 'frozen' is skipped, see the header: the size exposed then
+# is the one of the reloaded table, not of the running array.  Polling ends
+# when the size moves, which the kernel does only when the reshape finished.
 #
 # Returns 0 when the held size is confirmed, 1 when it violates the
-# contract and 2 when the reshape finished before it could be sampled.
+# contract, 2 when the size moved before a running reshape could be sampled
+# with the size still held, and 3 when the reshape still runs at the timeout
+# without such a sample.
 function _check_size_hold
 {
 	local vg=$1
 	local lv=$2
 	local old_size=$3
 	local lv_size
-	local delay
+	local action
+	local action2
+	local i
 
-	for delay in 0 .05 .1 .2 .4 .8 1.6
+	action=$(get dm_status_raid "$vg/$lv" action)
+
+	for (( i = 0; i < POLL_COUNT; i++ ))
 	do
-		sleep "$delay"
-
 		lv_size=$(blockdev --getsz "$DM_DEV_DIR/$vg/$lv")
+		action2=$(get dm_status_raid "$vg/$lv" action)
 
-		if _is_reshaping "$vg" "$lv"; then
+		if [ "$action" = reshape ] && [ "$action2" = reshape ]; then
 			# Reshape running: the size has to still be @old_size
 			[ "$lv_size" -eq "$old_size" ] && return 0
 			return 1
 		fi
 
-		# No reshape running: a moved size means it finished
-		[ "$lv_size" -eq "$old_size" ] || return 2
+		# Not reshaping and not suspended: a moved size means it finished
+		if [ "$action" != frozen ] && [ "$action2" != frozen ]; then
+			[ "$lv_size" -eq "$old_size" ] || return 2
+		fi
+
+		action=$action2
+		sleep "$POLL_INTERVAL"
 	done
+
+	# The timeout left the reshape running with the size still held: the
+	# contract holds, but no sample saw it running around the size read.
+	[ "$(get dm_status_raid "$vg/$lv" action)" = reshape ] && return 3
 
 	return 2
 }
 
-# Die unless the ongoing reshape of @lv still exposes @old_size.  A reshape
-# that finished before the size could be sampled is not a size violation, so
-# only warn: the delay failed to hold it long enough on this machine.
-function _check_size_held
+# Run _reshape_layout() with the remaining arguments in the background so the
+# size can be polled while it runs, and verify the LV keeps exposing @old_size
+# until its reshape finished.  Waiting for the command too means a failed
+# conversion fails the test, not just an unsampled size.  The metadata is read
+# back by the caller, after its waits.
+function _lvconvert_size_held
 {
-	local vg=$1
-	local lv=$2
-	local old_size=$3
-	local rc
+	local raid_type=$1
+	local data_stripes=$2
+	local vg=$3
+	local lv=$4
+	local old_size=$5
+	shift 5
+	local pid
+	local rc=0
 
-	_check_size_hold "$vg" "$lv" "$old_size"
-	rc=$?
+	_reshape_layout "$raid_type" "$data_stripes" $vg $lv "$@" &
+	pid=$!
+
+	# '|| rc=$?' and not a bare call: the test shell runs with 'set -e', so
+	# a nonzero return would abort the run before the command is waited for
+	_check_size_hold "$vg" "$lv" "$old_size" || rc=$?
+
+	# The delay has done its job once the held size has been looked for, so
+	# reset it whatever the sampling found.  It is what keeps the reshape
+	# running slowly and the command below waits for that reshape, so this
+	# is worth about a second per reshape; on a sample that failed it also
+	# lets the reshape drain and the command exit instead of waiting for it
+	# at the delayed rate.
+	aux enable_dev "$dev1"
+
+	# Fails the test when the command itself failed
+	wait "$pid"
+
 	case "$rc" in
 	0)	return 0 ;;
 	1)	die "LV size should be small" ;;
-	2)	echo "WARNING: reshape of $vg/$lv finished before its size could be sampled." ;;
+	2)	die "reshape of $vg/$lv finished before its size could be sampled" ;;
+	3)	die "reshape of $vg/$lv still ran at the timeout without a size sample" ;;
+	*)	die "unexpected result $rc from _check_size_hold" ;;
 	esac
-
-	return 0
 }
 
 function _check_size_timeout
 {
 	local i
 
-	for i in $(seq 0 $((CHECK_SIZE_TIMEOUT * 20)))
+	for (( i = 0; i < POLL_COUNT; i++ ))
 	do
 		_check_size "$@" && return
-		sleep .05
+		sleep "$POLL_INTERVAL"
 	done
 
 	return 1
@@ -326,31 +411,18 @@ function _lvcreate
 	_skip_or_fsck "$DM_DEV_DIR/$vg/$lv"
 }
 
+# Start converting @vg/@lv to @raid_type with @data_stripes.  The reshape runs
+# in the background: the caller waits for it and reads the metadata back only
+# afterwards, so an lvs run never gets in the way of a running reshape.
 function _reshape_layout
 {
 	local raid_type=$1
 	local data_stripes=$2
 	local vg=$3
 	local lv=$4
-	local wait_for_reshape=$5
-	local ignore_a_chars=$6
-	shift 6
-	local stripes
+	shift 4
 
-	stripes=$(_total_stripes "$raid_type" "$data_stripes")
-
-	# FIXME: replace this hack with --noudevsync with slowdown of 'write'
-	#        areas used for reshape operation.
-	#   ATM: command used to be 'sleeping' waiting for a cookie - delayed by udev
 	lvconvert -y --ty "$raid_type" --stripes "$data_stripes" "${UDEVOPTS[@]}" $vg/$lv "$@"
-	check lv_first_seg_field $vg/$lv1 segtype "$raid_type"
-
-	if [ "$wait_for_reshape" -eq 1 ]
-	then
-		_restore_dev "$dev1"
-		aux wait_for_sync $vg $lv "$ignore_a_chars"
-		_skip_or_fsck "$DM_DEV_DIR/$vg/$lv" "fn"
-	fi
 }
 
 function _not_reshape_layout
@@ -359,18 +431,35 @@ function _not_reshape_layout
 	local data_stripes=$2
 	local vg=$3
 	local lv=$4
-	local wait_for_reshape=$5
-	local ignore_a_chars=$6
-	shift 6
-	local stripes
+	shift 4
 
-	stripes=$(_total_stripes "$raid_type" "$data_stripes")
-
-	# FIXME: replace this hack with --noudevsync with slowdown of 'write'
-	#        areas used for reshape operation.
-	#   ATM: command used to be 'sleeping' waiting for a cookie - delayed by udev
 	not lvconvert -y --ty "$raid_type" --stripes "$data_stripes" "${UDEVOPTS[@]}" $vg/$lv "$@"
-	check lv_first_seg_field $vg/$lv1 segtype "$raid_type"
+	check lv_first_seg_field $vg/$lv segtype "$raid_type"
+}
+
+# Add a stripe to @vg/@lv with its first PV delayed, so the reshape runs long
+# enough for the size it holds to be sampled, and verify the LV keeps
+# exposing the pre-reshape size until the reshape finished.  The delay is
+# dropped by _lvconvert_size_held() as soon as it has seen that size.
+function _reshape_adding
+{
+	local raid_type=$1
+	local data_stripes=$2
+	local vg=$3
+	local lv=$4
+	shift 4
+	local old_size
+
+	# Delay the writes past the data start of the first PV, so that the size
+	# the reshape holds can be sampled before the reshape finishes.
+	aux delay_dev "$dev1" "0" "$ms" \
+		"$(( $(get first_extent_sector "$dev1") + 2048 ))"
+
+	# Size the LV exposes before the stripe is added, it has to stay at
+	# that value until the reshape finished
+	old_size=$(blockdev --getsz "$DM_DEV_DIR/$vg/$lv")
+
+	_lvconvert_size_held "$raid_type" "$data_stripes" "$vg" "$lv" "$old_size" "$@"
 }
 
 function _add_stripes
@@ -380,33 +469,24 @@ function _add_stripes
 	local lv=$3
 	local data_stripes=$4
 	local stripes=
-	local old_size
 	local stripesize="$((16 << (data_stripes % 5))).00k" # Stripe size variation
 
 	stripes=$(_total_stripes "$raid_type" "$data_stripes")
 
-	_delay_dev "$dev1"
-
-	# Size the LV exposes before the stripe is added, which has to be kept
-	# until the reshape finished
-	old_size=$(blockdev --getsz "$DM_DEV_DIR/$vg/$lv")
-
-	_reshape_layout "$raid_type" "$data_stripes" $vg $lv 0 1 --stripesize "$stripesize"
-
-	# Size has to stay at the pre-reshape value until reshape finishes
-	_check_size_held $vg $lv "$old_size"
-
-	_restore_dev "$dev1"
-
-	check lv_first_seg_field $vg/$lv stripesize "$stripesize"
-	check lv_first_seg_field $vg/$lv datastripes "$data_stripes"
-	check lv_first_seg_field $vg/$lv stripes "$stripes"
+	_reshape_adding "$raid_type" "$data_stripes" $vg $lv --stripesize "$stripesize"
 
 	_skip_or_fsck "$DM_DEV_DIR/$vg/$lv"
 	aux wait_for_sync $vg $lv 0
 
 	# Now size consistency has to be fine
 	_check_size_timeout $vg $lv "$data_stripes" || die "LV size should be grown"
+
+	# The reshape is done: read the metadata back only now, an lvs run before
+	# the waits above only slows the reshape down.
+	check lv_first_seg_field $vg/$lv segtype "$raid_type"
+	check lv_first_seg_field $vg/$lv stripesize "$stripesize"
+	check lv_first_seg_field $vg/$lv datastripes "$data_stripes"
+	check lv_first_seg_field $vg/$lv stripes "$stripes"
 
 	# Check, use grown capacity for the filesystem and check again
 	if [ "$SKIP_RESIZE" -eq 0 ]
@@ -441,26 +521,28 @@ function _remove_stripes
 		_skip_or_fsck "$DM_DEV_DIR/$vg/$lv"
 	fi
 
-	_delay_dev "$dev1"
-	_reshape_layout "$raid_type" "$data_stripes" $vg $lv 0 1 --force --stripesize "$stripesize"
+	_reshape_layout "$raid_type" "$data_stripes" $vg $lv --force --stripesize "$stripesize"
 
-	# Size has to be inconsistent, as to be removed legs still exist
+	# Size has to be inconsistent, as to be removed legs still exist.  The
+	# size was reduced before the reshape started, so this holds whether or
+	# not the reshape is still running.
 	_check_size $vg $lv "$cur_data_stripes" && die "LV size should be reduced but not rimage count"
-
-	_restore_dev "$dev1"
-
-	check lv_first_seg_field $vg/$lv stripesize "$stripesize"
-	check lv_first_seg_field $vg/$lv datastripes "$data_stripes"
-	check lv_first_seg_field $vg/$lv stripes "$stripes"
 
 	_skip_or_fsck "$DM_DEV_DIR/$vg/$lv"
 
-	# Have to remove freed legs before another restriping conversion. Will fail while reshaping is ongoing as stripes are still in use
-	_not_reshape_layout "$raid_type" $(( data_stripes + 1 )) $vg $lv 0 1 --force
+	# The sub LVs left over by the reshape are still there, so a further
+	# reshape request has to be refused until they are dropped below
+	_not_reshape_layout "$raid_type" $(( data_stripes + 1 )) $vg $lv --force
 	aux wait_for_sync $vg $lv 1
 
 	# Remove freed legs as they are now idle has to succeed without --force
-	_reshape_layout "$raid_type" "$data_stripes" $vg $lv 1 1
+	_reshape_layout "$raid_type" "$data_stripes" $vg $lv
+	aux wait_for_sync $vg $lv 1
+	_skip_or_fsck "$DM_DEV_DIR/$vg/$lv" "fn"
+
+	# Now that the reshape is done, the layout can be read back.
+	check lv_first_seg_field $vg/$lv segtype "$raid_type"
+	check lv_first_seg_field $vg/$lv stripesize "$stripesize"
 	check lv_first_seg_field $vg/$lv datastripes "$data_stripes"
 	check lv_first_seg_field $vg/$lv stripes "$(_total_stripes "$raid_type" "$data_stripes")"
 
@@ -477,7 +559,6 @@ function _test
 	local raid_type=$3
 	local data_stripes=$4
 	local cur_data_stripes
-	local old_size
 	local rimagesz
 
 	_get_stripes_and_delay "$raid_type"
@@ -485,26 +566,18 @@ function _test
 	# Calculate maximum rimage size in MiB and subtract 3 extents to leave room for rounding
 	rimagesz=$(( $(blockdev --getsz "$dev1") / 2048 - 3 ))
 
-	# Create (data_stripes+1)-way striped $raid_type
+	# Create $raid_type with @data_stripes data stripes
 	_lvcreate "$raid_type" "$data_stripes" $(( data_stripes * rimagesz ))M $vg $lv --stripesize 128k
 	_check_size $vg $lv "$data_stripes" || die "LV size bogus"
 	check lv_first_seg_field $vg/$lv stripesize "128.00k"
 	aux wait_for_sync $vg $lv 0
 
-	_delay_dev "$dev1"
-
-	# Size the LV exposes before the stripe is added, which has to be kept
-	# until the reshape finished
-	old_size=$(blockdev --getsz "$DM_DEV_DIR/$vg/$lv")
-
 	# Reshape it to one more stripe and 256K stripe size
-	_reshape_layout "$raid_type" $(( data_stripes + 1 )) $vg $lv 0 0 --stripesize 256K
-	_check_size_held $vg $lv "$old_size"
+	_reshape_adding "$raid_type" $(( data_stripes + 1 )) $vg $lv --stripesize 256K
 
-	_restore_dev "$dev1"
 	_skip_or_fsck "$DM_DEV_DIR/$vg/$lv"
 
-	# Wait for sync to finish to check frow extended LV size
+	# Wait for sync to finish to check the extended LV size
 	aux wait_for_sync $vg $lv 0
 
 	_check_size_timeout $vg $lv $(( data_stripes + 1 )) || die "LV size should be grown"
