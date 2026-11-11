@@ -739,6 +739,10 @@ int pvcreate_params_from_args(struct cmd_context *cmd, struct pvcreate_params *p
 	 * . vgcreate --setpersist y                   does not start PR
 	 * . vgcreate --persist start                  does start PR
 	 * . vgcreate --setpersist y --persist start   does start PR
+	 * . vgcreate --pr                             does start PR
+	 *
+	 * --pr is a shortcut for --setpersist y --persist start (and
+	 * cannot be combined with either option.)
 	 *
 	 * A special case which does not follow this pattern is creating
 	 * a shared VG, where PR is started even without --persist start
@@ -772,36 +776,46 @@ int pvcreate_params_from_args(struct cmd_context *cmd, struct pvcreate_params *p
 			return 0;
 
 		/*
-		 * PR is not permitted with persistent_reservations=none
-		 * (an explicit --setpersist n remains allowed as a way to
-		 * clear PR settings.)
+		 * --pr is a shortcut for --setpersist y --persist start: the
+		 * command takes a PR on the devs it uses, and the VG is
+		 * created with PR enabled and started.
 		 */
-		if (policy == PR_POLICY_NONE) {
+		if (arg_is_set(cmd, pr_ARG))
+			pp->setpersist_flags |= SETPR_Y;
+
+		/*
+		 * PR is not permitted with policy none.
+		 * (--setpersist n is allowed to clear PR settings)
+		 */
+		if (pr_policy == PR_POLICY_NONE) {
 			if (pp->setpersist_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART | SETPR_PTPL)) {
-				log_error("Persistent reservations are not permitted on this host (persistent_reservations=none).");
+				log_error("Persistent reservations are disabled in lvm config (persistent_reservations=none).");
 				return 0;
 			}
 			if (arg_is_set(cmd, persist_ARG)) {
-				log_error("Persistent reservations are not permitted on this host (persistent_reservations=none).");
+				log_error("Persistent reservations are disabled in lvm config (persistent_reservations=none).");
 				return 0;
 			}
 		}
 
 		/*
-		 * With full, vgcreate enables PR on the new VG by default,
-		 * as if --setpersist y was given.  The devs must still be
-		 * checked for PR support, which happens in vgcreate once the
-		 * devs are known (setpersist_default); an explicit
-		 * --setpersist always wins over the default.
+		 * With PR policy set to "full", a new VG automatically has PR enabled
+		 * (assuming the devices all support PR), without the user needing to
+		 * include an explicit '--setpersist y' on the command line.
+		 * (Unless the user explicitly says no with --setpersist n.)
 		 */
-		if (!arg_is_set(cmd, setpersist_ARG) && (policy == PR_POLICY_FULL)) {
+		if (!arg_is_set(cmd, setpersist_ARG) && !arg_is_set(cmd, pr_ARG) && (pr_policy == PR_POLICY_FULL)) {
 			pp->setpersist_flags = SETPR_Y;
-			pp->setpersist_default = 1;
+			pp->setpersist_from_full = 1;
 		}
 
 		setpersist_on = (pp->setpersist_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART)) ? 1 : 0;
 
-		pp->start_pr = arg_is_set(cmd, persist_ARG); /* --persist start is the only permitted option */
+		/*
+		 * "start" is the only permitted option for --persist in vgcreate,
+		 * and --pr is a shortcut that implies --persist start.
+		 */
+		pp->start_pr = arg_is_set(cmd, persist_ARG) || arg_is_set(cmd, pr_ARG);
 
 		if (!shared_vg && arg_is_set(cmd, locktype_ARG)) {
 			int lock_type_num = get_lock_type_from_string(arg_str_value(cmd, locktype_ARG, NULL));
@@ -1439,7 +1453,7 @@ int dev_args_accepted_for_vgcreate(struct cmd_context *cmd, struct dm_list *devs
 		}
 	}
 
-	setpersist_on = (pp->setpersist_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART) ? 1 : 0;
+	setpersist_on = (pp->setpersist_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART)) ? 1 : 0;
 
 	if ((pp->start_pr || setpersist_on) && !_dev_args_check_pr(cmd, devs)) {
 		_dev_args_fail_all(devs);

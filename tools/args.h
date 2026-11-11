@@ -682,6 +682,14 @@ arg(poolmetadataspare_ARG, '\0', "poolmetadataspare", bool_VAL, 0, 0,
     "spare pool metadata LV in the VG. A spare metadata LV is reserved\n"
     "space that can be used when repairing a pool.\n")
 
+arg(pr_ARG, '\0', "pr", 0, 0, 0,
+    "#vgcreate\n"
+    "Use persistent reservations (PR) for the command and the new VG.\n"
+    "A shortcut for --setpersist y --persist start: the command takes\n"
+    "a PR on the devices it uses, and the VG is created with PR enabled\n"
+    "and started.  lvmlocal.conf pr_key or host_id must be configured\n"
+    "to use PR.  See \\fBlvmpersist\\fP(8) for more information.\n")
+
 arg(profile_ARG, '\0', "profile", string_VAL, 0, 0,
     "An alias for --commandprofile or --metadataprofile, depending\n"
     "on the command.\n")
