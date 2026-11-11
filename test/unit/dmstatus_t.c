@@ -152,6 +152,55 @@ static void _test_raid_status(void *fixture)
 
 }
 
+static void _test_raid_status_aligned(void *fixture)
+{
+	struct dm_pool *mem = fixture;
+	struct dm_status_raid *s = NULL;
+	struct dm_info info = { .major = 4242, .minor = 4242 };
+
+	/*
+	 * One character per device: the string is already at its slots, so
+	 * the result is the parsed status.  The device does not exist and
+	 * must not be needed.
+	 */
+	T_ASSERT(dm_get_status_raid_aligned(mem, &info,
+					    "raid6_zr 5 AAAAA 48/68 idle 10 20 -",
+					    &s));
+	if (s) {
+		T_ASSERT_EQUAL(s->dev_count, 5);
+		T_ASSERT_EQUAL(s->advertised_dev_count, 5);
+		T_ASSERT(!strcmp(s->dev_health, "AAAAA"));
+		T_ASSERT(!strcmp(s->raid_type, "raid6_zr"));
+	}
+
+	/*
+	 * A short string needs the table.  The device does not exist, so the
+	 * alignment fails, the parsed status is released and nothing that
+	 * cannot be indexed by slot is handed back.
+	 */
+	s = NULL;
+	T_ASSERT(!dm_get_status_raid_aligned(mem, &info,
+					     "raid1 3 AD 100/100 idle 0",
+					     &s));
+	T_ASSERT(!s);
+
+	/* No device to read a table from: the status is returned as parsed. */
+	s = NULL;
+	T_ASSERT(dm_get_status_raid_aligned(mem, NULL,
+					    "raid1 3 AD 100/100 idle 0",
+					    &s));
+	if (s) {
+		T_ASSERT_EQUAL(s->dev_count, 2);
+		T_ASSERT_EQUAL(s->advertised_dev_count, 3);
+		T_ASSERT(!strcmp(s->dev_health, "AD"));
+	}
+
+	/* A NULL out-pointer is accepted and no status is returned. */
+	T_ASSERT(dm_get_status_raid_aligned(mem, &info,
+					    "raid1 2 aa 10/20 idle 0",
+					    NULL));
+}
+
 void dm_status_tests(struct dm_list *all_tests)
 {
 	struct test_suite *ts = test_suite_create(_mem_init, _mem_exit);
@@ -162,5 +211,6 @@ void dm_status_tests(struct dm_list *all_tests)
 
 	register_test(ts, "/device-mapper/mirror/status", "parsing mirror status", _test_mirror_status);
 	register_test(ts, "/device-mapper/raid/status", "parsing raid status", _test_raid_status);
+	register_test(ts, "/device-mapper/raid/status-aligned", "parsing aligned raid status", _test_raid_status_aligned);
 	dm_list_add(all_tests, &ts->list);
 }
