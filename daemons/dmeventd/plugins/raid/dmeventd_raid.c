@@ -53,8 +53,6 @@ struct dso_state {
 	unsigned warned;
 	/* Set once per idle primary-source episode after lvconvert is tried. */
 	unsigned idle_primary_attempted;
-	/* Warn once while the kernel reports an incomplete health string. */
-	unsigned incomplete_warned;
 	/* Whether the preceding event reported a complete sync ratio. */
 	unsigned in_sync;
 	/* Device count the positional state above belongs to; a change
@@ -285,13 +283,14 @@ static int _raid_should_run_repair(struct dso_state *state,
 	return 1;
 }
 
-static int _process_raid_event(struct dso_state *state, const char *params, const char *device)
+static int _process_raid_event(struct dso_state *state, const char *params,
+			       const char *device, const struct dm_info *dinfo)
 {
 	struct raid_event event = { { 0 } };
 	struct dm_status_raid *status;
 	int r = 1;
 
-	if (!dm_get_status_raid(state->mem, params, &status)) {
+	if (!dm_get_status_raid_aligned(state->mem, dinfo, params, &status)) {
 		log_error("Failed to process status line for %s.", device);
 		return 0;
 	}
@@ -304,19 +303,6 @@ static int _process_raid_event(struct dso_state *state, const char *params, cons
 		r = 0;
 		goto out;
 	}
-
-	if (status->dev_count < status->advertised_dev_count) {
-		if (!state->incomplete_warned) {
-			state->incomplete_warned = 1;
-			log_warn("WARNING: RAID device %s has incomplete health status (%u of %u"
-				 " chars); skipping positional handling and automatic repair."
-				 " dm-raid 1.9.0/1.9.1 has a known short-health bug; check the"
-				 " target version and upgrade if affected.",
-				 device, status->dev_count, status->advertised_dev_count);
-		}
-		goto out;
-	}
-	state->incomplete_warned = 0;
 
 	/* New dev_count: leg indexes changed; forget positional repair state. */
 	_raid_reset_epoch(state, status, device);
@@ -364,11 +350,17 @@ void process_event(struct dm_task *dmt,
 		   void **user)
 {
 	struct dso_state *state = *user;
+	struct dm_info info;
 	void *next = NULL;
 	uint64_t start, length;
 	char *target_type = NULL;
 	char *params;
 	const char *device = dm_task_get_name(dmt);
+
+	if (!dm_task_get_info(dmt, &info)) {
+		log_error("Failed to get info for %s.", device);
+		return;
+	}
 
 	do {
 		next = dm_get_next_target(dmt, next, &start, &length,
@@ -384,7 +376,7 @@ void process_event(struct dm_task *dmt,
 			continue;
 		}
 
-		if (!_process_raid_event(state, params, device))
+		if (!_process_raid_event(state, params, device, &info))
 			log_error("Failed to process event for %s.",
 				  device);
 	} while (next);
