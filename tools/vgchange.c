@@ -1899,6 +1899,13 @@ static int _vgchange_setpersist_single(struct cmd_context *cmd, const char *vg_n
 
 	on = (set_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART)) ? 1 : 0;
 
+	if (set_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART | SETPR_PTPL)) {
+		if (persist_policy_get(cmd) == PR_POLICY_NONE) {
+			log_error("Persistent reservations are not permitted on this host (persistent_reservations=none).");
+			return ECMD_FAILED;
+		}
+	}
+
 	if (on) {
 		local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
 		local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
@@ -2243,7 +2250,6 @@ static int _vgchange_global_mode_single(struct cmd_context *cmd, const char *vg_
 	if (our_key_held && !persist_upgrade_stop(cmd, vg, our_key_held))
 		log_warn("Failed to stop PR.");
 
-	/* FIXME: should this recommend running lvmlockctl --gl-enable or a different command? */
 	if ((global_mode == LOCKD_GLOBAL_MODE_1) && !gl_enabled && !others_have_lock_1)
 		log_warn("WARNING: No VG has the global lock enabled.");
 
