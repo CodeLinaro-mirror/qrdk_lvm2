@@ -388,18 +388,19 @@ static int _raid_status_health_is_complete(const struct lv_segment *seg,
 /*
  * HM Helper:
  *
- * report the kernel device count in @*kernel_devs and the number of health
- * characters in @*devs_health, of which @*devs_in_sync are in sync
+ * report the kernel device count in @*kernel_devs and, of those devices,
+ * how many are in sync in @*devs_in_sync.  lv_raid_status() returns a
+ * status whose health string covers every device, so the characters can
+ * be walked by device.
  */
 static int _get_dev_health(struct logical_volume *lv, uint32_t *kernel_devs,
-			   uint32_t *devs_health, uint32_t *devs_in_sync)
+			   uint32_t *devs_in_sync)
 {
 	struct lv_status_raid *status;
 	struct dm_status_raid *raid;
 	unsigned d;
-	int r = 0;
 
-	*devs_health = *devs_in_sync = 0;
+	*devs_in_sync = 0;
 
 	if (!lv_raid_status(lv, &status)) {
 		log_error("Failed to get device health.");
@@ -409,20 +410,13 @@ static int _get_dev_health(struct logical_volume *lv, uint32_t *kernel_devs,
 	raid = status->raid;
 	*kernel_devs = raid->advertised_dev_count;
 
-	if (!_raid_status_health_is_complete(first_seg(lv), raid))
-		goto_out;
-
-	d = (unsigned) strlen(raid->dev_health);
-	while (d--) {
-		(*devs_health)++;
+	for (d = 0; d < raid->dev_count; d++)
 		if (raid->dev_health[d] == RAID_DEV_HEALTH_ALIVE)
 			(*devs_in_sync)++;
-	}
 
-	r = 1;
-out:
 	dm_pool_destroy(status->mem);
-	return r;
+
+	return 1;
 }
 
 /*
@@ -459,14 +453,11 @@ enum raid_read_result {
  * the second is the 0% dm-raid can report right after a reload while the
  * legs are already in sync (linux/drivers/md/dm-raid.c rs_get_progress(),
  * kernel commits 4102d9de6d37 and 41dcf197ad53), and equally a recover or
- * resync that has not advanced yet.  Only a status whose health string
- * covers all @expected_count slots is retried: a shorter string omits failed
- * components, so its 'a' positions cannot be mapped to RAID slots and it is
- * returned as-is for the caller to reject or skip.
- *
- * The caller still validates that the device count matches its segment,
- * since a mismatched count is handled differently by each caller (skip
- * versus reject).
+ * resync that has not advanced yet.  Only a status whose device count
+ * matches @expected_count is retried: the retries watch for a transient in
+ * the array the caller is about to change, while a kernel count that
+ * differs from the segment is a reshape in progress, handed back for the
+ * caller to reject or skip as it sees fit.
  *
  * On RAID_READ_OK the caller owns @raid_status and must destroy its pool;
  * on the other results the pool has already been released.  RAID_READ_ERROR
@@ -2186,8 +2177,7 @@ int lv_raid_free_reshape_space(const struct logical_volume *lv)
  * HM
  *
  * Compares current raid disk count of active RAID set @lv to
- * requested @dev_count returning number of disks as of healths
- * string in @devs_health and synced disks in @devs_in_sync
+ * requested @dev_count returning synced disks in @devs_in_sync
  *
  * Returns:
  *
@@ -2198,14 +2188,14 @@ int lv_raid_free_reshape_space(const struct logical_volume *lv)
  *
  */
 static int _reshaped_state(struct logical_volume *lv, const unsigned dev_count,
-			   unsigned *devs_health, unsigned *devs_in_sync)
+			   unsigned *devs_in_sync)
 {
 	uint32_t kernel_devs;
 
-	if (!devs_health || !devs_in_sync)
+	if (!devs_in_sync)
 		return_0;
 
-	if (!_get_dev_health(lv, &kernel_devs, devs_health, devs_in_sync))
+	if (!_get_dev_health(lv, &kernel_devs, devs_in_sync))
 		return_0;
 
 	if (kernel_devs == dev_count)
@@ -2417,7 +2407,7 @@ static int _raid_reshape_remove_images(struct logical_volume *lv,
 	int stripe_size_changed;
 	uint32_t available_slvs, current_le_count, reduced_le_count, removed_slvs, s, stripe_size;
 	uint64_t extend_le_count;
-	unsigned devs_health, devs_in_sync;
+	unsigned devs_in_sync;
 	struct lv_segment *seg = first_seg(lv);
 	struct lvinfo info = { 0 };
 
@@ -2435,7 +2425,7 @@ static int _raid_reshape_remove_images(struct logical_volume *lv,
 		return 0;
 	}
 
-	switch (_reshaped_state(lv, new_image_count, &devs_health, &devs_in_sync)) {
+	switch (_reshaped_state(lv, new_image_count, &devs_in_sync)) {
 	case 3:
 		/*
 		 * Disk removal reshape step 1:
@@ -2792,7 +2782,7 @@ static int _raid_reshape(struct logical_volume *lv,
 			 struct dm_list *allocate_pvs)
 {
 	int force_repair = 0, r, too_few = 0;
-	unsigned devs_health, devs_in_sync;
+	unsigned devs_in_sync;
 	uint32_t available_slvs, removed_slvs, new_image_count, old_image_count;
 	enum alloc_where where_it_was = alloc_none;
 	struct lv_segment *seg = first_seg(lv);
@@ -2887,14 +2877,14 @@ static int _raid_reshape(struct logical_volume *lv,
 		return 0;
 	}
 
-	switch ((r = _reshaped_state(lv, old_image_count, &devs_health, &devs_in_sync))) {
+	switch ((r = _reshaped_state(lv, old_image_count, &devs_in_sync))) {
 	case 1:
 		/*
 		 * old_image_count == kernel_dev_count
 		 *
 		 * Check for device health
 		 */
-		if (devs_in_sync < devs_health) {
+		if (devs_in_sync < old_image_count) {
 			log_error("Can't reshape out of sync LV %s.", display_lvname(lv));
 			return 0;
 		}
