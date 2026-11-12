@@ -205,12 +205,6 @@ out:
 			 * in near-by future, do not report 100% */
 			s->insync_regions--;
 		}
-		if ((a == s->dev_count) && /* all legs are in 'a' */
-		    (!strcasecmp(s->sync_action, "resync") ||
-		     !strcasecmp(s->sync_action, "idle"))) {
-			/* Mark 1st. leg in sync */
-			s->dev_health[0] = 'A';
-		}
 	}
 
 	return 1;
