@@ -72,6 +72,17 @@ struct raid_event {
 DM_EVENT_LOG_FN("raid")
 
 /*
+ * Whether the leading leg is out of sync while another leg is not: a
+ * health string of 'a' alone does not identify a failed source, it says
+ * that no leg has reached 'A' yet.
+ */
+static int _leading_leg_out_of_sync(const struct dm_status_raid *status)
+{
+	return (status->dev_health[0] == 'a') &&
+	       (strspn(status->dev_health, "a") < status->dev_count);
+}
+
+/*
  * If we are converting from non-RAID to RAID (e.g. linear -> raid1) and too
  * many original devices die, such that we cannot continue the "recover"
  * operation, the sync action will go to "idle", the unsynced devs will remain
@@ -104,7 +115,7 @@ static int _raid_idle_primary_failure(const struct dm_status_raid *status,
 	if (!strchr(status->dev_health, 'a'))
 		return 0;
 
-	if (status->dev_health[0] == 'a')
+	if (_leading_leg_out_of_sync(status))
 		return 1;
 
 	if (sscanf(params, "%*s %*u %*s " FMTu64 "/" FMTu64,

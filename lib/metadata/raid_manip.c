@@ -362,6 +362,23 @@ static int _deactivate_and_remove_lvs(struct volume_group *vg, struct dm_list *r
 #define RAID_DEV_HEALTH_ALIVE_NOT_IN_SYNC	'a'
 
 /*
+ * Succeed when every device of @status is alive but not in sync, which
+ * dm-raid reports for an array-wide resync: a new array, a resync
+ * restarted by lvchange --resync, or one resumed after an interruption.
+ * The health string does not say which leg is the In_sync source.
+ */
+static int _raid_status_all_not_in_sync(const struct dm_status_raid *status)
+{
+	unsigned d;
+
+	for (d = 0; d < status->dev_count; d++)
+		if (status->dev_health[d] != RAID_DEV_HEALTH_ALIVE_NOT_IN_SYNC)
+			return 0;
+
+	return 1;
+}
+
+/*
  * Succeed if @status carries one health character per device the target
  * reports.
  *
@@ -3512,20 +3529,19 @@ static int _raid_allow_extraction(struct logical_volume *lv,
 
 	/*
 	 * The caller has already established the array is fully in sync
-	 * (e.g. the split path called _raid_in_sync()), so a 100% in-sync
-	 * array passes every check below unconditionally and the read can
-	 * be skipped.  A requested snapshot is still read for: the caller
+	 * (e.g. the split path called _raid_in_sync()), so the read can be
+	 * skipped.  A requested observation is still taken for: the caller
 	 * explicitly asked for it, so the read is not optional.
 	 */
 	if (known_in_sync && !out_status)
 		return 1;
 
 	/*
-	 * Base the whole decision on a single status snapshot instead of a
-	 * separate in-sync probe followed by a second read: the array may
+	 * Base the extraction check on a single status observation instead of
+	 * a separate in-sync probe followed by a second read: the array may
 	 * change between two reads, so acting on a secondary, possibly
-	 * conflicting view would be wrong.  _raid_status_read_stable() waits
-	 * out the ambiguous idle/0% states before returning.
+	 * conflicting observation would be wrong.  _raid_status_read_stable()
+	 * waits out the ambiguous idle/0% states before returning.
 	 *
 	 * We can allow extracting images if the array is performing a sync
 	 * operation as long as it is "recover" and the image is not a primary
@@ -3533,10 +3549,6 @@ static int _raid_allow_extraction(struct logical_volume *lv,
 	 */
 	if (_raid_status_read_stable(lv, seg->area_count, &raid_status) != RAID_READ_OK)
 		return_0;
-
-	/* If in-sync allow to proceed. */
-	if (raid_status->in_sync == DM_PERCENT_100)
-		goto out;
 
 	sync_action = raid_status->raid->sync_action;
 	dev_health = raid_status->raid->dev_health;
@@ -3549,6 +3561,10 @@ static int _raid_allow_extraction(struct logical_volume *lv,
 		log_error("Unable to remove primary RAID image while array resyncing.");
 		goto bad;
 	}
+
+	/* If in-sync and not resyncing, allow to proceed. */
+	if (raid_status->in_sync == DM_PERCENT_100)
+		goto out;
 
 	if (!_raid_sync_action_allows_image_change(sync_action)) {
 		log_error("Unable to remove RAID image while array"
@@ -3881,6 +3897,10 @@ static int _raid_remove_images(struct logical_volume *lv, int yes,
 {
 	struct dm_list removed_lvs;
 	struct lv_segment *seg;
+	struct lv_status_raid *raid_status;
+	struct dm_status_raid *raid;
+	struct logical_volume *image;
+	int all_resync;
 	uint32_t s;
 	int rebuild_flags_set = 0;
 
@@ -3892,21 +3912,41 @@ static int _raid_remove_images(struct logical_volume *lv, int yes,
 			return 0;
 		}
 
+		if (_raid_status_read_stable(lv, seg->area_count,
+					     &raid_status) != RAID_READ_OK)
+			return_0;
+
+		raid = raid_status->raid;
+		if (!raid_status_covers_segment(seg, raid))
+			goto_bad;
+
+		/*
+		 * md reads the not-yet-resynced range from the first leg
+		 * and copies it to the others, while dm-raid does not say
+		 * which leg is the In_sync source, so keep the first one.
+		 */
+		all_resync = !strcmp(raid->sync_action, "resync") &&
+			     _raid_status_all_not_in_sync(raid);
+
 		for (s = 0; s < seg->area_count; s++) {
-			if (seg_type(seg, s) == AREA_UNASSIGNED)
+			if (seg_type(seg, s) != AREA_LV ||
+			    !(image = seg_lv(seg, s)) ||
+			    !lv_is_raid_image(image) || !lv_is_active(image))
 				continue;
 
-			if (lv_raid_image_in_sync(seg_lv(seg, s))) {
+			if (raid->dev_health[s] == RAID_DEV_HEALTH_ALIVE ||
+			    (!s && all_resync)) {
 				_swap_areas(seg->areas + 0, seg->areas + s);
 				break;
 			}
-
 		}
 
 		if (s >= seg->area_count) {
 			log_error("%s is out-of-sync!  Please try refreshing first.", display_lvname(lv));
-			return 0;
+			goto bad;
 		}
+
+		dm_pool_destroy(raid_status->mem);
 	}
 
 	if (!removal_lvs) {
@@ -3968,6 +4008,10 @@ static int _raid_remove_images(struct logical_volume *lv, int yes,
 		return_0;
 
 	return 1;
+bad:
+	dm_pool_destroy(raid_status->mem);
+
+	return 0;
 }
 
 /* Check if single SubLV @slv is degraded. */
