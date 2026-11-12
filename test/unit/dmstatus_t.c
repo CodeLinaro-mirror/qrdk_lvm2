@@ -137,7 +137,7 @@ static void _test_raid_status(void *fixture)
 		T_ASSERT(!strcmp(s->dev_health, "AD"));
 	}
 
-	/* Accept both legacy and raw health during the transition. */
+	/* The health characters remain those reported by the target. */
 	T_ASSERT(dm_get_status_raid(mem,
 				    "raid1 2 aa 10/20 resync 0 0 -",
 				    &s));
@@ -146,9 +146,43 @@ static void _test_raid_status(void *fixture)
 		T_ASSERT_EQUAL(s->insync_regions, 10);
 		T_ASSERT_EQUAL(s->dev_count, 2);
 		T_ASSERT(!strcmp(s->raid_type, "raid1"));
-		T_ASSERT(!strcmp(s->dev_health, "Aa") || !strcmp(s->dev_health, "aa"));
+		T_ASSERT(!strcmp(s->dev_health, "aa"));
 		T_ASSERT(!strcmp(s->sync_action, "resync"));
 	}
+
+	/* Do not treat all reported 'a' as all legs when a slot is omitted. */
+	T_ASSERT(dm_get_status_raid(mem, "raid1 3 aa 10/20 resync 0", &s));
+	if (s) {
+		T_ASSERT_EQUAL(s->dev_count, 2);
+		T_ASSERT_EQUAL(s->advertised_dev_count, 3);
+		T_ASSERT(!strcmp(s->dev_health, "aa"));
+	}
+
+	T_ASSERT(dm_get_status_raid(mem, "raid1 3 aa 10/20 idle 0", &s));
+	if (s)
+		T_ASSERT(!strcmp(s->dev_health, "aa"));
+
+	/* A complete RAID1 idle status is not rewritten either. */
+	T_ASSERT(dm_get_status_raid(mem, "raid1 2 aa 10/20 idle 0", &s));
+	if (s)
+		T_ASSERT(!strcmp(s->dev_health, "aa"));
+
+	T_ASSERT(dm_get_status_raid(mem, "raid1 3 -aa 10/20 resync 0", &s));
+	if (s)
+		T_ASSERT(!strcmp(s->dev_health, "-aa"));
+
+	/* Other RAID levels keep all-a health unchanged. */
+	T_ASSERT(dm_get_status_raid(mem, "raid5_ls 3 aaa 10/20 resync 0", &s));
+	if (s)
+		T_ASSERT(!strcmp(s->dev_health, "aaa"));
+
+	T_ASSERT(dm_get_status_raid(mem, "raid5_ls 3 aaa 10/20 idle 0", &s));
+	if (s)
+		T_ASSERT(!strcmp(s->dev_health, "aaa"));
+
+	T_ASSERT(dm_get_status_raid(mem, "raid10_near 4 aaaa 10/20 resync 0", &s));
+	if (s)
+		T_ASSERT(!strcmp(s->dev_health, "aaaa"));
 
 }
 
