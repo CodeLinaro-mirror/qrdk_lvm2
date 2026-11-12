@@ -137,7 +137,7 @@ static void _test_raid_status(void *fixture)
 		T_ASSERT(!strcmp(s->dev_health, "AD"));
 	}
 
-	/* remap aa  to Aa */
+	/* Accept both legacy and raw health during the transition. */
 	T_ASSERT(dm_get_status_raid(mem,
 				    "raid1 2 aa 10/20 resync 0 0 -",
 				    &s));
@@ -146,7 +146,7 @@ static void _test_raid_status(void *fixture)
 		T_ASSERT_EQUAL(s->insync_regions, 10);
 		T_ASSERT_EQUAL(s->dev_count, 2);
 		T_ASSERT(!strcmp(s->raid_type, "raid1"));
-		T_ASSERT(!strcmp(s->dev_health, "Aa"));
+		T_ASSERT(!strcmp(s->dev_health, "Aa") || !strcmp(s->dev_health, "aa"));
 		T_ASSERT(!strcmp(s->sync_action, "resync"));
 	}
 

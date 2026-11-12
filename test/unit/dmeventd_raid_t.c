@@ -146,11 +146,24 @@ static void _idle_primary(void *fixture)
  * be mistaken for a failed source. */
 static void _idle_incomplete(void *fixture)
 {
+	_event(fixture, "raid1 2 aa 0/8192 idle 0", 0);
 	_event(fixture, "raid1 2 Aa 99/100 idle 0", 0);
 	_event(fixture, "raid1 2 Aa 100/100 recover 0", 0);
 	_event(fixture, "raid1 2 AA 100/100 idle 0", 0);
 	_event(fixture, "raid1 3 Aaa 100/100 idle 0", 1);
 	_event(fixture, "raid1 3 Aaa 100/100 idle 0", 1);
+}
+
+/* An all-a parity status alone does not identify a failed primary. */
+static void _idle_all_a_parity(void *fixture)
+{
+	_event(fixture, "raid5_ls 3 aaa 0/8192 idle 0", 0);
+	_event(fixture, "raid5_ls 3 aaa 0/8192 idle 0", 0);
+	/* Preserve the separate complete-ratio idle failure signature. */
+	_event(fixture, "raid5_ls 3 aaa 8192/8192 idle 0", 1);
+	_event(fixture, "raid5_ls 3 AAA 8192/8192 idle 0", 1);
+	/* A leading 'a' in a mixed status remains a failure signature. */
+	_event(fixture, "raid5_ls 3 aAA 1/8192 idle 0", 2);
 }
 
 /* A short health string cannot be aligned, so the event is refused. */
@@ -182,5 +195,6 @@ void dmeventd_raid_tests(struct dm_list *all_tests)
 	register_test(ts, "/dmeventd/raid/new-failure", "repair fresh failures immediately", _new_failure);
 	register_test(ts, "/dmeventd/raid/idle-primary", "detect normalized primary failure", _idle_primary);
 	register_test(ts, "/dmeventd/raid/idle-incomplete", "exclude incomplete idle snapshot", _idle_incomplete);
+	register_test(ts, "/dmeventd/raid/idle-all-a-parity", "exclude all-a parity transition", _idle_all_a_parity);
 	dm_list_add(all_tests, &ts->list);
 }

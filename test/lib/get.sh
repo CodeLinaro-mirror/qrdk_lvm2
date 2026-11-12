@@ -18,6 +18,8 @@
 #
 #  get lv_devices LV     [lvs params]
 #
+#  get dm_status_raid LV health|dev_count|action...
+#
 #  get io_engine DEV
 #  get io_count SYSCALL FILE [BATCH]
 
@@ -119,6 +121,39 @@ lv_tree_devices() {
 
 first_extent_sector() {
 	pv_field "$@" pe_start --units s --nosuffix
+}
+
+# Print the requested components of the 'dmsetup status' line of the dm-raid
+# target of LV, in the order asked and separated by a space.  The line is
+#
+#   <start> <length> raid <raid type> <#devs> <health> <progress>/<max>
+#       <sync action> <mismatch> <data offset> [<journal device status>]
+#
+# so 'health' is the health characters, one per device slot, 'dev_count' is
+# the '<#devs>' field, which a reshape changes before the metadata does, and
+# 'action' is the sync action.  All components come from one read, so asking
+# for several keeps them from describing two different states of the array.
+dm_status_raid() {
+	local name=${1/\//-}
+	local -a st
+	local -a vals=()
+	local field
+
+	test $# -gt 1 || return 1
+	shift
+
+	st=( $(dmsetup status --noflush "$name") ) || return 1
+
+	for field in "$@"; do
+		case "$field" in
+		dev_count) vals+=( "${st[4]-}" ) ;;
+		health) vals+=( "${st[5]-}" ) ;;
+		action) vals+=( "${st[7]-}" ) ;;
+		*) return 1 ;;
+		esac
+	done
+
+	echo "${vals[*]}"
 }
 
 # Print the io engines this build can create, probing each candidate with
