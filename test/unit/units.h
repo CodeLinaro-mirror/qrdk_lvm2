@@ -49,6 +49,7 @@ void parse_rx_tests(struct dm_list *all_tests);
 void percent_tests(struct dm_list *all_tests);
 void radix_tree_tests(struct dm_list *all_tests);
 void raid_region_tests(struct dm_list *all_tests);
+void raid_status_tests(struct dm_list *all_tests);
 void regex_tests(struct dm_list *all_tests);
 void string_tests(struct dm_list *all_tests);
 void vdo_tests(struct dm_list *all_tests);
@@ -82,6 +83,7 @@ static inline void register_all_tests(struct dm_list *all_tests)
 	percent_tests(all_tests);
 	radix_tree_tests(all_tests);
 	raid_region_tests(all_tests);
+	raid_status_tests(all_tests);
 	regex_tests(all_tests);
 	string_tests(all_tests);
 	vdo_tests(all_tests);

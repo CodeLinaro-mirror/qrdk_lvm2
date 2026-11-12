@@ -207,6 +207,18 @@ static void _test_raid_status_aligned(void *fixture)
 		T_ASSERT(!strcmp(s->raid_type, "raid6_zr"));
 	}
 
+	T_ASSERT(dm_get_status_raid_aligned(mem, &info,
+					    "raid5_ls 3 aaa 10/20 idle 0",
+					    &s));
+	if (s)
+		T_ASSERT(!strcmp(s->dev_health, "aaa"));
+
+	T_ASSERT(dm_get_status_raid_aligned(mem, &info,
+					    "raid1 2 aa 10/20 resync 0",
+					    &s));
+	if (s)
+		T_ASSERT(!strcmp(s->dev_health, "aa"));
+
 	/*
 	 * A short string needs the table.  The device does not exist, so the
 	 * alignment fails, the parsed status is released and nothing that

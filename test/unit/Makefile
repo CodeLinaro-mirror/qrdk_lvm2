@@ -40,6 +40,7 @@ UNIT_SOURCE=\
 	test/unit/parse_rx_t.c \
 	test/unit/percent_t.c \
 	test/unit/raid_region_t.c \
+	test/unit/raid_status_t.c \
 	test/unit/radix_tree_t.c \
 	test/unit/run.c \
 	test/unit/string_t.c \
