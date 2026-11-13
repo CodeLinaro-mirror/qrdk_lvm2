@@ -7,3 +7,4 @@ run shell/local-vg-boot-activation.sh
 run shell/local-vg-devices-import.sh
 run shell/local-vg-fixes-pr-release.sh
 run shell/local-vg-global-devices-pr.sh
+run shell/local-vg-pr-policy.sh
