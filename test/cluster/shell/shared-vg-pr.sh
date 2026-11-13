@@ -535,6 +535,51 @@ node1_vgremove_retry
 fi # d3
 
 #
+# vgremove and vgreduce with a stale persist key file: commands that stop
+# or clear the VG's PR must use the key verified on the existing PVs, not
+# the stale key from the file.  (vgremove stopping a stale key would leave
+# the real key registered on the removed PVs.)
+#
+if [ -n "$d3" ]; then
+
+# vgremove stops PR with the verified key, leaving no keys on the devs
+node1 vgcreate --shared --setpersist y testvg $d1 $d2
+KEY1=$(get_key 1)
+
+host_id_hex=$(echo $KEY1 | sed 's/.*\(....\)$/\1/')
+STALE_KEY="0x100000999999${host_id_hex}"
+VGID=$(node1 vgs --noheadings -o vg_uuid testvg | tr -d ' -')
+node1 "echo key: $STALE_KEY > /var/lib/lvm/persist_key_testvg_$VGID"
+
+node1 vgremove -y -f testvg
+
+node1 lvmpersist read-keys --device $d1 | tee out
+check_key_none out
+node1 lvmpersist read-keys --device $d2 | tee out
+check_key_none out
+
+# vgreduce clears all PR state from the reduced PV
+node1 vgcreate --shared --setpersist y testvg $d1 $d2 $d3
+KEY1=$(get_key 1)
+
+VGID=$(node1 vgs --noheadings -o vg_uuid testvg | tr -d ' -')
+node1 "echo key: $STALE_KEY > /var/lib/lvm/persist_key_testvg_$VGID"
+
+node1 vgreduce testvg $d3
+
+node1 lvmpersist read-keys --device $d3 | tee out
+check_key_none out
+node1 lvmpersist read-reservation --device $d3 | tee out
+check_reservation_none out
+
+# the VG keeps PR on the remaining devs
+node1 lvmpersist check-key --key $KEY1 --device $d1
+
+node1_vgremove_retry
+
+fi # d3
+
+#
 # vgreduce clears PR on the removed PV (our key and other hosts' keys), after
 # writing it, so the PV can be used by another VG.
 #
