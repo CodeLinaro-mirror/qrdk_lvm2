@@ -5164,15 +5164,14 @@ struct volume_group *vg_read(struct cmd_context *cmd, const char *vg_name, const
 	}
 
 	if ((vg->pr & VG_PR_REQUIRE) && (writing || activating) && !cmd->disable_pr_required) {
-		if (!persist_is_started_gen(cmd, vg, NULL, 0, lks->generation)) {
+		if (!persist_is_started_gen(cmd, vg, NULL, 0, lks->generation, &vg->pr_our_key)) {
 			/*
-			 * The VG metadata requires PR, but this host forbids
-			 * PR: explain the conflict (the VG setting wins for
-			 * existing VGs, so the command fails either way.)
+			 * If the VG metadata requires PR to write or activate,
+			 * but this host's config disallows PR from being used,
+			 * then return an error, disallowing VG write/activate.
 			 */
 			if (persist_policy_get(cmd) == PR_POLICY_NONE)
-				log_error("VG %s requires persistent reservations, but PR is not permitted on this host (persistent_reservations=none).",
-					  vg->name);
+				log_error("VG %s requires persistent reservations, but PR is disabled in lvm config (persistent_reservations=none).", vg->name);
 			failure |= FAILED_PR_REQUIRED;
 			goto_bad;
 		}

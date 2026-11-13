@@ -1161,11 +1161,14 @@ out:
 	return is_started;
 }
 
-int persist_is_started_gen(struct cmd_context *cmd, struct volume_group *vg, int *is_error, int may_fail, uint64_t ls_generation)
+int persist_is_started_gen(struct cmd_context *cmd, struct volume_group *vg, int *is_error, int may_fail, uint64_t ls_generation, uint64_t *our_key_ret)
 {
 	uint64_t our_key_val = 0;
 	uint64_t key_gen;
 	int ret;
+
+	if (our_key_ret)
+		*our_key_ret = 0;
 
 	ret = _is_started(cmd, vg, is_error, may_fail, &our_key_val, (uint32_t)ls_generation);
 
@@ -1174,11 +1177,11 @@ int persist_is_started_gen(struct cmd_context *cmd, struct volume_group *vg, int
 
 	/* only sanlock vgs use generation in keys */
 	if (!vg_is_sanlock(vg))
-		return ret;
+		goto key_set;
 
 	/* when lockd_vg is skipped there is no ls_generation to check */
 	if (cmd->lockd_vg_disable)
-		return 1;
+		goto key_set;
 
 	/* if the generation in the key isn't correct, then return 0 (not started) */
 
@@ -1189,6 +1192,11 @@ int persist_is_started_gen(struct cmd_context *cmd, struct volume_group *vg, int
 			  (unsigned long long) our_key_val, (unsigned long long) key_gen, (unsigned long long) ls_generation);
 		return 0;
 	}
+
+ key_set:
+	if (our_key_ret)
+		*our_key_ret = our_key_val;
+
 	return 1;
 }
 
@@ -1233,15 +1241,6 @@ static int _get_our_key(struct cmd_context *cmd, struct volume_group *vg,
 			goto read_keys;
 		}
 
-		/*
-		 * FIXME: A matching host_id does not prove last_gen is current.
-		 * persist_vgextend_begin/update can use a stale file to register an
-		 * old generation on new PVs while existing PVs use the current one.
-		 * For vgextend, use the already validated VG key, or validate the
-		 * cached key against existing PV registrations and the current
-		 * lockspace generation.  Exclude new PVs from that validation until
-		 * their VG keys have been installed.
-		 */
 		log_debug("Our key from file: 0x%llx.", (unsigned long long) our_key_val);
 		goto done;
 
@@ -2935,12 +2934,6 @@ int persist_vgcreate_update(struct cmd_context *cmd, struct volume_group *vg,
 	return 1;
 }
 
-/*
- * vgextend only handles PR on new devs when VG_PR_REQUIRE is set.
- * When REQUIRE is set, then persist_is_started() has already run and
- * verified that PR is started on existing devices, now do new devs.
- */
-
 int persist_vgextend_begin(struct cmd_context *cmd, struct volume_group *vg,
 			   struct dm_list *devs)
 {
@@ -2950,6 +2943,7 @@ int persist_vgextend_begin(struct cmd_context *cmd, struct volume_group *vg,
 	struct device *dev = NULL;
 	uint64_t our_key_val = 0;
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
+	uint64_t file_key = 0;
 	const char *access = vg_is_shared(vg) ? "sh" : "ex";
 	const char *devname;
 	const char **argv;
@@ -2963,16 +2957,39 @@ int persist_vgextend_begin(struct cmd_context *cmd, struct volume_group *vg,
 		return 0;
 	int n = 0;
 
-	if (vg_is_sanlock(vg))
-		local_key = NULL;
+	if (vg_is_sanlock(vg) && vg->pr_our_key) {
+		/*
+		 * Use the key that vg_read's REQUIRE check verified on the
+		 * existing PVs (its generation matches the lockspace).
+		 * Selecting the key from the local key file could register
+		 * an old generation on the new PVs while the existing PVs
+		 * use the current one.
+		 */
+		our_key_val = vg->pr_our_key;
+		if (dm_snprintf(our_key_buf, sizeof(our_key_buf), "0x%llx",
+				(unsigned long long) our_key_val) < 0)
+			return_0;
+		log_debug("Our key verified on existing PVs: 0x%llx.",
+			  (unsigned long long) our_key_val);
 
-	if (!local_key && !local_host_id) {
-		log_error("No pr_key or host_id configured (see lvmlocal.conf).");
-		return 0;
+		/* The key file is an optimization; correct a stale value. */
+		if (!_read_key_file(cmd, vg, NULL, &file_key, NULL, NULL) ||
+		    (file_key != our_key_val)) {
+			if (!_write_key_file(cmd, vg, our_key_val))
+				log_warn("WARNING: Failed to update persist key file.");
+		}
+	} else {
+		if (vg_is_sanlock(vg))
+			local_key = NULL;
+
+		if (!local_key && !local_host_id) {
+			log_error("No pr_key or host_id configured (see lvmlocal.conf).");
+			return 0;
+		}
+
+		if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, &our_key_val))
+			return_0;
 	}
-
-	if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, &our_key_val))
-		return_0;
 
 	dm_list_iterate_items(devl, devs) {
 		dev = devl->dev;
@@ -3106,8 +3123,22 @@ int persist_vgextend_update(struct cmd_context *cmd, struct volume_group *vg,
 	_global_pr_handed_off(cmd);
 
 	/* Remove the generation-zero keys before looking up the VG's key. */
-	if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, NULL))
-		return_0;
+
+	/*
+	 * Select the key to start on the new devs: the key that vg_read's
+	 * REQUIRE check verified on the existing PVs (vg->pr_our_key), or
+	 * _get_our_key() (key file or device lookup) if it is unset.
+	 * persist_vgextend_begin() selects the same key, and this key is
+	 * used for cleanup on failure, so one key is used throughout.
+	 */
+	if (vg_is_sanlock(vg) && vg->pr_our_key) {
+		if (dm_snprintf(our_key_buf, sizeof(our_key_buf), "0x%llx",
+				(unsigned long long) vg->pr_our_key) < 0)
+			return_0;
+	} else {
+		if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, NULL))
+			return_0;
+	}
 
 	/* Start again with a new key/mode. */
 	if (persist_vgextend_begin(cmd, vg, devs)) {

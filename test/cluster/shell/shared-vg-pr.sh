@@ -501,6 +501,40 @@ node1_vgremove_retry
 fi # d3
 
 #
+# vgextend with a stale persist key file: the key file is an optimization
+# that may hold an old sanlock generation for the local host_id.  vgextend
+# must use the key verified on the existing PVs, not the stale key from
+# the file, when registering PR on the new device.
+#
+if [ -n "$d3" ]; then
+
+node1 vgcreate --shared --setpersist y testvg $d1 $d2
+KEY1=$(get_key 1)
+
+# Corrupt the local persist key file with a stale key: same host_id as
+# node1's real key but a different generation.
+host_id_hex=$(echo $KEY1 | sed 's/.*\(....\)$/\1/')
+STALE_KEY="0x100000999999${host_id_hex}"
+VGID=$(node1 vgs --noheadings -o vg_uuid testvg | tr -d ' -')
+node1 "echo key: $STALE_KEY > /var/lib/lvm/persist_key_testvg_$VGID"
+
+node1 vgextend testvg $d3
+
+# the new device must have the verified key, not the stale file key
+node1 lvmpersist check-key --key $KEY1 --device $d3
+node1 not lvmpersist check-key --key $STALE_KEY --device $d3
+
+# the key file is corrected to the verified key
+node1 "cat /var/lib/lvm/persist_key_testvg_$VGID" | tee out
+grep -q "key: $KEY1" out
+
+node1 vgchange --persist check testvg | grep -q "$KEY1"
+
+node1_vgremove_retry
+
+fi # d3
+
+#
 # vgreduce clears PR on the removed PV (our key and other hosts' keys), after
 # writing it, so the PV can be used by another VG.
 #

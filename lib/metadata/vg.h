@@ -140,6 +140,7 @@ struct volume_group {
 	uint32_t mda_copies; /* target number of mdas for this VG */
 
 	uint32_t pr; /* VG_PR_ flags */
+	uint64_t pr_our_key; /* runtime, our key read from PVs */
 
 	struct logical_volume *pool_metadata_spare_lv; /* one per VG */
 	struct logical_volume *sanlock_lv; /* one per VG */
