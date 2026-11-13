@@ -1416,6 +1416,65 @@ static int _get_our_key_sanlock_start(struct cmd_context *cmd, struct volume_gro
 }
 
 /*
+ * Get the PR key for this host on this VG.
+ *
+ * If our key was already found in vg_read, then that key was saved in
+ * vg->pr_our_key so it can be taken from there without looking it up again.
+ *
+ * If our key was not already saved in vg->pr_our_key, then get it with the
+ * usual _get_our_key().
+ *
+ * The vg->pr_our_key shortcut is only helpful for sanlock VGs where the key
+ * includes a generation number.
+ *
+ * Returns 1 and sets key_buf/key_val on success.
+ * Returns 0 on error.
+ * Returns -1 when no local key is configured (neither local/pr_key for a
+ * non-sanlock VG nor local/host_id), meaning this host has no PR key to
+ * use; callers that do not require a key treat this as nothing to do.
+ */
+
+static int _get_our_key_verified(struct cmd_context *cmd, struct volume_group *vg,
+				 char *key_buf, uint64_t *key_val)
+{
+	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
+	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
+	uint64_t verified_key = 0;
+	uint64_t file_key = 0;
+
+	if (vg_is_sanlock(vg)) {
+		local_key = NULL;
+
+		if (vg->pr_our_key) {
+			verified_key = vg->pr_our_key;
+			if (dm_snprintf(key_buf, PR_KEY_BUF_SIZE, "0x%llx",
+					(unsigned long long) verified_key) < 0)
+				return_0;
+			if (key_val)
+				*key_val = verified_key;
+			log_debug("Our key verified on existing PVs: 0x%llx.",
+				  (unsigned long long) verified_key);
+
+			/* The key file is an optimization; correct a stale value. */
+			if (!_read_key_file(cmd, vg, NULL, &file_key, NULL, NULL) ||
+			    (file_key != verified_key)) {
+				if (!_write_key_file(cmd, vg, verified_key))
+					log_warn("WARNING: Failed to update persist key file.");
+			}
+			return 1;
+		}
+	}
+
+	if (!local_key && !local_host_id)
+		return -1;
+
+	if (!_get_our_key(cmd, vg, local_key, local_host_id, key_buf, key_val))
+		return_0;
+
+	return 1;
+}
+
+/*
  * Called after sanlock lockstart to check if a registered PR key contains the
  * latest generation number (from sanlock) for the host, and if not to update
  * the PR key.  The sanlock lockstart actually returns the previous generation
@@ -2052,19 +2111,15 @@ static int _run_clear(struct cmd_context *cmd, struct volume_group *vg, struct d
 
 int persist_finish_before(struct cmd_context *cmd, struct volume_group *vg, struct dm_list *devs, char **key)
 {
-	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
-	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	uint64_t our_key_val = 0;
+	int ret;
 
-	if (vg_is_sanlock(vg))
-		local_key = NULL;
-
-	if (!local_key && !local_host_id)
-		return 1;
-
-	if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, &our_key_val))
+	ret = _get_our_key_verified(cmd, vg, our_key_buf, &our_key_val);
+	if (!ret)
 		return_0;
+	if (ret < 0)
+		return 1;
 
 	/*
 	 * When removing a shared VG, verify that other hosts
@@ -2122,19 +2177,15 @@ void persist_finish_after(struct cmd_context *cmd, struct volume_group *vg, stru
 
 int persist_stop_devs(struct cmd_context *cmd, struct volume_group *vg, struct dm_list *stop_devs)
 {
-	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
-	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	uint64_t our_key_val = 0;
+	int ret;
 
-	if (vg_is_sanlock(vg))
-		local_key = NULL;
-
-	if (!local_key && !local_host_id)
-		return 1;
-
-	if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, &our_key_val))
+	ret = _get_our_key_verified(cmd, vg, our_key_buf, &our_key_val);
+	if (!ret)
 		return_0;
+	if (ret < 0)
+		return 1;
 
 	if (!_run_stop(cmd, vg, stop_devs, our_key_buf, 0))
 		return_0;
@@ -2153,19 +2204,15 @@ int persist_stop_devs(struct cmd_context *cmd, struct volume_group *vg, struct d
 int persist_vgreduce_clear_devs(struct cmd_context *cmd, struct volume_group *vg,
 				struct dm_list *clear_devs)
 {
-	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
-	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	uint64_t our_key_val = 0;
+	int ret;
 
-	if (vg_is_sanlock(vg))
-		local_key = NULL;
-
-	if (!local_key && !local_host_id)
-		return 1;
-
-	if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, &our_key_val))
+	ret = _get_our_key_verified(cmd, vg, our_key_buf, &our_key_val);
+	if (!ret)
 		return_0;
+	if (ret < 0)
+		return 1;
 
 	if (!_run_clear(cmd, vg, clear_devs, our_key_buf))
 		return_0;
@@ -2245,15 +2292,13 @@ int persist_upgrade_ex(struct cmd_context *cmd, struct volume_group *vg, uint64_
 	int pv_count;
 	int args;
 	int status;
+	int ret;
 
-	if (vg_is_sanlock(vg))
-		local_key = NULL;
-
-	if (!local_key && !local_host_id)
-		return 1;
-
-	if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, &our_key_val))
+	ret = _get_our_key_verified(cmd, vg, our_key_buf, &our_key_val);
+	if (!ret)
 		return_0;
+	if (ret < 0)
+		return 1;
 
 	if (!pv_list_to_dev_list(cmd->mem, &vg->pvs, &devs))
 		return_0;
@@ -2262,6 +2307,9 @@ int persist_upgrade_ex(struct cmd_context *cmd, struct volume_group *vg, uint64_
 
 	if (!_run_stop(cmd, vg, &devs, our_key_buf, 0))
 		return_0;
+
+	if (vg_is_sanlock(vg))
+		local_key = NULL;
 
 	if (local_key) {
 		new_key_val = our_key_val;
@@ -2937,13 +2985,10 @@ int persist_vgcreate_update(struct cmd_context *cmd, struct volume_group *vg,
 int persist_vgextend_begin(struct cmd_context *cmd, struct volume_group *vg,
 			   struct dm_list *devs)
 {
-	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
-	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
 	struct device_list *devl;
 	struct device *dev = NULL;
 	uint64_t our_key_val = 0;
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
-	uint64_t file_key = 0;
 	const char *access = vg_is_shared(vg) ? "sh" : "ex";
 	const char *devname;
 	const char **argv;
@@ -2952,43 +2997,17 @@ int persist_vgextend_begin(struct cmd_context *cmd, struct volume_group *vg,
 	int pv_count = 0;
 	int errors = 0;
 	int found = 0;
+	int ret;
 
 	if (_persist_policy_none(cmd))
 		return 0;
 	int n = 0;
 
-	if (vg_is_sanlock(vg) && vg->pr_our_key) {
-		/*
-		 * Use the key that vg_read's REQUIRE check verified on the
-		 * existing PVs (its generation matches the lockspace).
-		 * Selecting the key from the local key file could register
-		 * an old generation on the new PVs while the existing PVs
-		 * use the current one.
-		 */
-		our_key_val = vg->pr_our_key;
-		if (dm_snprintf(our_key_buf, sizeof(our_key_buf), "0x%llx",
-				(unsigned long long) our_key_val) < 0)
-			return_0;
-		log_debug("Our key verified on existing PVs: 0x%llx.",
-			  (unsigned long long) our_key_val);
-
-		/* The key file is an optimization; correct a stale value. */
-		if (!_read_key_file(cmd, vg, NULL, &file_key, NULL, NULL) ||
-		    (file_key != our_key_val)) {
-			if (!_write_key_file(cmd, vg, our_key_val))
-				log_warn("WARNING: Failed to update persist key file.");
-		}
-	} else {
-		if (vg_is_sanlock(vg))
-			local_key = NULL;
-
-		if (!local_key && !local_host_id) {
+	ret = _get_our_key_verified(cmd, vg, our_key_buf, &our_key_val);
+	if (ret <= 0) {
+		if (ret < 0)
 			log_error("No pr_key or host_id configured (see lvmlocal.conf).");
-			return 0;
-		}
-
-		if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, &our_key_val))
-			return_0;
+		return 0;
 	}
 
 	dm_list_iterate_items(devl, devs) {
@@ -3089,10 +3108,9 @@ int persist_vgextend_begin(struct cmd_context *cmd, struct volume_group *vg,
 int persist_vgextend_update(struct cmd_context *cmd, struct volume_group *vg,
 			    struct dm_list *devs)
 {
-	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
-	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
 	char global_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
+	int ret;
 
 	/*
 	 * Update the PR on newly extended devs.
@@ -3122,23 +3140,9 @@ int persist_vgextend_update(struct cmd_context *cmd, struct volume_group *vg,
 	 */
 	_global_pr_handed_off(cmd);
 
-	/* Remove the generation-zero keys before looking up the VG's key. */
-
-	/*
-	 * Select the key to start on the new devs: the key that vg_read's
-	 * REQUIRE check verified on the existing PVs (vg->pr_our_key), or
-	 * _get_our_key() (key file or device lookup) if it is unset.
-	 * persist_vgextend_begin() selects the same key, and this key is
-	 * used for cleanup on failure, so one key is used throughout.
-	 */
-	if (vg_is_sanlock(vg) && vg->pr_our_key) {
-		if (dm_snprintf(our_key_buf, sizeof(our_key_buf), "0x%llx",
-				(unsigned long long) vg->pr_our_key) < 0)
-			return_0;
-	} else {
-		if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, NULL))
-			return_0;
-	}
+	ret = _get_our_key_verified(cmd, vg, our_key_buf, NULL);
+	if (ret <= 0)
+		return 0;
 
 	/* Start again with a new key/mode. */
 	if (persist_vgextend_begin(cmd, vg, devs)) {
