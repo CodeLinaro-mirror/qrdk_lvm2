@@ -403,40 +403,6 @@ static int _raid_status_health_is_complete(const struct lv_segment *seg,
 }
 
 /*
- * HM Helper:
- *
- * report the kernel device count in @*kernel_devs and, of those devices,
- * how many are in sync in @*devs_in_sync.  lv_raid_status() returns a
- * status whose health string covers every device, so the characters can
- * be walked by device.
- */
-static int _get_dev_health(struct logical_volume *lv, uint32_t *kernel_devs,
-			   uint32_t *devs_in_sync)
-{
-	struct lv_status_raid *status;
-	struct dm_status_raid *raid;
-	unsigned d;
-
-	*devs_in_sync = 0;
-
-	if (!lv_raid_status(lv, &status)) {
-		log_error("Failed to get device health.");
-		return 0;
-	}
-
-	raid = status->raid;
-	*kernel_devs = raid->advertised_dev_count;
-
-	for (d = 0; d < raid->dev_count; d++)
-		if (raid->dev_health[d] == RAID_DEV_HEALTH_ALIVE)
-			(*devs_in_sync)++;
-
-	dm_pool_destroy(status->mem);
-
-	return 1;
-}
-
-/*
  * Retry a no-progress status with an exponential backoff -- 50, 100, 200,
  * 400 ms, ... -- for a ~3 s window in total.  The first probe is quick so an
  * already-completing transient is caught almost at once, while the doubling
@@ -570,6 +536,29 @@ _raid_stable_sync_percent(const struct logical_volume *lv,
 }
 
 /*
+ * Take the status observation an operation on @lv decides on.  The retries
+ * wait out a sync that has not started yet; the caller owns *@status on
+ * success.
+ */
+static int _raid_read_status(const struct logical_volume *lv,
+			     struct lv_status_raid **status)
+{
+	enum raid_read_result read_result;
+
+	read_result = _raid_status_read_stable(lv, first_seg(lv)->area_count, status);
+	if (read_result == RAID_READ_STUCK)
+		return_0;
+
+	if (read_result != RAID_READ_OK) {
+		log_error("Unable to determine sync status of %s.",
+			  display_lvname(lv));
+		return 0;
+	}
+
+	return 1;
+}
+
+/*
  * _raid_in_sync
  * @lv
  *
@@ -581,7 +570,7 @@ _raid_stable_sync_percent(const struct logical_volume *lv,
  */
 static int _raid_in_sync(const struct logical_volume *lv)
 {
-	enum raid_read_result read_result;
+	struct lv_status_raid *status;
 	dm_percent_t sync_percent;
 
 	if (seg_is_striped(first_seg(lv)))
@@ -596,19 +585,15 @@ static int _raid_in_sync(const struct logical_volume *lv)
 		}
 	} else {
 		/*
-		 * A single stable snapshot: _raid_status_read_stable()
-		 * waits out both the 0% in_sync transient (RHBZ 1210637)
-		 * and the idle-with-out-of-sync-legs ambiguity.
+		 * A single stable observation: _raid_read_status() waits out
+		 * both the 0% in_sync transient (RHBZ 1210637) and the
+		 * idle-with-out-of-sync-legs ambiguity.
 		 */
-		read_result = _raid_stable_sync_percent(lv, first_seg(lv)->area_count,
-							&sync_percent);
-		if (read_result != RAID_READ_OK) {
-			if (read_result == RAID_READ_ERROR)
-				log_error("Unable to determine sync status of %s.",
-					  display_lvname(lv));
-			/* RAID_READ_STUCK is already reported. */
-			return 0;
-		}
+		if (!_raid_read_status(lv, &status))
+			return_0;
+
+		sync_percent = status->in_sync;
+		dm_pool_destroy(status->mem);
 	}
 
 	return (sync_percent == DM_PERCENT_100) ? 1 : 0;
@@ -2193,32 +2178,38 @@ int lv_raid_free_reshape_space(const struct logical_volume *lv)
 /*
  * HM
  *
- * Compares current raid disk count of active RAID set @lv to
- * requested @dev_count returning synced disks in @devs_in_sync
- *
- * Returns:
- *
- * 	0: error
- * 	1: kernel dev count = @dev_count
- * 	2: kernel dev count < @dev_count
- * 	3: kernel dev count > @dev_count
- *
+ * Compares the raid disk count reported in @status to the requested
+ * @dev_count, returning in @devs_in_sync how many of the reported devices
+ * are in sync.  @status holds one health character per reported device,
+ * so the characters are walked by device.
  */
-static int _reshaped_state(struct logical_volume *lv, const unsigned dev_count,
-			   unsigned *devs_in_sync)
+enum raid_count_cmp {
+	RAID_COUNT_ERROR,	/* the counts could not be taken */
+	RAID_COUNT_EQUAL,	/* kernel dev count == @dev_count */
+	RAID_COUNT_LESS,	/* kernel dev count < @dev_count */
+	RAID_COUNT_MORE,	/* kernel dev count > @dev_count */
+};
+
+static enum raid_count_cmp
+_reshaped_state(const struct lv_status_raid *status,
+		const unsigned dev_count, unsigned *devs_in_sync)
 {
-	uint32_t kernel_devs;
+	const struct dm_status_raid *raid = status->raid;
+	uint32_t kernel_devs = raid->advertised_dev_count;
+	unsigned d;
 
 	if (!devs_in_sync)
-		return_0;
+		return RAID_COUNT_ERROR;
 
-	if (!_get_dev_health(lv, &kernel_devs, devs_in_sync))
-		return_0;
+	*devs_in_sync = 0;
+	for (d = 0; d < raid->dev_count; d++)
+		if (raid->dev_health[d] == RAID_DEV_HEALTH_ALIVE)
+			(*devs_in_sync)++;
 
 	if (kernel_devs == dev_count)
-		return 1;
+		return RAID_COUNT_EQUAL;
 
-	return kernel_devs < dev_count ? 2 : 3;
+	return kernel_devs < dev_count ? RAID_COUNT_LESS : RAID_COUNT_MORE;
 }
 
 /*
@@ -2285,46 +2276,37 @@ static int _reshape_adjust_to_size(struct logical_volume *lv,
 }
 
 /*
+ * Report a reshape confirmation the user declined: every step refuses the
+ * same way once it knows the answer, so only the LV is named here.
+ */
+static int _raid_reshape_declined(const struct logical_volume *lv)
+{
+	log_error("Logical volume %s NOT converted.", display_lvname(lv));
+
+	return 0;
+}
+
+/*
  * HM Helper:
  *
- * Reshape: add images to existing raid lv
+ * Reshape: warn about adding images to @lv and ask for confirmation.
  *
  */
-static int _lv_raid_change_image_count(struct logical_volume *lv, int yes, uint32_t new_count,
-				       struct dm_list *allocate_pvs, struct dm_list *removal_lvs,
-				       int commit, int use_existing_area_len);
-static int _raid_reshape_add_images(struct logical_volume *lv,
-				    const struct segment_type *new_segtype, int yes,
-				    uint32_t old_image_count, uint32_t new_image_count,
-				    const unsigned new_stripes, const unsigned new_stripe_size,
-				    struct dm_list *allocate_pvs)
+static int _raid_reshape_add_images_confirm(struct logical_volume *lv,
+					    const struct segment_type *new_segtype, int yes,
+					    uint32_t old_image_count, uint32_t new_image_count)
 {
-	uint32_t grown_le_count, current_le_count, s;
-	struct volume_group *vg;
-	struct logical_volume *slv;
+	uint32_t grown_le_count, current_le_count;
 	struct lv_segment *seg = first_seg(lv);
 	struct lvinfo info = { 0 };
 
-	if (new_image_count == old_image_count) {
-		log_error(INTERNAL_ERROR "No change of image count on LV %s.", display_lvname(lv));
-		return 0;
-	}
-
-	vg = lv->vg;
-
-	if (!lv_info(vg->cmd, lv, 0, &info, 1, 0) && driver_version(NULL, 0)) {
+	if (!lv_info(lv->vg->cmd, lv, 0, &info, 1, 0) && driver_version(NULL, 0)) {
 		log_error("lv_info failed: aborting.");
 		return 0;
 	}
 
 	if (seg->segtype != new_segtype)
 		log_print_unless_silent("Ignoring layout change on device adding reshape.");
-
-	if (seg_is_any_raid10(seg) && (new_image_count % seg->data_copies)) {
-		log_error("Can't reshape %s LV %s to odd number of stripes.",
-			  lvseg_name(seg), display_lvname(lv));
-		return 0;
-	}
 
 	if (!_lv_reshape_get_new_len(lv, old_image_count, new_image_count, &grown_le_count))
 		return_0;
@@ -2338,10 +2320,30 @@ static int _raid_reshape_add_images(struct logical_volume *lv,
 	log_print_unless_silent("Run \"lvresize -l%u %s\" to shrink it or use the additional capacity.",
 				current_le_count, display_lvname(lv));
 	if (!yes && yes_no_prompt("Are you sure you want to add %u images to %s LV %s? [y/n]: ",
-				  new_image_count - old_image_count, lvseg_name(seg), display_lvname(lv)) == 'n') {
-		log_error("Logical volume %s NOT converted.", display_lvname(lv));
-		return 0;
-	}
+				  new_image_count - old_image_count, lvseg_name(seg),
+				  display_lvname(lv)) == 'n')
+		return _raid_reshape_declined(lv);
+
+	return 1;
+}
+
+/*
+ * HM Helper:
+ *
+ * Reshape: add images to existing raid lv
+ *
+ */
+static int _lv_raid_change_image_count(struct logical_volume *lv, int yes, uint32_t new_count,
+				       struct dm_list *allocate_pvs, struct dm_list *removal_lvs,
+				       int commit, int use_existing_area_len);
+static int _raid_reshape_add_images(struct logical_volume *lv,
+				    uint32_t old_image_count, uint32_t new_image_count,
+				    const unsigned new_stripe_size,
+				    struct dm_list *allocate_pvs)
+{
+	uint32_t s;
+	struct logical_volume *slv;
+	struct lv_segment *seg = first_seg(lv);
 
 	/* raid10 new image allocation can't cope with allocated reshape space. */
 	if (seg_is_any_raid10(seg) && !_lv_free_reshape_space(lv))
@@ -2411,177 +2413,184 @@ static int _raid_reshape_add_images(struct logical_volume *lv,
 /*
  * HM Helper:
  *
- * Reshape: remove images from existing raid lv
+ * Reshape: warn about starting to remove images from @lv and ask for
+ * confirmation
  *
  */
-static int _raid_reshape_remove_images(struct logical_volume *lv,
-				       const struct segment_type *new_segtype,
-				       int yes, int force,
-				       uint32_t old_image_count, uint32_t new_image_count,
-				       const unsigned new_stripes, const unsigned new_stripe_size,
-				       struct dm_list *allocate_pvs, struct dm_list *removal_lvs)
+static int _raid_reshape_remove_images_confirm(struct logical_volume *lv,
+					       const struct segment_type *new_segtype,
+					       int yes, int force,
+					       uint32_t old_image_count, uint32_t new_image_count,
+					       const unsigned new_stripes)
 {
-	int stripe_size_changed;
-	uint32_t available_slvs, current_le_count, reduced_le_count, removed_slvs, s, stripe_size;
+	uint32_t current_le_count, reduced_le_count;
 	uint64_t extend_le_count;
-	unsigned devs_in_sync;
 	struct lv_segment *seg = first_seg(lv);
 	struct lvinfo info = { 0 };
 
-	stripe_size = seg->stripe_size;
-	stripe_size_changed = new_stripe_size && (stripe_size != new_stripe_size);
+	if (seg->segtype != new_segtype)
+		log_print_unless_silent("Ignoring layout change on device removing reshape.");
 
-	if (seg_is_any_raid6(seg) && new_stripes < 3) {
-		log_error("Minimum 3 stripes required for %s LV %s.",
-			  lvseg_name(seg), display_lvname(lv));
+	if (!lv_info(lv->vg->cmd, lv, 0, &info, 1, 0) && driver_version(NULL, 0)) {
+		log_error("lv_info failed: aborting.");
 		return 0;
 	}
 
-	if (new_image_count == old_image_count) {
-		log_error(INTERNAL_ERROR "No change of image count on LV %s.", display_lvname(lv));
+	if (!_lv_reshape_get_new_len(lv, old_image_count, new_image_count, &reduced_le_count))
+		return_0;
+
+	reduced_le_count -= seg->reshape_len * _data_rimages_count(seg, new_image_count);
+	current_le_count = lv->le_count - seg->reshape_len * _data_rimages_count(seg, old_image_count);
+	extend_le_count = (uint32_t)((uint64_t) current_le_count * current_le_count / reduced_le_count);
+	log_warn("WARNING: Removing stripes from active%s logical "
+		 "volume %s will shrink it from %s to %s!",
+		 info.open_count ? " and open" : "", display_lvname(lv),
+		 display_size(lv->vg->cmd, (uint64_t) current_le_count * lv->vg->extent_size),
+		 display_size(lv->vg->cmd, (uint64_t) reduced_le_count * lv->vg->extent_size));
+	log_warn("THIS MAY DESTROY (PARTS OF) YOUR DATA!");
+	if (!yes)
+		log_warn("Interrupt the conversion and run \"lvresize -y -l%u %s\" to "
+			 "keep the current size if not done already!",
+			 (uint32_t) extend_le_count, display_lvname(lv));
+	log_print_unless_silent("If that leaves the logical volume larger than %llu extents due to stripe rounding,",
+				(unsigned long long) extend_le_count);
+	log_print_unless_silent("you may want to grow the content afterwards (filesystem etc.)");
+	log_warn("WARNING: To remove freed stripes after the conversion has finished, you have to run \"lvconvert --stripes %u %s\".",
+		 new_stripes, display_lvname(lv));
+
+	if (!force) {
+		log_error("Can't remove stripes without --force option.");
 		return 0;
 	}
 
-	switch (_reshaped_state(lv, new_image_count, &devs_in_sync)) {
-	case 3:
-		/*
-		 * Disk removal reshape step 1:
-		 *
-		 * we got more disks active than requested via @new_stripes
-		 *
-		 * -> flag the ones to remove
-		 *
-		 */
-		if (seg->segtype != new_segtype)
-			log_print_unless_silent("Ignoring layout change on device removing reshape.");
+	if (!yes && yes_no_prompt("Are you sure you want to remove %u images from %s LV %s? [y/n]: ",
+				  old_image_count - new_image_count, lvseg_name(seg),
+				  display_lvname(lv)) == 'n')
+		return _raid_reshape_declined(lv);
 
-		if (!lv_info(lv->vg->cmd, lv, 0, &info, 1, 0) && driver_version(NULL, 0)) {
-			log_error("lv_info failed: aborting.");
-			return 0;
-		}
+	return 1;
+}
 
-		if (!_lv_reshape_get_new_len(lv, old_image_count, new_image_count, &reduced_le_count))
-			return_0;
+/*
+ * What a reshape does, decided by _raid_reshape_decide() before any prompt.
+ */
+enum raid_reshape_step {
+	RAID_RESHAPE_FREE_SPACE,	/* same layout: free the reshape space */
+	RAID_RESHAPE_ADD_IMAGES,	/* add stripes */
+	RAID_RESHAPE_REMOVE_IMAGES,	/* removal step 1: reshape onto fewer images */
+	RAID_RESHAPE_DROP_IMAGES,	/* removal step 2: drop the images freed by step 1 */
+	RAID_RESHAPE_KEEP_IMAGES,	/* layout or stripe size change */
+};
 
-		reduced_le_count -= seg->reshape_len * _data_rimages_count(seg, new_image_count);
-		current_le_count = lv->le_count - seg->reshape_len * _data_rimages_count(seg, old_image_count);
-		extend_le_count = (uint32_t)((uint64_t) current_le_count * current_le_count / reduced_le_count);
-		log_warn("WARNING: Removing stripes from active%s logical "
-			 "volume %s will shrink it from %s to %s!",
-			 info.open_count ? " and open" : "", display_lvname(lv),
-			 display_size(lv->vg->cmd, (uint64_t) current_le_count * lv->vg->extent_size),
-			 display_size(lv->vg->cmd, (uint64_t) reduced_le_count * lv->vg->extent_size));
-		log_warn("THIS MAY DESTROY (PARTS OF) YOUR DATA!");
-		if (!yes)
-			log_warn("Interrupt the conversion and run \"lvresize -y -l%u %s\" to "
-				 "keep the current size if not done already!",
-				 (uint32_t) extend_le_count, display_lvname(lv));
-		log_print_unless_silent("If that leaves the logical volume larger than %llu extents due to stripe rounding,",
-					(unsigned long long) extend_le_count);
-		log_print_unless_silent("you may want to grow the content afterwards (filesystem etc.)");
-		log_warn("WARNING: To remove freed stripes after the conversion has finished, you have to run \"lvconvert --stripes %u %s\".",
-			 new_stripes, display_lvname(lv));
-
-		if (!force) {
-			log_error("Can't remove stripes without --force option.");
-			return 0;
-		}
-
-		if (!yes && yes_no_prompt("Are you sure you want to remove %u images from %s LV %s? [y/n]: ",
-					  old_image_count - new_image_count, lvseg_name(seg), display_lvname(lv)) == 'n') {
-			log_error("Logical volume %s NOT converted.", display_lvname(lv));
-			return 0;
-		}
-
-		/*
-		 * Allocate backward out of place reshape space at the
-		 * _end_ of all data image LVs, because MD reshapes backwards
-		 * to remove disks from a raid set
-		 */
-		if (!_lv_alloc_reshape_space(lv, alloc_end, NULL, allocate_pvs))
-			return_0;
-
-		/* Flag all disks past new images as delta disks minus to kernel */
-		for (s = new_image_count; s < old_image_count; s++)
-			seg_lv(seg, s)->status |= LV_RESHAPE_DELTA_DISKS_MINUS;
-
-		if (seg_is_any_raid5(seg) && new_image_count == 2)
-			seg->data_copies = 2;
-
-		/* Define image removing reshape (used as SEGTYPE_FLAG to avoid incompatible activations on old runtime) */
-		lv ->status |= LV_RESHAPE;
-		break;
-
-	case 1:
-		/*
-		 * Disk removal reshape step 2:
-		 *
-		 * we got the proper (smaller) amount of devices active
-		 * for a previously finished disk removal reshape
-		 *
-		 * -> remove the freed up images and reduce LV size
-		 *
-		 */
-		if (!_get_available_removed_sublvs(lv, &available_slvs, &removed_slvs))
-			return_0;
-
-		if (devs_in_sync != new_image_count) {
-			log_error("No correct kernel/lvm active LV count on %s.", display_lvname(lv));
-			return 0;
-		}
-
-		if (available_slvs + removed_slvs != old_image_count) {
-			log_error("No correct kernel/lvm total LV count on %s.", display_lvname(lv));
-			return 0;
-		}
-
-		/* Reshape removing image component pairs -> change sizes accordingly */
-		if (!_reshape_adjust_to_size(lv, old_image_count, new_image_count)) {
-			log_error("Failed to adjust LV %s to new size!", display_lvname(lv));
-			return 0;
-		}
-
-		log_debug_metadata("Removing %u data and metadata image LV pair%s from %s.",
-				   old_image_count - new_image_count, old_image_count - new_image_count > 1 ? "s" : "",
-				   display_lvname(lv));
-		if (!_lv_raid_change_image_count(lv, 1, new_image_count, allocate_pvs, removal_lvs, 0, 0))
-			return_0;
-
-		seg->area_count = new_image_count;
-		break;
-
-	default:
-		log_error(INTERNAL_ERROR "Bad return provided to %s.", __func__);
-		return 0;
-	}
-
-	/* May allow stripe size changes > 2 legs */
+/*
+ * The stripe size a removal reshape leaves behind: a new size is kept only
+ * while more than 2 images remain, because a 1-stripe raid1 mapping keeps
+ * the size it had, and the size from before the phase is then put back.
+ */
+static void _raid_reshape_set_stripe_size(struct lv_segment *seg,
+					  uint32_t new_image_count,
+					  uint32_t stripe_size,
+					  const unsigned new_stripe_size)
+{
 	if (new_image_count > 2)
 		seg->stripe_size = new_stripe_size;
 	else {
 		seg->stripe_size = stripe_size;
-		if (stripe_size_changed)
+		if (new_stripe_size && (stripe_size != new_stripe_size))
 			log_warn("WARNING: Ignoring --stripesize on conversion of %s to 1 stripe.",
-				 display_lvname(lv));
+				 display_lvname(seg->lv));
 	}
+}
+
+/*
+ * Disk removal reshape step 1: reshape @lv onto fewer images.  The images
+ * past @new_image_count are flagged for removal and MD gets the space it
+ * needs to move the data backwards.
+ */
+static int _raid_reshape_remove_images(struct logical_volume *lv,
+				       uint32_t old_image_count, uint32_t new_image_count,
+				       const unsigned new_stripe_size,
+				       struct dm_list *allocate_pvs)
+{
+	uint32_t s, stripe_size;
+	struct lv_segment *seg = first_seg(lv);
+
+	stripe_size = seg->stripe_size;
+
+	/*
+	 * Allocate backward out of place reshape space at the _end_ of all
+	 * data image LVs, because MD reshapes backwards to remove disks
+	 * from a raid set.
+	 */
+	if (!_lv_alloc_reshape_space(lv, alloc_end, NULL, allocate_pvs))
+		return_0;
+
+	/* Flag all disks past new images as delta disks minus to kernel */
+	for (s = new_image_count; s < old_image_count; s++)
+		seg_lv(seg, s)->status |= LV_RESHAPE_DELTA_DISKS_MINUS;
+
+	if (seg_is_any_raid5(seg) && new_image_count == 2)
+		seg->data_copies = 2;
+
+	/* Define image removing reshape (used as SEGTYPE_FLAG to avoid incompatible activations on old runtime) */
+	lv->status |= LV_RESHAPE;
+
+	_raid_reshape_set_stripe_size(seg, new_image_count, stripe_size,
+				      new_stripe_size);
 
 	return 1;
 }
+
+/*
+ * Disk removal reshape step 2: the array runs on @new_image_count devices
+ * after a finished removal reshape, so drop the images it freed and reduce
+ * the LV to the smaller size.
+ */
+static int _raid_reshape_drop_images(struct logical_volume *lv,
+				     uint32_t old_image_count, uint32_t new_image_count,
+				     const unsigned new_stripe_size,
+				     struct dm_list *allocate_pvs,
+				     struct dm_list *removal_lvs)
+{
+	uint32_t stripe_size;
+	struct lv_segment *seg = first_seg(lv);
+
+	stripe_size = seg->stripe_size;
+
+	/* Reshape removing image component pairs -> change sizes accordingly */
+	if (!_reshape_adjust_to_size(lv, old_image_count, new_image_count)) {
+		log_error("Failed to adjust LV %s to new size!", display_lvname(lv));
+		return 0;
+	}
+
+	log_debug_metadata("Removing %u data and metadata image LV pair%s from %s.",
+				   old_image_count - new_image_count,
+				   old_image_count - new_image_count > 1 ? "s" : "",
+				   display_lvname(lv));
+	if (!_lv_raid_change_image_count(lv, 1, new_image_count, allocate_pvs,
+					 removal_lvs, 0, 0))
+		return_0;
+
+	seg->area_count = new_image_count;
+
+	_raid_reshape_set_stripe_size(seg, new_image_count, stripe_size,
+				      new_stripe_size);
+
+	return 1;
+}
+
 /*
  * HM Helper:
  *
- * Reshape: keep images in RAID @lv but change layout, stripe size or data copies
+ * Reshape: announce a layout, stripe size or data copies change of @lv and
+ * ask for confirmation
  *
  */
 static const char *_get_segtype_alias(const struct segment_type *segtype);
 static const char *_get_segtype_alias_str(const struct logical_volume *lv, const struct segment_type *segtype);
-static int _raid_reshape_keep_images(struct logical_volume *lv,
-				     const struct segment_type *new_segtype,
-				     int yes, int force, int *force_repair,
-				     const int new_data_copies, const unsigned new_stripe_size,
-				     struct dm_list *allocate_pvs)
+static int _raid_reshape_keep_images_confirm(struct logical_volume *lv,
+					     const struct segment_type *new_segtype, int yes)
 {
-	int alloc_reshape_space = 1;
 	struct lv_segment *seg = first_seg(lv);
 
 	if (seg->segtype != new_segtype)
@@ -2591,10 +2600,26 @@ static int _raid_reshape_keep_images(struct logical_volume *lv,
 					_get_segtype_alias_str(lv, new_segtype));
 
 	if (!yes && yes_no_prompt("Are you sure you want to convert %s LV %s? [y/n]: ",
-				  lvseg_name(seg), display_lvname(lv)) == 'n') {
-			log_error("Logical volume %s NOT converted.", display_lvname(lv));
-			return 0;
-	}
+				  lvseg_name(seg), display_lvname(lv)) == 'n')
+		return _raid_reshape_declined(lv);
+
+	return 1;
+}
+
+/*
+ * HM Helper:
+ *
+ * Reshape: keep images in RAID @lv but change layout, stripe size or data copies
+ *
+ */
+static int _raid_reshape_keep_images(struct logical_volume *lv,
+				     const struct segment_type *new_segtype,
+				     int force, int *force_repair,
+				     const int new_data_copies, const unsigned new_stripe_size,
+				     struct dm_list *allocate_pvs)
+{
+	int alloc_reshape_space = 1;
+	struct lv_segment *seg = first_seg(lv);
 
 	/*
 	 * Reshape layout algorithm or chunksize:
@@ -2781,6 +2806,197 @@ static void _warn_if_reshape_kernel_is_old(const struct logical_volume *lv)
 }
 
 /*
+ * A prompt can wait for any time while the array keeps changing.  Read the
+ * status of @lv again after the answer and refuse the operation when it
+ * differs from the observation the user confirmed in @confirmed: other
+ * devices, other health or sync action, or a lower sync ratio.  No change
+ * is judged harmless; running the command again decides on the new state.
+ *
+ * @confirmed stays owned by the caller and is not touched; the observation
+ * read here is released before returning.
+ */
+static int _raid_status_revalidate(const struct logical_volume *lv,
+				   const struct lv_status_raid *confirmed)
+{
+	struct lv_status_raid *current;
+	int r = 0;
+
+	if (!_raid_read_status(lv, &current))
+		return_0;
+
+	if (current->raid->dev_count != confirmed->raid->dev_count ||
+	    strcmp(current->raid->dev_health, confirmed->raid->dev_health) ||
+	    strcmp(current->raid->sync_action, confirmed->raid->sync_action) ||
+	    current->in_sync < confirmed->in_sync) {
+		log_error("RAID LV %s changed while waiting for confirmation "
+			  "(health %s -> %s, sync action %s -> %s).",
+			  display_lvname(lv),
+			  confirmed->raid->dev_health, current->raid->dev_health,
+			  confirmed->raid->sync_action, current->raid->sync_action);
+		log_error("Run the command again to check the new state.");
+		goto out;
+	}
+
+	r = 1;
+out:
+	dm_pool_destroy(current->mem);
+
+	return r;
+}
+
+/*
+ * Decide from @status and the metadata of @lv which step a reshape takes,
+ * and refuse one the array cannot take now.  The in-sync gate, the kernel
+ * device count and the in-sync device count all come from the one
+ * observation, so a device failing between two reads cannot make them
+ * disagree.
+ */
+static int _raid_reshape_decide(struct logical_volume *lv,
+				const struct lv_status_raid *status,
+				const struct segment_type *new_segtype,
+				const unsigned new_data_copies,
+				const unsigned new_region_size,
+				const unsigned new_stripes,
+				const unsigned new_stripe_size,
+				enum raid_reshape_step *step)
+{
+	int too_few = 0;
+	unsigned devs_in_sync;
+	uint32_t available_slvs, removed_slvs;
+	struct lv_segment *seg = first_seg(lv);
+	uint32_t old_image_count = seg->area_count;
+	uint32_t new_image_count = new_stripes + seg->segtype->parity_devs;
+
+	if (status->in_sync != DM_PERCENT_100) {
+		log_error("Unable to convert %s while it is not in-sync.",
+			  display_lvname(lv));
+		return 0;
+	}
+
+	/* Prevent any new reshape request on RaidLV with existing freed stripes resulting from a previous one. */
+	if (!_get_available_removed_sublvs(lv, &available_slvs, &removed_slvs))
+		return_0;
+
+	if (removed_slvs &&
+	    !_same_layout(seg, new_segtype, new_data_copies, new_region_size,
+			  old_image_count, new_image_count + removed_slvs, new_stripe_size)) {
+		log_error("Unable to convert %s containing sub LVs to remove after a reshape.",
+			  display_lvname(lv));
+		log_error("Run \"lvconvert --stripes %" PRIu32 " %s\" first.",
+			  seg->area_count - removed_slvs - 1, display_lvname(lv));
+		return 0;
+	}
+
+	/*
+	 * No change in segment type, image count, region or stripe size has been requested ->
+	 * user requests this to remove any reshape space from the @lv
+	 */
+	if (_same_layout(seg, new_segtype, new_data_copies, new_region_size, old_image_count, new_image_count, new_stripe_size)) {
+		*step = RAID_RESHAPE_FREE_SPACE;
+		return 1;
+	}
+
+	/* raid4/5 with N image component pairs (i.e. N-1 stripes): allow for raid4/5 reshape to 2 devices, i.e. raid1 layout */
+	if (seg_is_raid4(seg) || seg_is_any_raid5(seg)) {
+		if (new_stripes < 1)
+			too_few = 1;
+
+	/* raid6 (raid10 can't shrink reshape) device count: check for 2 stripes minimum */
+	} else if (new_stripes < 2)
+		too_few = 1;
+
+	if (too_few) {
+		log_error("Too few stripes requested.");
+		return 0;
+	}
+
+	switch (_reshaped_state(status, old_image_count, &devs_in_sync)) {
+	case RAID_COUNT_EQUAL:
+		/*
+		 * old_image_count == kernel_dev_count
+		 *
+		 * Check for device health
+		 */
+		if (devs_in_sync < old_image_count) {
+			log_error("Can't reshape out of sync LV %s.", display_lvname(lv));
+			return 0;
+		}
+
+		/* device count and health are good -> ready to go */
+		break;
+
+	case RAID_COUNT_LESS:
+		if (devs_in_sync == new_image_count)
+			break;
+
+		/* Possible after a shrinking reshape and forgotten device removal */
+		log_error("Device count is incorrect. "
+			  "Forgotten \"lvconvert --stripes %u %s\" to remove %u images after reshape?",
+			  devs_in_sync - seg->segtype->parity_devs, display_lvname(lv),
+			  old_image_count - devs_in_sync);
+		return 0;
+
+	default:
+		log_error(INTERNAL_ERROR "Unexpected device count relation in %s.",
+			  __func__);
+		return 0;
+	}
+
+	/* Handle disk addition reshaping */
+	if (old_image_count < new_image_count) {
+		if (seg_is_any_raid10(seg) && (new_image_count % seg->data_copies)) {
+			log_error("Can't reshape %s LV %s to odd number of stripes.",
+				  lvseg_name(seg), display_lvname(lv));
+			return 0;
+		}
+
+		*step = RAID_RESHAPE_ADD_IMAGES;
+
+	/* Handle disk removal reshaping */
+	} else if (old_image_count > new_image_count) {
+		if (seg_is_any_raid6(seg) && new_stripes < 3) {
+			log_error("Minimum 3 stripes required for %s LV %s.",
+				  lvseg_name(seg), display_lvname(lv));
+			return 0;
+		}
+
+		switch (_reshaped_state(status, new_image_count, &devs_in_sync)) {
+		case RAID_COUNT_MORE:
+			/* More disks active than requested: start the reshape. */
+			*step = RAID_RESHAPE_REMOVE_IMAGES;
+			break;
+
+		case RAID_COUNT_EQUAL:
+			/* A finished removal reshape: drop the images it freed. */
+			if (devs_in_sync != new_image_count) {
+				log_error("No correct kernel/lvm active LV count on %s.", display_lvname(lv));
+				return 0;
+			}
+
+			if (available_slvs + removed_slvs != old_image_count) {
+				log_error("No correct kernel/lvm total LV count on %s.", display_lvname(lv));
+				return 0;
+			}
+
+			*step = RAID_RESHAPE_DROP_IMAGES;
+			break;
+
+		default:
+			log_error(INTERNAL_ERROR "Bad return provided to %s.", __func__);
+			return 0;
+		}
+
+	/*
+	 * Handle raid set layout reshaping w/o changing # of legs (allocation algorithm or stripe size change)
+	 * (e.g. raid5_ls -> raid5_n or stripe size change)
+	 */
+	} else
+		*step = RAID_RESHAPE_KEEP_IMAGES;
+
+	return 1;
+}
+
+/*
  * Reshape logical volume @lv by adding/removing stripes
  * (absolute new stripes given in @new_stripes), changing
  * layout (e.g. raid5_ls -> raid5_ra) or changing
@@ -2788,6 +3004,13 @@ static void _warn_if_reshape_kernel_is_old(const struct logical_volume *lv)
  *
  * In case of disk addition, any PVs listed in mandatory
  * @allocate_pvs will be used for allocation of new stripes.
+ *
+ * The reshape is decided, confirmed, then carried out.  The decision is
+ * taken on one observation before any prompt, so a refused reshape is
+ * never asked about; after a prompt _raid_status_revalidate() refuses it
+ * when the array changed meanwhile.  The observation describes the table
+ * loaded before the reshape, so it is not consulted after the first
+ * reload.
  */
 static int _raid_reshape(struct logical_volume *lv,
 			 const struct segment_type *new_segtype,
@@ -2798,11 +3021,13 @@ static int _raid_reshape(struct logical_volume *lv,
 			 const unsigned new_stripe_size,
 			 struct dm_list *allocate_pvs)
 {
-	int force_repair = 0, r, too_few = 0;
-	unsigned devs_in_sync;
-	uint32_t available_slvs, removed_slvs, new_image_count, old_image_count;
+	int asks = !yes;
+	int force_repair = 0, r = 0;
+	uint32_t new_image_count, old_image_count;
 	enum alloc_where where_it_was = alloc_none;
+	enum raid_reshape_step step;
 	struct lv_segment *seg = first_seg(lv);
+	struct lv_status_raid *status = NULL;
 	struct dm_list removal_lvs;
 
 	if (!seg_is_reshapable_raid(seg))
@@ -2830,100 +3055,12 @@ static int _raid_reshape(struct logical_volume *lv,
 	if (!_check_region_size_constraints(lv, new_segtype, new_region_size, new_stripe_size))
 		return_0;
 
-	if (!_raid_in_sync(lv)) {
-		log_error("Unable to convert %s while it is not in-sync.",
-			  display_lvname(lv));
-		return 0;
-	}
-
-	/* Prevent any new reshape request on RaidLV with existing freed stripes resulting from a previous one. */
-	if (!_get_available_removed_sublvs(lv, &available_slvs, &removed_slvs))
+	if (!_raid_read_status(lv, &status))
 		return_0;
 
-	if (removed_slvs &&
-	    !_same_layout(seg, new_segtype, new_data_copies, new_region_size,
-			  old_image_count, new_image_count + removed_slvs, new_stripe_size)) {
-		log_error("Unable to convert %s containing sub LVs to remove after a reshape.",
-			  display_lvname(lv));
-		log_error("Run \"lvconvert --stripes %" PRIu32 " %s\" first.",
-			  seg->area_count - removed_slvs - 1, display_lvname(lv));
-		return 0;
-	}
-
-	lv->status &= ~LV_RESHAPE; /* Reset any reshaping segtype flag */
-
-	dm_list_init(&removal_lvs);
-
-	/* No change in layout requested ? */
-	if (_same_layout(seg, new_segtype, new_data_copies, new_region_size, old_image_count, new_image_count, new_stripe_size)) {
-		/*
-		 * No change in segment type, image count, region or stripe size has been requested ->
-		 * user requests this to remove any reshape space from the @lv
-		 */
-		if (!_lv_free_reshape_space_with_status(lv, &where_it_was)) {
-			log_error(INTERNAL_ERROR "Failed to free reshape space of %s.",
-				  display_lvname(lv));
-			return 0;
-		}
-
-		log_print_unless_silent("No change in RAID LV %s layout, freeing reshape space.", display_lvname(lv));
-
-		if (where_it_was == alloc_none) {
-			log_error("LV %s does not have reshape space allocated.",
-				  display_lvname(lv));
-			return 0;
-		}
-
-		if (!_lv_update_reload_fns_reset_eliminate_lvs(lv, 0, NULL, NULL))
-			return_0;
-
-		return 1;
-	}
-
-	/* raid4/5 with N image component pairs (i.e. N-1 stripes): allow for raid4/5 reshape to 2 devices, i.e. raid1 layout */
-	if (seg_is_raid4(seg) || seg_is_any_raid5(seg)) {
-		if (new_stripes < 1)
-			too_few = 1;
-
-	/* raid6 (raid10 can't shrink reshape) device count: check for 2 stripes minimum */
-	} else if (new_stripes < 2)
-		too_few = 1;
-
-	if (too_few) {
-		log_error("Too few stripes requested.");
-		return 0;
-	}
-
-	switch ((r = _reshaped_state(lv, old_image_count, &devs_in_sync))) {
-	case 1:
-		/*
-		 * old_image_count == kernel_dev_count
-		 *
-		 * Check for device health
-		 */
-		if (devs_in_sync < old_image_count) {
-			log_error("Can't reshape out of sync LV %s.", display_lvname(lv));
-			return 0;
-		}
-
-		/* device count and health are good -> ready to go */
-		break;
-
-	case 2:
-		if (devs_in_sync == new_image_count)
-			break;
-
-		/* Possible after a shrinking reshape and forgotten device removal */
-		log_error("Device count is incorrect. "
-			  "Forgotten \"lvconvert --stripes %u %s\" to remove %u images after reshape?",
-			  devs_in_sync - seg->segtype->parity_devs, display_lvname(lv),
-			  old_image_count - devs_in_sync);
-		return 0;
-
-	default:
-		log_error(INTERNAL_ERROR "Bad return=%d provided to %s.", r, __func__);
-		return 0;
-	}
+	if (!_raid_reshape_decide(lv, status, new_segtype, new_data_copies, new_region_size,
+				  new_stripes, new_stripe_size, &step))
+		goto_out;
 
 	if (seg->stripe_size != new_stripe_size)
 		log_print_unless_silent("Converting stripesize %s of %s LV %s to %s.",
@@ -2931,29 +3068,86 @@ static int _raid_reshape(struct logical_volume *lv,
 					lvseg_name(seg), display_lvname(lv),
 					display_size(lv->vg->cmd, new_stripe_size));
 
-	/* raid4/5 with N image component pairs (i.e. N-1 stripes): allow for raid4/5 reshape to 2 devices, i.e. raid1 layout */
-	/* Handle disk addition reshaping */
-	if (old_image_count < new_image_count) {
-		if (!_raid_reshape_add_images(lv, new_segtype, yes,
-					      old_image_count, new_image_count,
-					      new_stripes, new_stripe_size, allocate_pvs))
-			return_0;
-
-	/* Handle disk removal reshaping */
-	} else if (old_image_count > new_image_count) {
-		if (!_raid_reshape_remove_images(lv, new_segtype, yes, force,
-						 old_image_count, new_image_count,
-						 new_stripes, new_stripe_size,
-						 allocate_pvs, &removal_lvs))
-			return_0;
+	switch (step) {
+	case RAID_RESHAPE_ADD_IMAGES:
+		if (!_raid_reshape_add_images_confirm(lv, new_segtype, yes,
+						      old_image_count, new_image_count))
+			goto_out;
+		break;
+	case RAID_RESHAPE_REMOVE_IMAGES:
+		if (!_raid_reshape_remove_images_confirm(lv, new_segtype, yes, force,
+							 old_image_count, new_image_count,
+							 new_stripes))
+			goto_out;
+		break;
+	case RAID_RESHAPE_KEEP_IMAGES:
+		if (!_raid_reshape_keep_images_confirm(lv, new_segtype, yes))
+			goto_out;
+		break;
+	case RAID_RESHAPE_FREE_SPACE:
+	case RAID_RESHAPE_DROP_IMAGES:
+		asks = 0;	/* Nothing to confirm. */
+		break;
+	default:
+		log_error(INTERNAL_ERROR "Unknown reshape step provided to %s.",
+			  __func__);
+		goto out;
+	}
 
 	/*
-	 * Handle raid set layout reshaping w/o changing # of legs (allocation algorithm or stripe size change)
-	 * (e.g. raid5_ls -> raid5_n or stripe size change)
+	 * A step that asked must not act on a state the user did not see;
+	 * the other steps act on the observation the decision was made on.
 	 */
-	} else if (!_raid_reshape_keep_images(lv, new_segtype, yes, force, &force_repair,
-					      new_data_copies, new_stripe_size, allocate_pvs))
-		return_0;
+	if (asks && !_raid_status_revalidate(lv, status))
+		goto_out;
+
+	lv->status &= ~LV_RESHAPE; /* Reset any reshaping segtype flag */
+
+	dm_list_init(&removal_lvs);
+
+	switch (step) {
+	case RAID_RESHAPE_FREE_SPACE:
+		/* No change in layout requested: free the reshape space. */
+		if (!_lv_free_reshape_space_with_status(lv, &where_it_was)) {
+			log_error(INTERNAL_ERROR "Failed to free reshape space of %s.",
+				  display_lvname(lv));
+			goto out;
+		}
+
+		log_print_unless_silent("No change in RAID LV %s layout, freeing reshape space.", display_lvname(lv));
+
+		if (where_it_was == alloc_none) {
+			log_error("LV %s does not have reshape space allocated.",
+				  display_lvname(lv));
+			goto out;
+		}
+
+		if (!_lv_update_reload_fns_reset_eliminate_lvs(lv, 0, NULL, NULL))
+			goto_out;
+
+		r = 1;
+		goto out;
+	case RAID_RESHAPE_ADD_IMAGES:
+		if (!_raid_reshape_add_images(lv, old_image_count, new_image_count,
+					      new_stripe_size, allocate_pvs))
+			goto_out;
+		break;
+	case RAID_RESHAPE_REMOVE_IMAGES:
+		if (!_raid_reshape_remove_images(lv, old_image_count, new_image_count,
+						 new_stripe_size, allocate_pvs))
+			goto_out;
+		break;
+	case RAID_RESHAPE_DROP_IMAGES:
+		if (!_raid_reshape_drop_images(lv, old_image_count, new_image_count,
+					       new_stripe_size, allocate_pvs,
+					       &removal_lvs))
+			goto_out;
+		break;
+	case RAID_RESHAPE_KEEP_IMAGES:
+		if (!_raid_reshape_keep_images(lv, new_segtype, force, &force_repair,
+					       new_data_copies, new_stripe_size, allocate_pvs))
+			goto_out;
+	}
 
 	/*
 	 * A reshape re-lays-out all of the array data, so the areas an LV
@@ -2982,12 +3176,17 @@ static int _raid_reshape(struct logical_volume *lv,
 
 	if (seg->area_count != 2 || old_image_count != seg->area_count) {
 		if (!_lv_update_reload_fns_reset_eliminate_lvs(lv, 0, &removal_lvs, NULL))
-			return_0;
+			goto_out;
 	} else if (!_vg_write_commit_backup(lv->vg))
-		return_0;
+		goto_out;
 
-	return 1;
+	r = 1;
 	/* FIXME force_repair ? _lv_cond_repair(lv) : 1; */
+out:
+	if (status)
+		dm_pool_destroy(status->mem);
+
+	return r;
 }
 
 /*
@@ -3912,8 +4111,7 @@ static int _raid_remove_images(struct logical_volume *lv, int yes,
 			return 0;
 		}
 
-		if (_raid_status_read_stable(lv, seg->area_count,
-					     &raid_status) != RAID_READ_OK)
+		if (!_raid_read_status(lv, &raid_status))
 			return_0;
 
 		raid = raid_status->raid;
