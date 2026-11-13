@@ -1046,10 +1046,15 @@ static int _create_sanlock_lv(struct cmd_context *cmd, struct volume_group *vg,
 
 static int _remove_sanlock_lv(struct cmd_context *cmd, struct volume_group *vg)
 {
-	if (!lv_remove(vg->sanlock_lv)) {
-		log_error("Failed to remove sanlock LV %s/%s", vg->name, vg->sanlock_lv->name);
+	struct logical_volume *lv = vg->sanlock_lv;
+
+	if (!lv_remove(lv)) {
+		log_error("Failed to remove sanlock LV %s/%s", vg->name, lv->name);
 		return 0;
 	}
+
+	/* Don't leave vg->sanlock_lv pointing to an LV removed from the VG. */
+	vg->sanlock_lv = NULL;
 
 	log_debug("sanlock lvmlock LV removed");
 	return 1;
