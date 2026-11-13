@@ -805,18 +805,26 @@ static int _print_lvs(struct formatter *f, struct volume_group *vg)
 	outf(f, "logical_volumes {");
 	_inc_indent(f);
 
+	/* Write sanlock lvmlock LV first to optimize label_scan vgsummary parsing which looks for it. */
+	dm_list_iterate_items(lvl, &vg->lvs) {
+		if (!(lv_is_lockd_sanlock_lv(lvl->lv)))
+			continue;
+		if (!_print_lv(f, lvl->lv))
+			return_0;
+	}
+
 	/*
-	 * Write visible LVs first
+	 * Write visible LVs before hidden LVs.
 	 */
 	dm_list_iterate_items(lvl, &vg->lvs) {
-		if (!(lv_is_visible(lvl->lv)))
+		if (!(lv_is_visible(lvl->lv)) || lv_is_lockd_sanlock_lv(lvl->lv))
 			continue;
 		if (!_print_lv(f, lvl->lv))
 			return_0;
 	}
 
 	dm_list_iterate_items(lvl, &vg->lvs) {
-		if ((lv_is_visible(lvl->lv)))
+		if ((lv_is_visible(lvl->lv)) || lv_is_lockd_sanlock_lv(lvl->lv))
 			continue;
 		if (!_print_lv(f, lvl->lv))
 			return_0;
