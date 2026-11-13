@@ -135,6 +135,9 @@ int unlink_lv_from_vg(struct logical_volume *lv)
 	if ((lv->status & LV_REMOVED))
 		return_0;
 
+	if (lv->vg->sanlock_lv == lv)
+		lv->vg->sanlock_lv = NULL;
+
 	dm_list_move(&lv->vg->removed_lvs, &lv->lvl.list);
 	lv->status |= LV_REMOVED;
 
