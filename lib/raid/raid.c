@@ -447,8 +447,9 @@ static int _raid_target_percent(void **target_state,
 }
 
 static int _raid_transient_status(struct dm_pool *mem,
-				  struct lv_segment *seg,
-				  char *params)
+				  const struct dm_info *dminfo,
+				  const struct lv_segment *seg,
+				  const char *params)
 {
 	int failed = 0, r = 0;
 	unsigned i;
@@ -457,7 +458,7 @@ static int _raid_transient_status(struct dm_pool *mem,
 
 	log_debug("Raid transient status %s.", params);
 
-	if (!dm_get_status_raid(mem, params, &sr))
+	if (!raid_get_status(mem, dminfo, seg, params, &sr))
 		return_0;
 
 	if (!raid_status_covers_segment(seg, sr))
@@ -524,7 +525,6 @@ static int _raid_target_present(struct cmd_context *cmd,
 		{ 1, 7, 0, RAID_FEATURE_RAID0, SEG_TYPE_NAME_RAID0 },
 		{ 1, 9, 0, RAID_FEATURE_SHRINK, "shrinking" },
 		{ 1, 9, 0, RAID_FEATURE_NEW_DEVICES_ACCEPT_REBUILD, "rebuild+emptymeta" },
-		{ 1, 9, 2, RAID_FEATURE_FIXED_HEALTH_CHARS, "fixedhealthchars" },
 		{ 1, 12, 0, RAID_FEATURE_RESHAPE, "reshaping" },
 		{ 1, 14, 0, RAID_FEATURE_REBUILD_KEEPS_RECOVERY, "rebuildkeepsrecovery" },
 		{ 1, 15, 0, RAID_FEATURE_EXTEND_RESYNC, "extendresync" },

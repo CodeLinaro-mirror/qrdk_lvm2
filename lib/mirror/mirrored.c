@@ -189,7 +189,10 @@ static int _mirrored_target_percent(void **target_state,
 	return 1;
 }
 
-static int _mirrored_transient_status(struct dm_pool *mem, struct lv_segment *seg, char *params)
+static int _mirrored_transient_status(struct dm_pool *mem,
+				      const struct dm_info *dminfo,
+				      const struct lv_segment *seg,
+				      const char *params)
 {
 	struct dm_status_mirror *sm;
 	struct logical_volume *log;

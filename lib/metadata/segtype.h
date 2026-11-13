@@ -266,7 +266,9 @@ struct segtype_handler {
 				uint32_t *pvmove_mirror_count);
 	int (*target_status_compatible) (const char *type);
 	int (*check_transient_status) (struct dm_pool *mem,
-				       struct lv_segment *seg, char *params);
+				       const struct dm_info *dminfo,
+				       const struct lv_segment *seg,
+				       const char *params);
 	int (*target_percent) (void **target_state,
 			       dm_percent_t *percent,
 			       struct dm_pool * mem,
@@ -329,7 +331,6 @@ struct segment_type *init_unknown_segtype(struct cmd_context *cmd,
  * certain the new behavior exists is to check for version 1.9.0.
  */
 #define RAID_FEATURE_NEW_DEVICES_ACCEPT_REBUILD	(1U << 6) /* version 1.9.0 */
-#define RAID_FEATURE_FIXED_HEALTH_CHARS		(1U << 7) /* version 1.9.2 stale health chars fixed */
 /*
  * RAID_FEATURE_REBUILD_KEEPS_RECOVERY
  * dm-raid keeps the array's recovery progress when a reload carries

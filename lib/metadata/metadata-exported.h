@@ -1333,6 +1333,10 @@ int lv_raid_change_region_size(struct logical_volume *lv,
                                int yes, int force, uint32_t new_region_size);
 int raid_status_covers_segment(const struct lv_segment *seg,
 			       const struct dm_status_raid *status);
+int raid_area_has_device(const struct lv_segment *seg, uint32_t s);
+int raid_get_status(struct dm_pool *mem, const struct dm_info *info,
+		    const struct lv_segment *seg, const char *params,
+		    struct dm_status_raid **status);
 int lv_raid_can_resize(const struct logical_volume *lv);
 int lv_raid_in_sync(const struct logical_volume *lv);
 uint32_t lv_raid_data_copies(const struct segment_type *segtype, uint32_t area_count);

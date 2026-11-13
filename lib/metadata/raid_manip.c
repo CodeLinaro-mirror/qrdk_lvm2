@@ -365,11 +365,12 @@ static int _deactivate_and_remove_lvs(struct volume_group *vg, struct dm_list *r
  * Succeed if @status carries one health character per device the target
  * reports.
  *
- * dm-raid before Linux 4.11 lists health characters only for the devices
- * still in the array, while the #devs field counts every slot, which makes
- * the characters unmappable to slots.  Linux 4.11 and later report a slot
- * without a device as '-' and one character per slot, so a count mismatch
- * can only come from such an older target, and it is refused.
+ * A status obtained with dm_get_status_raid_aligned() always passes: libdm
+ * fails instead of returning a string it could not align.  A status parsed
+ * from the STATUS line alone can be short, because dm-raid before Linux
+ * 4.11 lists health characters only for the devices still in the array
+ * while the #devs field counts every slot.  Such a status is refused here
+ * rather than indexed by slot.
  */
 static int _raid_status_health_is_complete(const struct lv_segment *seg,
 					   const struct dm_status_raid *status)
@@ -650,6 +651,58 @@ int raid_status_covers_segment(const struct lv_segment *seg,
 			  seg->area_count, status->dev_count);
 		return 0;
 	}
+
+	return 1;
+}
+
+/*
+ * Answer whether area @s gets a device in the raid table.  The table
+ * passes '- -' for an area with no device: an unassigned area, or an
+ * image that has temporarily been extracted from the array and is kept
+ * visible and read-only so that its changes stay tracked.
+ */
+int raid_area_has_device(const struct lv_segment *seg, uint32_t s)
+{
+	const struct logical_volume *lv;
+
+	if (seg_type(seg, s) == AREA_UNASSIGNED)
+		return 0;
+
+	if (seg_type(seg, s) != AREA_LV || !(lv = seg_lv(seg, s)))
+		return 1;
+
+	return !lv_is_visible(lv) || (lv->status & LVM_WRITE);
+}
+
+/*
+ * Parse and align a RAID status, then use metadata to distinguish a slot
+ * deliberately passed as '- -' from a device released by dm-raid before
+ * 1.9.2.  Both appear as '-' after alignment; mark the latter as 'D'.
+ *
+ * The test asks the metadata as it stands now, so the answer is only as
+ * right as the assumption that the metadata still describes the loaded
+ * table; an area that changed without a reload can land on the wrong
+ * side.  Alignment guarantees one character per kernel slot, not per
+ * metadata area; callers indexing by area must check the counts.
+ */
+int raid_get_status(struct dm_pool *mem, const struct dm_info *info,
+		    const struct lv_segment *seg, const char *params,
+		    struct dm_status_raid **status)
+{
+	uint32_t s;
+	struct dm_status_raid *raid;
+
+	if (!status)
+		return_0;
+
+	if (!dm_get_status_raid_aligned(mem, info, params, status))
+		return_0;
+
+	raid = *status;
+	for (s = 0; s < raid->dev_count && s < seg->area_count; s++)
+		if ((raid->dev_health[s] == '-') &&
+		    raid_area_has_device(seg, s))
+			raid->dev_health[s] = 'D';
 
 	return 1;
 }
