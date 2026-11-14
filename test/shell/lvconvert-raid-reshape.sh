@@ -220,8 +220,8 @@ fi
 # -> check takeover request gets rejected
 not lvconvert --yes --type striped $vg/$lv1
 not lvconvert --yes --type raid0 $vg/$lv1
-not lvconvert --yes --type "$DM_DEV_DIR/raid0_meta $vg/$lv1"
-not lvconvert --yes --type "$DM_DEV_DIR/raid6 $vg/$lv1"
+not lvconvert --yes --type raid0_meta $vg/$lv1
+not lvconvert --yes --type raid6 $vg/$lv1
 # Remove the freed SubLVs
 _reshape_layout raid5_ls 4 5 $vg $lv1 --stripes 4
 
