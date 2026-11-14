@@ -2287,6 +2287,20 @@ static int _raid_reshape_declined(const struct logical_volume *lv)
 }
 
 /*
+ * Report a conversion confirmation the user declined: every conversion
+ * refuses the same way.  The caller still owns the observation it
+ * decided on and releases it, so the name says all this function does.
+ */
+static int _raid_conversion_declined(const struct logical_volume *lv,
+				     const char *segtype)
+{
+	log_error("Logical volume %s NOT converted to \"%s\".",
+		  display_lvname(lv), segtype);
+
+	return 0;
+}
+
+/*
  * HM Helper:
  *
  * Reshape: warn about adding images to @lv and ask for confirmation.
@@ -3728,9 +3742,9 @@ static int _raid_allow_extraction(struct logical_volume *lv,
 
 	/*
 	 * The caller has already established the array is fully in sync
-	 * (e.g. the split path called _raid_in_sync()), so the read can be
-	 * skipped.  A requested observation is still taken for: the caller
-	 * explicitly asked for it, so the read is not optional.
+	 * (e.g. the split path read it in _raid_split_confirm()), so the
+	 * read can be skipped.  A requested observation is still taken for:
+	 * the caller explicitly asked for it, so the read is not optional.
 	 */
 	if (known_in_sync && !out_status)
 		return 1;
@@ -4111,6 +4125,11 @@ static int _raid_remove_images(struct logical_volume *lv, int yes,
 			return 0;
 		}
 
+		if (lv_raid_has_integrity(lv)) {
+			log_error("Integrity must be removed before converting raid to linear.");
+			return 0;
+		}
+
 		if (!_raid_read_status(lv, &raid_status))
 			return_0;
 
@@ -4144,6 +4163,21 @@ static int _raid_remove_images(struct logical_volume *lv, int yes,
 			goto bad;
 		}
 
+		/*
+		 * The image kept is chosen above; a leg failing while the
+		 * prompt waits would leave the LV linear on a dead device.
+		 */
+		if (!yes) {
+			if (yes_no_prompt("Are you sure you want to convert %s LV %s to type %s losing all resilience? [y/n]: ",
+					  lvseg_name(seg), display_lvname(lv), SEG_TYPE_NAME_LINEAR) == 'n') {
+				dm_pool_destroy(raid_status->mem);
+				return _raid_conversion_declined(lv, SEG_TYPE_NAME_LINEAR);
+			}
+
+			if (!_raid_status_revalidate(lv, raid_status))
+				goto_bad;
+		}
+
 		dm_pool_destroy(raid_status->mem);
 	}
 
@@ -4167,17 +4201,6 @@ static int _raid_remove_images(struct logical_volume *lv, int yes,
 
 	/* Convert to linear? */
 	if (new_count == 1) {
-		if (lv_raid_has_integrity(lv)) {
-			log_error("Integrity must be removed before converting raid to linear.");
-			return 0;
-		}
-
-		if (!yes && yes_no_prompt("Are you sure you want to convert %s LV %s to type %s losing all resilience? [y/n]: ",
-					  lvseg_name(first_seg(lv)), display_lvname(lv), SEG_TYPE_NAME_LINEAR) == 'n') {
-			log_error("Logical volume %s NOT converted to \"%s\".",
-				  display_lvname(lv), SEG_TYPE_NAME_LINEAR);
-			return 0;
-		}
 		if (!_raid_remove_top_layer(lv, removal_lvs)) {
 			log_error("Failed to remove RAID layer "
 				  "after linear conversion.");
@@ -4333,6 +4356,53 @@ int lv_raid_change_image_count(struct logical_volume *lv, int yes, uint32_t new_
 	return _lv_raid_change_image_count(lv, yes, new_count, allocate_pvs, NULL, 1, 0);
 }
 
+/*
+ * Check that raid1 @lv can give up an image by a split, with @track_changes
+ * set by a split that tracks changes: the array is in sync and, when the
+ * split costs the resilience of a 2-legged raid1, the user confirmed it on
+ * an array that did not change while the prompt waited.
+ */
+static int _raid_split_confirm(const struct logical_volume *lv, int yes,
+			       int track_changes)
+{
+	const char *and_track = track_changes ? " and track" : "";
+	const char *loss = track_changes
+			   ? "resilience for newly written data"
+			   : "all resilience";
+	struct lv_segment *seg = first_seg(lv);
+	struct lv_status_raid *status;
+	int r = 0;
+
+	if (!_raid_read_status(lv, &status))
+		return_0;
+
+	if (status->in_sync != DM_PERCENT_100) {
+		log_error("Unable to split%s %s while it is not in-sync.",
+			  and_track, display_lvname(lv));
+		goto out;
+	}
+
+	if (seg->area_count == 2) {
+		if (!yes) {
+			if (yes_no_prompt("Are you sure you want to split%s %s LV %s losing %s? [y/n]: ",
+					  and_track, lvseg_name(seg), display_lvname(lv), loss) == 'n') {
+				log_error("Logical volume %s NOT split.", display_lvname(lv));
+				goto out;
+			}
+
+			if (!_raid_status_revalidate(lv, status))
+				goto_out;
+		}
+		log_verbose("Losing %s on logical volume %s.", loss, display_lvname(lv));
+	}
+
+	r = 1;
+out:
+	dm_pool_destroy(status->mem);
+
+	return r;
+}
+
 int lv_raid_split(struct logical_volume *lv, int yes, const char *split_name,
 		  uint32_t new_count, struct dm_list *splittable_pvs)
 {
@@ -4378,22 +4448,6 @@ int lv_raid_split(struct logical_volume *lv, int yes, const char *split_name,
 		return 0;
 	}
 
-	if (!_raid_in_sync(lv)) {
-		log_error("Unable to split %s while it is not in-sync.",
-			  display_lvname(lv));
-		return 0;
-	}
-
-	/* Split on a 2-legged raid1 LV causes losing all resilience */
-	if (new_count == 1) {
-		if (!yes && yes_no_prompt("Are you sure you want to split %s LV %s losing all resilience? [y/n]: ",
-					  lvseg_name(first_seg(lv)), display_lvname(lv)) == 'n') {
-			log_error("Logical volume %s NOT split.", display_lvname(lv));
-			return 0;
-		}
-		log_verbose("Losing all resilience for logical volume %s.", display_lvname(lv));
-	}
-
 	/*
 	 * We only allow a split while there is tracking if it is to
 	 * complete the split of the tracking sub-LV
@@ -4413,6 +4467,14 @@ int lv_raid_split(struct logical_volume *lv, int yes, const char *split_name,
 					tracking, splittable_pvs))
 			return_0;
 	}
+
+	/*
+	 * The array is in sync and has not changed since the user confirmed;
+	 * nothing reloads it before the extraction below, which may therefore
+	 * skip its own read.
+	 */
+	if (!_raid_split_confirm(lv, yes, 0))
+		return_0;
 
 	if (!_raid_extract_images(lv, new_count, splittable_pvs, 1, 1, NULL,
 				 &removal_lvs, &data_list)) {
@@ -4556,41 +4618,28 @@ int lv_raid_split_and_track(struct logical_volume *lv,
 		return 0;
 	}
 
-	if (!_raid_in_sync(lv)) {
-		log_error("Unable to split image from %s while not in-sync.",
-			  display_lvname(lv));
-		return 0;
-	}
-
 	/* Cannot track two split images at once */
 	if (lv_is_raid_with_tracking(lv)) {
 		log_error("Cannot track more than one split image at a time.");
 		return 0;
 	}
 
-	/* Split and track changes on a 2-legged raid1 LV causes losing resilience for newly written data. */
-	if (seg->area_count == 2) {
-		if (!yes && yes_no_prompt("Are you sure you want to split and track %s LV %s losing resilience for any newly written data? [y/n]: ",
-					  lvseg_name(seg), display_lvname(lv)) == 'n') {
-			log_error("Logical volume %s NOT split.", display_lvname(lv));
-			return 0;
-		}
-		log_verbose("Losing resilience for newly written data on logical volume %s.",
-			    display_lvname(lv));
-	}
-
-	for (s = seg->area_count - 1; s >= 0; --s) {
-		if (!lv_is_on_pvs(seg_lv(seg, s), splittable_pvs))
-			continue;
-		lv_set_visible(seg_lv(seg, s));
-		seg_lv(seg, s)->status &= ~LVM_WRITE;
-		break;
-	}
+	/* Find the image to split before asking, so a refused request is
+	 * never confirmed, then mark it once the user agreed. */
+	for (s = seg->area_count - 1; s >= 0; --s)
+		if (lv_is_on_pvs(seg_lv(seg, s), splittable_pvs))
+			break;
 
 	if (s < 0) {
 		log_error("Unable to find image to satisfy request.");
 		return 0;
 	}
+
+	if (!_raid_split_confirm(lv, yes, 1))
+		return_0;
+
+	lv_set_visible(seg_lv(seg, s));
+	seg_lv(seg, s)->status &= ~LVM_WRITE;
 
 	if (!lv_update_and_reload(lv))
 		return_0;
@@ -6000,22 +6049,53 @@ static int _raid0_to_striped_wrapper(struct logical_volume *lv,
 	return 1;
 }
 
+/*
+ * Read the status a takeover of @lv is decided on and require a fully
+ * in-sync array: the takeover reloads it without a resync.  The
+ * observation is released when the array is not in sync.
+ */
+static int _raid_convert_status(const struct logical_volume *lv,
+				struct lv_status_raid **status)
+{
+	if (!_raid_read_status(lv, status))
+		return_0;
+
+	if ((*status)->in_sync == DM_PERCENT_100)
+		return 1;
+
+	log_error("Unable to convert %s while it is not in-sync.",
+		  display_lvname(lv));
+	dm_pool_destroy((*status)->mem);
+	*status = NULL;
+
+	return 0;
+}
+
 /* raid1 -> mirror */
 static int _raid1_to_mirrored_wrapper(TAKEOVER_FN_ARGS)
 {
+	struct lv_status_raid *status;
 	struct dm_list removal_lvs;
 
 	dm_list_init(&removal_lvs);
 
-	if (!_raid_in_sync(lv))
+	if (!_raid_convert_status(lv, &status))
 		return_0;
 
-	if (!yes && yes_no_prompt("Are you sure you want to convert %s back to the older %s type? [y/n]: ",
+	if (!yes) {
+		if (yes_no_prompt("Are you sure you want to convert %s back to the older %s type? [y/n]: ",
 				  display_lvname(lv), SEG_TYPE_NAME_MIRROR) == 'n') {
-		log_error("Logical volume %s NOT converted to \"%s\".",
-			  display_lvname(lv), SEG_TYPE_NAME_MIRROR);
-		return 0;
+			dm_pool_destroy(status->mem);
+			return _raid_conversion_declined(lv, SEG_TYPE_NAME_MIRROR);
+		}
+
+		if (!_raid_status_revalidate(lv, status)) {
+			dm_pool_destroy(status->mem);
+			return 0;
+		}
 	}
+
+	dm_pool_destroy(status->mem);
 
 	/* Archive metadata */
 	if (!archive(lv->vg))
@@ -6231,6 +6311,7 @@ static int _shift_parity_dev(struct lv_segment *seg)
 static int _raid45_to_raid54_wrapper(TAKEOVER_FN_ARGS)
 {
 	struct lv_segment *seg = first_seg(lv);
+	struct lv_status_raid *status;
 	uint32_t region_size = seg->region_size;
 
 	if (!(seg_is_raid4(seg) && segtype_is_raid5_n(new_segtype)) &&
@@ -6241,21 +6322,29 @@ static int _raid45_to_raid54_wrapper(TAKEOVER_FN_ARGS)
 	}
 
 
-	/* Necessary when converting to raid0/striped w/o redundancy. */
-	if (!_raid_in_sync(lv)) {
-		log_error("Unable to convert %s while it is not in-sync.",
-			  display_lvname(lv));
-		return 0;
-	}
+	/*
+	 * The conversion reloads the array without a resync, so it must be
+	 * in sync, and it must not have changed while the prompt waited.
+	 */
+	if (!_raid_convert_status(lv, &status))
+		return_0;
 
-	if (!yes && yes_no_prompt("Are you sure you want to convert %s%s LV %s to %s%s type? [y/n]: ",
+	if (!yes) {
+		if (yes_no_prompt("Are you sure you want to convert %s%s LV %s to %s%s type? [y/n]: ",
 				  lvseg_name(seg), _get_segtype_alias_str(lv, seg->segtype),
 				  display_lvname(lv), new_segtype->name,
 				  _get_segtype_alias_str(lv, new_segtype)) == 'n') {
-		log_error("Logical volume %s NOT converted to \"%s\".",
-			  display_lvname(lv), new_segtype->name);
-		return 0;
+			dm_pool_destroy(status->mem);
+			return _raid_conversion_declined(lv, new_segtype->name);
+		}
+
+		if (!_raid_status_revalidate(lv, status)) {
+			dm_pool_destroy(status->mem);
+			return 0;
+		}
 	}
+
+	dm_pool_destroy(status->mem);
 
 	log_debug_metadata("Converting LV %s from %s to %s.", display_lvname(lv),
 			   (seg_is_raid4(seg) ? SEG_TYPE_NAME_RAID4 : SEG_TYPE_NAME_RAID5_N),
