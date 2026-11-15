@@ -2311,7 +2311,7 @@ void device_id_lvremove(struct cmd_context *cmd, struct dm_list *removed_uuids)
 		return;
 
 	dm_list_iterate_items(sl, removed_uuids) {
-		if (!(du = get_du_for_device_id(cmd, DEV_ID_TYPE_LVMLV_UUID, sl->str)))
+		if (!get_du_for_device_id(cmd, DEV_ID_TYPE_LVMLV_UUID, sl->str))
 			continue;
 		found++;
 	}
