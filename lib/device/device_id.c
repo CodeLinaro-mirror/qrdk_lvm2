@@ -3150,6 +3150,7 @@ static void _drop_dev_from_lvmcache(struct cmd_context *cmd, struct device *dev)
 void device_ids_validate(struct cmd_context *cmd, struct dm_list *scanned_devs, int using_hints, int noupdate, int *update_needed)
 {
 	struct dm_list wrong_devs;
+	struct dm_list del_devs;
 	struct device *dev = NULL;
 	struct device_list *devl;
 	struct dev_use *du, *du2;
@@ -3159,6 +3160,7 @@ void device_ids_validate(struct cmd_context *cmd, struct dm_list *scanned_devs, 
 	int update_file = 0;
 
 	dm_list_init(&wrong_devs);
+	dm_list_init(&del_devs);
 
 	cmd->device_ids_invalid = 0;
 
@@ -3547,14 +3549,19 @@ void device_ids_validate(struct cmd_context *cmd, struct dm_list *scanned_devs, 
 			if (!du2->pvid) {
 				log_debug("Validate %s %s PVID none: remove entry with repeated devname",
 					  idtype_to_str(du2->idtype), du2->idname ?: ".");
-				dm_list_del(&du2->list);
-				free_du(du2);
+				dm_list_move(&del_devs, &du2->list);
 				update_file = 1;
 				cmd->device_ids_invalid = 1;
 			}
 			break;
 		}
 	}
+
+	/*
+	 * Free the entries unlinked above only now: one of them can sit right
+	 * after an entry the loop above still steps to.
+	 */
+	free_dus(&del_devs);
 
 	/*
 	 * Set invalid if an entry using IDNAME=devname has not
