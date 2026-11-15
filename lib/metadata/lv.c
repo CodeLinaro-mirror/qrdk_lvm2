@@ -1185,35 +1185,27 @@ int lv_mirror_image_in_sync(const struct logical_volume *lv)
 	return (percent == DM_PERCENT_100) ? 1 : 0;
 }
 
+/*
+ * Answer whether the raid image @lv is in sync.  The callers only
+ * report the answer: lv_attr for the image character and lvs for the
+ * lv_image_synced and new data offset fields, so metadata that cannot
+ * be resolved is logged with log_debug() and does not fail the command.
+ */
 int lv_raid_image_in_sync(const struct logical_volume *lv)
 {
 	unsigned s;
 	char *raid_health;
-	struct lv_segment *seg, *raid_seg = NULL;
+	struct lv_segment *raid_seg;
 
 	/*
-	 * If the LV is not active locally,
-	 * it doesn't make sense to check status
+	 * The raid segment using this image is the array whose health says
+	 * whether the image is in sync, and an image is used by exactly one.
 	 */
-	if (!lv_is_active(lv))
-		return 0;  /* Assume not in-sync */
-
-	if (!lv_is_raid_image(lv)) {
-		log_error(INTERNAL_ERROR "%s is not a RAID image", lv->name);
-		return 0;
-	}
-
-	if ((seg = first_seg(lv)))
-		raid_seg = get_only_segment_using_this_lv(seg->lv);
-
-	if (!raid_seg) {
-		log_error("Failed to find RAID segment for %s", lv->name);
-		return 0;
-	}
-
-	if (!seg_is_raid(raid_seg)) {
-		log_error("%s on %s is not a RAID segment",
-			  raid_seg->lv->name, lv->name);
+	if (!lv_is_raid_image(lv) ||
+	    !(raid_seg = get_only_segment_using_this_lv(lv)) ||
+	    !seg_is_raid(raid_seg)) {
+		log_debug(INTERNAL_ERROR "Cannot find the RAID segment of %s.",
+			  display_lvname(lv));
 		return 0;
 	}
 
@@ -1222,19 +1214,30 @@ int lv_raid_image_in_sync(const struct logical_volume *lv)
 		if (seg_lv(raid_seg, s) == lv)
 			break;
 	if (s == raid_seg->area_count) {
-		log_error(INTERNAL_ERROR
-			  "sub-LV %s was not found in raid segment",
-			  lv->name);
+		log_debug(INTERNAL_ERROR "Sub-LV %s was not found in RAID segment.",
+			  display_lvname(lv));
 		return 0;
 	}
 
+	/*
+	 * An inactive LV has no status to read, and a failed read leaves no
+	 * health either: neither is an error, so assume not in sync.
+	 */
 	if (!lv_raid_dev_health(raid_seg->lv, &raid_health))
-		return_0;
+		return 0;
 
-	if (raid_health[s] == 'A')
-		return 1;
+	/*
+	 * A reshape drops devices from the live table before the metadata
+	 * drops the areas it freed, so this area may have no character:
+	 * it is no longer part of the array, so the image is not in sync.
+	 */
+	if (strlen(raid_health) <= s) {
+		log_debug("Raid health of %s does not cover area %u.",
+			  display_lvname(lv), s);
+		return 0;
+	}
 
-	return 0;
+	return (raid_health[s] == 'A') ? 1 : 0;
 }
 
 static int _lv_raid_integrity_image_in_sync(const struct logical_volume *lv_iorig)
