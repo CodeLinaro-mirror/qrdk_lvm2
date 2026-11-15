@@ -8414,6 +8414,12 @@ int lv_remove_with_dependencies(struct cmd_context *cmd, struct logical_volume *
 
 	if (!level && lv_is_merging_thin_snapshot(lv)) {
 		/* Merged snapshot LV is no longer available for the user */
+		if (!first_seg(lv)->merge_lv) {
+			log_error(INTERNAL_ERROR
+				  "Merging thin LV %s has no merge target.",
+				  display_lvname(lv));
+			return 0;
+		}
 		log_error("Unable to remove %s, volume is merged to %s.",
 			  display_lvname(lv), display_lvname(first_seg(lv)->merge_lv));
 		return 0;

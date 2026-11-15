@@ -662,6 +662,17 @@ static int _lv_update_log_type(struct cmd_context *cmd,
 
 	log_lv = first_seg(original_lv)->log_lv;
 
+	/*
+	 * _get_log_count() counts the images of this same log LV, and an
+	 * existing log LV always has at least one, so a nonzero old_log_count
+	 * means log_lv must be set here.
+	 */
+	if (old_log_count && !log_lv) {
+		log_error(INTERNAL_ERROR "Missing log LV for %s.",
+			  display_lvname(original_lv));
+		return 0;
+	}
+
 	/* Adding redundancy to the log */
 	if (old_log_count < log_count) {
 		if (!(region_size = adjusted_mirror_region_size(cmd, lv->vg->extent_size,

@@ -1467,6 +1467,13 @@ static void *_report_get_field_data(struct dm_report *rh,
 		return NULL;
 	}
 
+	if (!fp->type->data_fn) {
+		log_error(INTERNAL_ERROR
+			  "_report_get_field_data: no data_fn for type %u.",
+			  fp->type->id);
+		return NULL;
+	}
+
 	if (!(ret = fp->type->data_fn(object)))
 		return NULL;
 
