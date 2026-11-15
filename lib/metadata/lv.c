@@ -1187,9 +1187,10 @@ int lv_mirror_image_in_sync(const struct logical_volume *lv)
 
 /*
  * Answer whether the raid image @lv is in sync.  The callers only
- * report the answer: lv_attr for the image character and lvs for the
- * lv_image_synced and new data offset fields, so metadata that cannot
- * be resolved is logged with log_debug() and does not fail the command.
+ * report the answer: lv_attr for the image and integrity characters and
+ * lvs for the lv_image_synced and new data offset fields, so metadata
+ * that cannot be resolved is logged with log_debug() and does not fail
+ * the command.
  */
 int lv_raid_image_in_sync(const struct logical_volume *lv)
 {
@@ -1242,67 +1243,19 @@ int lv_raid_image_in_sync(const struct logical_volume *lv)
 
 static int _lv_raid_integrity_image_in_sync(const struct logical_volume *lv_iorig)
 {
-	struct logical_volume *lv_image = NULL;
-	struct logical_volume *lv_raid = NULL;
-	struct lv_segment *raid_seg = NULL;
-	char *raid_health;
-	unsigned int s;
-	int found = 0;
+	struct logical_volume *lv_image;
 
-	if (!lv_is_active(lv_iorig))
-		return 0;  /* Assume not in-sync */
-
-	/* Get top level raid LV from lv_iorig. */
-
-	/* step 1: get lv_image from lv_iorig */
-	lv_image = lv_integrity_from_origin(lv_iorig);
-
-	if (!lv_image) {
-		log_error("No lv_image found for lv_iorig %s", lv_iorig->name);
+	if (!(lv_image = lv_integrity_from_origin(lv_iorig))) {
+		log_debug(INTERNAL_ERROR "No RAID image found for %s.",
+			  display_lvname(lv_iorig));
 		return 0;
 	}
 
-	/* step 2: get lv_raid from lv_image */
-	if ((raid_seg = get_only_segment_using_this_lv(lv_image)))
-		lv_raid = raid_seg->lv;
-
-	if (!lv_raid) {
-		log_error("No lv_raid found for lv_image %s lv_iorig %s", lv_image->name, lv_iorig->name);
-		return 0;
-	}
-
-	/* Figure out which image number this is in lv_raid. */
-	if (!(raid_seg = first_seg(lv_raid))) {
-		log_error("No raid seg found for lv_raid %s lv_image %s lv_iorig %s",
-			  lv_raid->name, lv_image->name, lv_iorig->name);
-		return 0;
-	}
-	for (s = 0; s < raid_seg->area_count; s++) {
-		if (seg_lv(raid_seg, s) == lv_image) {
-			found = 1;
-			break;
-		}
-	}
-
-	if (!found) {
-		log_error("No seg area found for lv_raid %s lv_image %s lv_iorig %s",
-			  lv_raid->name, lv_image->name, lv_iorig->name);
-		return 0;
-	}
-
-	if (!lv_raid_dev_health(lv_raid, &raid_health)) {
-		log_error("No raid health for seg area %u lv_raid %s lv_image %s lv_iorig %s",
-			  s, lv_raid->name, lv_image->name, lv_iorig->name);
-		return 0;
-	}
-
-	log_debug("raid health %c for seg area %u lv_raid %s lv_image %s lv_iorig %s",
-		  raid_health[s], s, lv_raid->name, lv_image->name, lv_iorig->name);
-
-	if (raid_health[s] == 'A')
-		return 1;
-
-	return 0;
+	/*
+	 * lv_image is the raid image carrying the integrity segment, so the
+	 * raid image health check answers the same question.
+	 */
+	return lv_raid_image_in_sync(lv_image);
 }
 
 /*
