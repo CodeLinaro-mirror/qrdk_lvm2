@@ -1,5 +1,7 @@
 Version 2.03.45 - 
 ==================
+  Refuse a RAID conversion, reshape or split if the array changed.
+  Fix automatic repair of a RAID array with incomplete dm-raid health.
   Warn that extending a RAID LV before dm-raid 1.15.0 needs a resync.
   Refuse extending a RAID LV that is degraded or rebuilding a leg.
   Add configure --with-default-io-engine=ENGINE setting.
