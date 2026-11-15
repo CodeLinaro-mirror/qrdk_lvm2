@@ -789,8 +789,18 @@ static int _unlock_thread(struct thread_status *thread)
 	return pthread_mutex_unlock(&thread->mutex);
 }
 
-/* Check, if a device exists. */
-static int _fill_device_data(struct thread_status *ts)
+struct device_data {
+	char *name;
+	int major, minor;
+	uint32_t event_nr;
+};
+
+/*
+ * Check, if a device exists and read its identity.
+ * Runs an ioctl, so it must not be called with thread->mutex held.
+ * The uuid is immutable for the lifetime of the thread.
+ */
+static int _query_device_data(const char *uuid, struct device_data *dd)
 {
 	struct dm_task *dmt;
 	struct dm_info dmi;
@@ -799,7 +809,7 @@ static int _fill_device_data(struct thread_status *ts)
 	if (!(dmt = dm_task_create(DM_DEVICE_INFO)))
 		return 0;
 
-	if (!dm_task_set_uuid(dmt, ts->device.uuid))
+	if (!dm_task_set_uuid(dmt, uuid))
 		goto fail;
 
 	if (!dm_task_run(dmt))
@@ -811,19 +821,28 @@ static int _fill_device_data(struct thread_status *ts)
 	if (!dmi.exists)
 		goto fail;
 
-	free(ts->device.name);
-	if (!(ts->device.name = strdup(dm_task_get_name(dmt))))
+	if (!(dd->name = strdup(dm_task_get_name(dmt))))
 		goto fail;
 
-	ts->device.major = dmi.major;
-	ts->device.minor = dmi.minor;
-	dm_task_set_event_nr(ts->wait_task, dmi.event_nr);
+	dd->major = dmi.major;
+	dd->minor = dmi.minor;
+	dd->event_nr = dmi.event_nr;
 
 	ret = 1;
 fail:
 	dm_task_destroy(dmt);
 
 	return ret;
+}
+
+/* Store queried device data, takes over dd->name. */
+static void _apply_device_data(struct thread_status *ts, struct device_data *dd)
+{
+	free(ts->device.name);
+	ts->device.name = dd->name;
+	ts->device.major = dd->major;
+	ts->device.minor = dd->minor;
+	dm_task_set_event_nr(ts->wait_task, dd->event_nr);
 }
 
 static struct dm_task *_get_device_status(const struct thread_status *ts)
@@ -1258,6 +1277,8 @@ static int _event_wait(struct thread_status *thread)
 	sigset_t set, old;
 	int ret = DM_WAIT_RETRY;
 	struct dm_info info;
+	struct device_data dd = { 0 };
+	int have_dd = 0;
 	int task_result;
 	int r;
 
@@ -1284,12 +1305,16 @@ static int _event_wait(struct thread_status *thread)
 		log_warn("WARNING: pthread_sigmask failed to restore signal mask: %s.",
 			 strerror(r));
 
+	/* Recheck device info whether is still exists, still without mutex */
+	if (task_result)
+		have_dd = _query_device_data(thread->device.uuid, &dd);
+
 	_lock_thread(thread);
 
 	if (task_result) {
-		/* Recheck device info whether is still exists */
-		if (!_fill_device_data(thread))
+		if (!have_dd)
 			goto disappeared; /* device is gone... */
+		_apply_device_data(thread, &dd);
 		thread->current_events |= DM_EVENT_DEVICE_ERROR;
 		ret = DM_WAIT_INTR;
 		/* Update event_nr */
@@ -1351,20 +1376,23 @@ static void _do_process_event(struct thread_status *thread)
 
 	thread->current_events = 0; /* Clear events before processing */
 
+	/* The status ioctl and the plugin run without thread->mutex */
+	_unlock_thread(thread);
+
 	/* NOTE: timeout event gets status */
 	task = (current_events & DM_EVENT_TIMEOUT)
 		? _get_device_status(thread) : thread->wait_task;
 
 	if (!task)
 		log_error("Lost event in Thr %lx.", (unsigned long) thread->thread);
-	else {
-		_unlock_thread(thread);
+	else
 		thread->dso_data->process_event(task, (enum dm_event_mask) current_events,
 						&(thread->dso_private));
-		_lock_thread(thread);
-		if (task != thread->wait_task)
-			dm_task_destroy(task);
-	}
+
+	_lock_thread(thread);
+
+	if (task && task != thread->wait_task)
+		dm_task_destroy(task);
 }
 
 /*
@@ -1390,6 +1418,7 @@ static void _monitor_unregister(void *arg)
 
 	thread->events = 0;	/* Filter is now empty */
 	thread->pending = 0;	/* Event pending resolved */
+	/* coverity[missing_lock] thread->mutex held by caller */
 	thread->processing = 1;	/* Process unregistering */
 	registered = thread->registered;
 	thread->registered = 0;
@@ -1528,7 +1557,12 @@ static void _monitor_grace_period_wait(struct thread_status *thread)
 static void *_monitor_thread(void *arg)
 {
 	struct thread_status *thread = arg;
+	struct device_data dd = { 0 };
+	int have_dd;
 	int ret;
+
+	/* Resolve the device without holding thread->mutex */
+	have_dd = _query_device_data(thread->device.uuid, &dd);
 
 	/* Holds thread->mutex throughout the loop */
 	_lock_thread(thread);
@@ -1537,10 +1571,12 @@ static void *_monitor_thread(void *arg)
 	/* coverity[lock_order] thread mutex is released before grabbing global mutex */
 	pthread_cleanup_push(_monitor_unregister, thread);
 
-	if (!_fill_device_data(thread)) {
+	if (!have_dd) {
 		log_error("Failed to fill device data for %s.", thread->device.uuid);
 		goto out;
 	}
+
+	_apply_device_data(thread, &dd);
 
 	/* Now with resolved major:minor store also device inode */
 	thread->inode = _get_device_inode(thread);
