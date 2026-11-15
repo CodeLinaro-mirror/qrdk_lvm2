@@ -187,7 +187,7 @@ int read_flags(uint64_t *status, enum pv_vg_lv_e type, int mask, const struct dm
 	if (cv->type == DM_CFG_EMPTY_ARRAY)
 		goto out;
 
-	do {
+	for (; cv; cv = cv->next) {
 		if (cv->type != DM_CFG_STRING) {
 			log_error("Status value is not a string.");
 			return 0;
@@ -222,8 +222,7 @@ int read_flags(uint64_t *status, enum pv_vg_lv_e type, int mask, const struct dm
 			log_error("Unknown status flag '%s'.", cv->v.str);
 			return 0;
 		}
-
-	} while ((cv = cv->next));
+	}
 
       out:
 	*status |= s;

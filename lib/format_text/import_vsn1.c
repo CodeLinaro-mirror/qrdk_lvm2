@@ -168,7 +168,7 @@ static int _read_str_list(struct dm_pool *mem, struct dm_list *list, const struc
 	if (cv->type == DM_CFG_EMPTY_ARRAY)
 		return 1;
 
-	do {
+	for (; cv; cv = cv->next) {
 		if (cv->type != DM_CFG_STRING) {
 			log_error("Found an item that is not a string");
 			return 0;
@@ -176,8 +176,7 @@ static int _read_str_list(struct dm_pool *mem, struct dm_list *list, const struc
 
 		if (!str_list_add(mem, list, dm_pool_strdup(mem, cv->v.str)))
 			return_0;
-
-	} while ((cv = cv->next));
+	}
 
 	return 1;
 }
