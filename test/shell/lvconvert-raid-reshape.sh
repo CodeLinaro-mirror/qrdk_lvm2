@@ -83,32 +83,21 @@ function _lvconvert
 
 function _not_lvconvert
 {
-	local req_level=$1
-	local level=$2
-	local data_stripes=$3
-	local stripes=$4
-	local vg=$5
-	local lv=$6
-	local region_size=${7-}
-	local R=""
+	local type=$1
+	local vg=$2
+	local lv=$3
+	local segtype data_stripes stripes
 
-	[ -n "$region_size" ] && R="-R $region_size"
+	segtype=$(get lv_first_seg_field "$vg/$lv" segtype)
+	data_stripes=$(get lv_first_seg_field "$vg/$lv" data_stripes)
+	stripes=$(get lv_first_seg_field "$vg/$lv" stripes)
 
-	not lvconvert -y --ty $req_level $R $vg/$lv
+	not lvconvert -y --ty "$type" "$vg/$lv"
 
-	# Verify conversion did NOT happen - fields should NOT match requested values
-	not check lv_first_seg_field $vg/$lv segtype "$level"
-	not check lv_first_seg_field $vg/$lv data_stripes $data_stripes
-	not check lv_first_seg_field $vg/$lv stripes $stripes
-
-	[ -n "$region_size" ] &&
-		not check lv_field $vg/$lv regionsize $region_size
-	if [ "$wait_and_check" -eq 1 ]
-	then
-		not fsck -fn "$DM_DEV_DIR/$vg/$lv"
-		not aux wait_for_sync $vg $lv
-	fi
-	not fsck -fn "$DM_DEV_DIR/$vg/$lv"
+	# Verify the conversion did NOT happen: the LV keeps its state.
+	check lv_first_seg_field "$vg/$lv" segtype "$segtype"
+	check lv_first_seg_field "$vg/$lv" data_stripes "$data_stripes"
+	check lv_first_seg_field "$vg/$lv" stripes "$stripes"
 }
 
 function _reshape_layout
@@ -134,20 +123,21 @@ function _reshape_layout
 function _not_reshape_layout
 {
 	local type=$1
-	local data_stripes=$2
-	local stripes=$3
-	local vg=$4
-	local lv=$5
-	local opts="${@:6}"
+	local vg=$2
+	local lv=$3
+	local opts="${@:4}"
+	local segtype data_stripes stripes
 
-	not lvconvert -y --ty $type $opts $vg/$lv
+	segtype=$(get lv_first_seg_field "$vg/$lv" segtype)
+	data_stripes=$(get lv_first_seg_field "$vg/$lv" data_stripes)
+	stripes=$(get lv_first_seg_field "$vg/$lv" stripes)
 
-	# Verify reshape did NOT happen - fields should NOT match requested values
-	not check lv_first_seg_field $vg/$lv segtype "$type"
-	not check lv_first_seg_field $vg/$lv data_stripes $data_stripes
-	not check lv_first_seg_field $vg/$lv stripes $stripes
-	not aux wait_for_sync $vg $lv $ignore_a_chars
-	not fsck -fn "$DM_DEV_DIR/$vg/$lv"
+	not lvconvert -y --ty "$type" $opts "$vg/$lv"
+
+	# Verify the reshape did NOT happen: the LV keeps its state.
+	check lv_first_seg_field "$vg/$lv" segtype "$segtype"
+	check lv_first_seg_field "$vg/$lv" data_stripes "$data_stripes"
+	check lv_first_seg_field "$vg/$lv" stripes "$stripes"
 }
 
 # Delay leg so that rebuilding status characters
@@ -159,7 +149,6 @@ function _not_reshape_layout
 #
 
 # Create 3-way striped raid5 (4 legs total)
-# _lvcreate raid5_ls 3 4 16M $vg $lv1
 _lvcreate raid5_ls 3 4 16M $vg $lv1
 check lv_first_seg_field $vg/$lv1 segtype "raid5_ls"
 aux wait_for_sync $vg $lv1
@@ -168,9 +157,7 @@ aux wait_for_sync $vg $lv1
 _reshape_layout raid5_ls 3 4 $vg $lv1 --stripesize 256K
 check lv_first_seg_field $vg/$lv1 stripesize "256.00k"
 
-# Convert raid5(_n) -> striped testing raid5_ls gets rejected
-# FIXME
-# _not_lvconvert striped raid5_ls 3 3 $vg $lv1 "512.00k"
+# Convert raid5_ls -> striped via raid5_n
 _reshape_layout raid5_n 3 4 $vg $lv1
 _lvconvert striped striped 3 3 $vg $lv1
 
@@ -218,10 +205,10 @@ fi
 
 # No we got the data reshaped and the freed SubLVs still present
 # -> check takeover request gets rejected
-not lvconvert --yes --type striped $vg/$lv1
-not lvconvert --yes --type raid0 $vg/$lv1
-not lvconvert --yes --type raid0_meta $vg/$lv1
-not lvconvert --yes --type raid6 $vg/$lv1
+_not_lvconvert striped $vg $lv1
+_not_lvconvert raid0 $vg $lv1
+_not_lvconvert raid0_meta $vg $lv1
+_not_lvconvert raid6 $vg $lv1
 # Remove the freed SubLVs
 _reshape_layout raid5_ls 4 5 $vg $lv1 --stripes 4
 
@@ -273,7 +260,7 @@ _lvconvert raid10 raid10 4 8 $vg $lv1
 
 # Convert raid10 to 10 stripes and 64K stripesize
 # FIXME: change once we support odd numbers of raid10 stripes
-# _not_reshape_layout raid10 4 9 $vg $lv1 --stripes 9 --stripesize 64K
+# _not_reshape_layout raid10 $vg $lv1 --stripes 9 --stripesize 64K
 _reshape_layout raid10 10 20 $vg $lv1 --stripes 10 --stripesize 64K
 check lv_first_seg_field $vg/$lv1 stripesize "64.00k"
 
