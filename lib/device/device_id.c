@@ -2392,7 +2392,8 @@ void device_id_update_vg_uuid(struct cmd_context *cmd, struct volume_group *vg, 
 		memcpy(old_idname+4, old_vgid, ID_LEN);
 		memcpy(old_idname+4+ID_LEN, &lvl->lv->lvid.id[1], ID_LEN);
 
-		if ((du = get_du_for_device_id(cmd, DEV_ID_TYPE_LVMLV_UUID, old_idname))) {
+		if ((du = get_du_for_device_id(cmd, DEV_ID_TYPE_LVMLV_UUID, old_idname)) &&
+		    du->idname) {
 			log_debug("device_id update %s pvid %s vgid %s to %s",
 				  du->devname ?: ".", du->pvid ?: ".", old_vgid, new_vgid);
 			memcpy(du->idname+4, new_vgid, ID_LEN);
@@ -2475,6 +2476,10 @@ static int _match_dm_names(struct cmd_context *cmd, char *idname, struct device 
 
 static void _replace_incorrect_dm_idtype(struct dev_use *du)
 {
+	/* Kept for static analysis, the caller has already rejected a du without an idname. */
+	if (!du->idname)
+		return;
+
 	/* Previous bug let one of these types be swapped for another
 	   because they all read their value from sysfs file dm/uuid. */
 	if (du->idtype != DEV_ID_TYPE_MPATH_UUID &&
@@ -3773,15 +3778,15 @@ void device_ids_check_serial(struct cmd_context *cmd, struct dm_list *scan_devs,
 	 * pairings so that we can detect when a wrong pairing was corrected.
 	 */
 	dm_list_iterate_items(dul, &dus_check) {
-		if (!dul->du->dev)
+		du = dul->du;
+		if (!du->dev)
 			continue;
-		if (!dul->du->pvid)
+		if (!du->pvid)
 			continue;
 		/* save previously matched devs so they can be dropped from
 		   lvmcache at the end if they are no longer used */
 		if (!(dil = dm_pool_zalloc(cmd->mem, sizeof(*dil))))
 			continue;
-		du = dul->du;
 		dil->dev = du->dev;
 		memcpy(dil->pvid, du->pvid, ID_LEN);
 		dm_list_add(&prev_devs, &dil->list);
@@ -3794,15 +3799,15 @@ void device_ids_check_serial(struct cmd_context *cmd, struct dm_list *scan_devs,
 	 * Match du to a dev based on PVID.
 	 */
 	dm_list_iterate_items(dul, &dus_check) {
-		if (!dul->du->pvid)
+		du = dul->du;
+		if (!du->pvid)
 			continue;
 		log_debug("Matching suspect serial device id %s PVID %s prev %s",
-			  dul->du->idname, dul->du->pvid, dul->du->devname);
+			  du->idname, du->pvid, du->devname);
 		found = 0;
 		dm_list_iterate_items(devl, &devs_check) {
-			if (!memcmp(dul->du->pvid, devl->dev->pvid, ID_LEN)) {
+			if (!memcmp(du->pvid, devl->dev->pvid, ID_LEN)) {
 				/* pair dev and du */
-				du = dul->du;
 				dev = devl->dev;
 				du->dev = dev;
 				dev->id = _get_dev_id(dev, DEV_ID_TYPE_SYS_SERIAL);
