@@ -4666,7 +4666,6 @@ static uint64_t _stats_map_extents(int fd, struct dm_pool *mem,
 			/* Begin a new pending extent. */
 			ext_copy(fm_pending, fm_ext + i);
 		} else {
-			expected = 0;
 			/* Begin a new pending extent for extent 0. If there is
 			 * a hole at the start of the file, the first allocated
 			 * extent will have a non-zero fe_logical. Detect this
