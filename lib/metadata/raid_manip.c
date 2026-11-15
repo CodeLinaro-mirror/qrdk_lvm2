@@ -538,9 +538,9 @@ _raid_status_read_stable(const struct logical_volume *lv, uint32_t expected_coun
 }
 
 /*
- * Read one stable RAID status snapshot for a caller that only needs the
+ * Read one stable RAID status observation for a caller that only needs the
  * sync percentage, and release it: on RAID_READ_OK *sync_percent is set
- * from the snapshot; on the other results the snapshot is already
+ * from the observation; on the other results the observation is already
  * released and *sync_percent is left untouched.
  */
 static enum raid_read_result
@@ -697,7 +697,7 @@ int lv_raid_can_resize(const struct logical_volume *lv)
 	}
 
 	/*
-	 * One stable snapshot: the retry waits out the 0% in-sync a target
+	 * One stable observation: the retry waits out the 0% in-sync a target
 	 * may report right after a reload with every leg already in sync,
 	 * so a transient is not mistaken for a degraded array.
 	 */
@@ -3430,9 +3430,9 @@ static int _raid_sync_action_allows_image_change(const char *sync_action)
  *		    array fully in sync, so the read can be skipped; only
  *		    honored when @out_status is NULL.
  * @out_status:  If non-NULL, set to NULL on entry and, on success, to the
- *		 status snapshot the caller then owns and must release
+ *		 status observation the caller then owns and must release
  *		 with dm_pool_destroy(status->mem); when NULL the
- *		 snapshot is released here.
+ *		 observation is released here.
  *
  * returns: 0 if no, 1 if yes
  */
@@ -3532,7 +3532,7 @@ static int _raid_allow_extraction(struct logical_volume *lv,
 	}
 out:
 	if (out_status) {
-		/* Hand the snapshot to the caller, which owns the pool. */
+		/* Hand the observation to the caller, which owns the pool. */
 		*out_status = raid_status;
 		return 1;
 	}
@@ -3562,7 +3562,7 @@ static int _raid_apply_recovering_image_rebuild_flags(struct logical_volume *lv,
  * @rebuild_flags_set:  If non-NULL, mark recovering RAID1 images after
  *		      extraction has been validated and return whether any
  *		      LV_REBUILD flags were set.  Also requests the status
- *		      snapshot from _raid_allow_extraction(), which this
+ *		      observation from _raid_allow_extraction(), which this
  *		      function then owns and releases.
  * @extracted_[meta|data]_lvs:  The LVs removed from the array.  If 'shift'
  *			      is set, then there will likely be name conflicts.
@@ -3608,9 +3608,9 @@ static int _raid_extract_images(struct logical_volume *lv,
 		return_0;
 
 	/*
-	 * _raid_allow_extraction() reads one status snapshot; hand it on so
-	 * the recovering-image rebuild marking below reuses the same view
-	 * instead of taking a second, possibly conflicting one.
+	 * _raid_allow_extraction() takes one status observation; hand it on so
+	 * the recovering-image rebuild marking below reuses the same
+	 * observation instead of taking a second, possibly conflicting one.
 	 */
 	if (!_raid_allow_extraction(lv, extract, target_pvs, known_in_sync,
 				    rebuild_flags_set ? &raid_status : NULL))
@@ -3620,7 +3620,7 @@ static int _raid_extract_images(struct logical_volume *lv,
 		    (extract > 1) ? "images" : "image",
 		    display_lvname(lv));
 
-	/* Reuse the snapshot taken during extraction validation. */
+	/* Reuse the observation taken during extraction validation. */
 	if (raid_status) {
 		ok = _raid_apply_recovering_image_rebuild_flags(lv, rebuild_flags_set,
 								raid_status);
