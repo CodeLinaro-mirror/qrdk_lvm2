@@ -1410,17 +1410,18 @@ static int _compare_index_category(const void *a, const void *b)
 	return 0;
 }
 
+/*
+ * Index of the category @value names, -1 when it names none.  The caller
+ * passes the value of a meta file field with the line's newline already
+ * stripped, so the name matches exactly.
+ */
 static int _get_category_index(const char *value)
 {
 	unsigned i;
-	size_t len;
 
-	for (i = 0; i < CMD_CATEGORIES_COUNT; i++) {
-		len = strlen(_cmd_categories[i].name);
-		if (!strncmp(value, _cmd_categories[i].name, len) &&
-		    (value[len] == '\n' || value[len] == '\0'))
+	for (i = 0; i < CMD_CATEGORIES_COUNT; i++)
+		if (!strcmp(value, _cmd_categories[i].name))
 			return (int) i;
-	}
 
 	return -1;
 }
