@@ -374,7 +374,8 @@ void backup_dir_cleanup(const char *dir, const char *prefix,
 	}
 	if ((dir_fd = dirfd(dp)) < 0) {
 		log_sys_debug("dirfd", dir);
-		closedir(dp);
+		if (closedir(dp))
+			log_sys_debug("closedir", dir);
 		goto out;
 	}
 
@@ -397,7 +398,8 @@ void backup_dir_cleanup(const char *dir, const char *prefix,
 		remove_count--;
 	}
 
-	closedir(dp);
+	if (closedir(dp))
+		log_sys_debug("closedir", dir);
 out:
 	for (i = 0; i < count; i++)
 		free(namelist[i]);
