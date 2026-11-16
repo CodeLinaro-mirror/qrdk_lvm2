@@ -20,7 +20,10 @@ aux prepare_vg
 
 lvcreate -an --zero n -l 1 -n $lv1 $vg
 lvcreate -ky -K -l1 -n $lv2 $vg
-get lv_field $vg/$lv2 lv_attr | grep -- "-wi-a----k"
+# The 6th character is the open count: udev's blkid can still hold the
+# freshly activated LV open when this reads it, and which of '-' and 'o'
+# it reports then depends on the runner, not on the LV.
+get lv_field $vg/$lv2 lv_attr | grep -- "-wi-a[-o]---k"
 
 lvchange -ay -K $vg
 check active $vg $lv1
