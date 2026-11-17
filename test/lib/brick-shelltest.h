@@ -108,13 +108,26 @@ void split( std::string s, C &c ) {
         c.push_back( item );
 }
 
+// O_CLOEXEC appeared in glibc 2.7 and is only honoured by 2.6.23 and
+// later kernels.  When the macro is missing, set FD_CLOEXEC with fcntl()
+// instead of inventing a value, which differs between architectures.
+#ifdef O_CLOEXEC
+#define LO_CLOEXEC O_CLOEXEC
+#else
+#define LO_CLOEXEC 0
+#endif
+
 // An exclusive flock(2) on a file, held until the object is destroyed and
 // released when the descriptor is closed.  The descriptor is close-on-exec,
 // so a process started by the suite does not keep the lock after it exits.
 class Flock {
 public:
     explicit Flock( const char *path ):
-        fd( open( path, O_RDONLY | O_CREAT | O_CLOEXEC, 0666 ) ) {
+        fd( open( path, O_RDONLY | O_CREAT | LO_CLOEXEC, 0666 ) ) {
+#ifndef O_CLOEXEC
+        if ( fd >= 0 && fcntl( fd, F_SETFD, FD_CLOEXEC ) < 0 )
+            perror("failed to set FD_CLOEXEC on lock file");
+#endif
     }
 
     ~Flock() {
