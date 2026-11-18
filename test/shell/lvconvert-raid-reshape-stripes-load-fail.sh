@@ -91,6 +91,15 @@ sync
 
 umount "$mount_dir"
 
-fsck -fn "$DM_DEV_DIR/$vg/$lv1"
+# An interrupted reshape hands the I/O across its position back to
+# device-mapper, which ends that bio with an error outside a noflush
+# suspend until 1d24d4c1ea1d ("dm-raid: only requeue bios when dm is
+# suspending"), first released in 7.2.  ext4 then records the error and
+# needs repair, which says nothing about lvm2: the leg failure and the
+# metadata checks above have already run.  The dm-raid version cannot
+# tell the kernels apart, it reports 1.15.1 on both.
+if aux kernel_at_least 7 2; then
+	fsck -fn "$DM_DEV_DIR/$vg/$lv1"
+fi
 
 vgremove -ff $vg
