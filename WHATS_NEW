@@ -1,5 +1,6 @@
 Version 2.03.45 - 
 ==================
+  Fix vgreduce --removemissing to remove a partial pmspare LV.
   Refuse a RAID conversion, reshape or split if the array changed.
   Fix automatic repair of a RAID array with incomplete dm-raid health.
   Warn that extending a RAID LV before dm-raid 1.15.0 needs a resync.
