@@ -56,12 +56,23 @@ static int _consolidate_vg(struct cmd_context *cmd, struct volume_group *vg)
 	struct lv_list *lvl;
 	int r = 1;
 
-	dm_list_iterate_items(lvl, &vg->lvs)
-		if (lv_is_partial(lvl->lv)) {
-			log_warn("WARNING: Partial LV %s needs to be repaired "
-				 "or removed. ", lvl->lv->name);
-			r = 0;
-		}
+	dm_list_iterate_items(lvl, &vg->lvs) {
+		if (!lv_is_partial(lvl->lv))
+			continue;
+
+		/*
+		 * An unused pool metadata spare is internal and holds no
+		 * user data.  Ignore it here and remove it below, but not
+		 * with --mirrorsonly, which only handles mirror images.
+		 */
+		if (lv_is_pool_metadata_spare(lvl->lv) &&
+		    !arg_is_set(cmd, mirrorsonly_ARG))
+			continue;
+
+		log_warn("WARNING: Partial LV %s needs to be repaired "
+			 "or removed. ", lvl->lv->name);
+		r = 0;
+	}
 
 	if (!r) {
 		cmd->handles_missing_pvs = 1;
@@ -70,6 +81,24 @@ static int _consolidate_vg(struct cmd_context *cmd, struct volume_group *vg)
 		log_error("To remove them unconditionally from mirror LVs use: vgreduce"
 				  " --removemissing --mirrorsonly --force.");
 		log_warn("WARNING: Proceeding to remove empty missing PVs.");
+	}
+
+	if (r && vg->pool_metadata_spare_lv &&
+	    lv_is_partial(vg->pool_metadata_spare_lv)) {
+		/*
+		 * The spare is internal and holds no user data, so it is
+		 * removed without a prompt: --removemissing is already an
+		 * explicit request to repair the VG.  Warn about the
+		 * consequence, which the user cannot undo.
+		 */
+		log_warn("WARNING: Removing partial pool metadata spare LV %s "
+			 "disables automatic recovery attempts after damage "
+			 "to a thin or cache pool.",
+			 display_lvname(vg->pool_metadata_spare_lv));
+
+		if (!lv_remove_with_dependencies(cmd, vg->pool_metadata_spare_lv,
+						 DONT_PROMPT, 0))
+			return_0;
 	}
 
 	dm_list_iterate_items(pvl, &vg->pvs) {
