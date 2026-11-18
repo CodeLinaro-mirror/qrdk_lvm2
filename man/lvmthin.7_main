@@ -312,6 +312,11 @@ thin LVs.)
 .P
 To use MD RAID instead of LVM RAID, create linear data/metadata LVs on MD
 devices, and refer to the MD devices for DataDevices/MetadataDevices.
+.P
+The pool data and metadata LVs can each use RAID independently, but the
+VG's pmspare LV is not part of the pool and is not mirrored by default.
+See \fBSpare Metadata LV\fP and \fBRecovering Thin Pool on LVM RAID\fP
+for the consequences and recovery steps.
 .
 .SS Thin Pool on LVM VDO
 .
@@ -697,13 +702,52 @@ To create the pmspare ("pool metadata spare") LV, lvm first creates
 an LV with a default name, e.g. lvol0, and then converts this LV to
 a hidden LV with the _pmspare suffix, e.g. lvol0_pmspare.
 .P
-One pmspare LV is kept in a VG to be used for any thin pool.
+One pmspare LV is kept in a VG to be used for any thin or cache pool.
+It is sized for the largest pool metadata LV in the VG, and is
+extended when a larger metadata LV appears.
+.P
+The pmspare LV is reserved space, not a copy of any pool's metadata and
+not a backup.  It contains no valid metadata until it is used for a
+repair.  By default, it is a single LV without redundancy, even when the
+pool data and metadata LVs use RAID.  Its purpose is to make sure that a
+repair has a preallocated place to write the repaired metadata when the
+VG has no free space.
+.P
+Metadata can be lost with a failed device, or corrupted while the device
+is still usable, for example by a kernel bug.  The pmspare LV cannot
+recreate metadata that has been lost; it is only a destination for a
+repaired copy.  Thin pool metadata is not repaired in place.  The
+metadata format and tools build a new metadata tree and write it to a
+different LV, leaving the old metadata LV untouched.  Thin metadata is
+small, so the extra space for the new copy is cheap; in-place repair
+would add complexity and risk to the normal metadata path for a rare
+operation.  The pmspare LV is the preallocated destination for the new
+copy.
+.P
+The pmspare LV is a last-resort reserve, not a replacement for
+monitoring the pool and keeping free space in the VG.  A successful
+repair consumes it: the repaired metadata is written to it and it
+becomes the new pool metadata LV, so a new pmspare must be allocated
+afterwards if the VG is to keep this protection.  If several pools need
+repair at the same time, one pmspare is not enough; the repairs must be
+handled one at a time, with enough free space for each repaired metadata
+LV and for the next spare.
 .P
 The pmspare LV cannot be created explicitly, but may be removed
-explicitly.
+explicitly.  There is no separate command to create a new pmspare after
+one has been removed; a later pool creation or conversion, or a later
+lvconvert --repair, will create one if free space is available.
 .P
-The "Thin Pool Metadata check and repair" section describes the use of
-the pmspare LV.
+If the PV containing the pmspare LV fails, losing the pmspare does not
+affect the pool, but the VG becomes partial because the hidden pmspare
+still has extents on the missing PV.  Use \fBvgreduce --removemissing\fP
+to remove the partial pmspare along with the missing PV.
+.P
+The pmspare can be moved off a PV with \fBpvmove\fP(8) before that PV
+is removed from the VG.
+.P
+The "Thin Pool Metadata check and repair" and "Recovering Thin Pool on
+LVM RAID" sections describe the use of the pmspare LV.
 .
 .SS Thin Pool Metadata check and repair
 .
@@ -712,6 +756,12 @@ repairing thin pool metadata is analogous to running fsck/repair on a file
 system.  Thin pool metadata is compact, so even small areas of damage or
 corruption can result in significant data loss.  Resilient storage for
 thin pool metadata can have extra value.
+.P
+The metadata contains the block mapping for all thin LVs.  Without it,
+the data LV is just a collection of thin-pool chunks allocated on
+demand: the data blocks may still exist, but there is no way to tell
+which block belongs to which thin LV or file.  This is why metadata
+redundancy and repair are important even though the metadata is small.
 .P
 When a thin pool LV is activated, lvm runs the
 .BR thin_check (8)
@@ -782,6 +832,71 @@ metadata:
 .EX
 # lvconvert --thinpool VG/ThinPool --poolmetadata VG/NewMetadataLV
 .EE
+.P
+If the pool metadata LV is a RAID LV, the metadata LV created by a
+repair is the former pmspare, which is not RAID by default.  See
+\fBRecovering Thin Pool on LVM RAID\fP for restoring redundancy or for
+keeping the metadata on RAID during the repair.
+.
+.SS Recovering Thin Pool on LVM RAID
+.
+When a thin pool uses RAID for its data or metadata LVs, two different
+failures need to be handled separately: a lost RAID image (a device
+failure) and damaged thin pool metadata (a metadata content failure).
+The pmspare LV is not part of the RAID set.  It is used only as the
+destination for metadata repair and, by default, does not provide RAID
+redundancy.
+.P
+If a device fails and a RAID image of the data LV or the metadata LV is
+lost, the pool can usually continue in degraded mode.  Replace the
+failed image by repairing the RAID LV, not the pool LV:
+.P
+.EX
+# lvconvert --repair VG/ThinPool_tdata NewPV
+# lvconvert --repair VG/ThinPool_tmeta NewPV
+.EE
+.P
+Use the command for the component LV that lost an image.  Replacing a
+RAID image requires enough free space for a full copy of that image.
+For the data LV this can be as large as the data LV itself.  The pmspare
+LV does not provide this space and does not take part in RAID
+reconstruction.
+.P
+If the failed PV has already been removed from the VG, the RAID LV is
+left degraded; use the same commands to replace the missing images.
+.P
+Note that \fBlvconvert --repair VG/ThinPool\fP repairs thin pool
+metadata content; it does not repair RAID images of the pool component
+LVs.
+.P
+If thin pool metadata is damaged, the pool must be inactive and
+\fBlvconvert --repair VG/ThinPool\fP writes a repaired copy to the
+pmspare LV and swaps it in as the new metadata LV.  This restores access
+to the pool, but the new metadata LV is the former pmspare, which is not
+RAID by default.  The previous metadata LV, including its RAID layout,
+is kept as ThinPool_metaN and can be removed after the pool has been
+verified.
+.P
+If the metadata must remain on RAID, prepare a new RAID metadata LV and
+swap it manually after running \fBthin_repair\fP(8):
+.P
+.EX
+# lvchange -an VG/ThinPool
+# lvcreate --type raid1 -m1 -L MetadataSize -n NewMetadataLV VG Dev1 Dev2
+# lvchange -ay VG/ThinPool_tmeta VG/NewMetadataLV
+# thin_repair -i /dev/VG/ThinPool_tmeta -o /dev/VG/NewMetadataLV
+# lvconvert --thinpool VG/ThinPool --poolmetadata VG/NewMetadataLV
+.EE
+.P
+The pool must be inactive for the swap.  The old metadata LV is renamed
+to NewMetadataLV in the example and can be removed after verification.
+.P
+If the PV containing the pmspare LV fails, remove the partial pmspare
+and the missing PV as described in \fBSpare Metadata LV\fP.  A new
+pmspare can then be allocated on demand.  When several pools need
+repair, handle them one at a time: a single pmspare is consumed by the
+first successful repair, and a new one must be allocated before the next
+pool can use the same recovery path.
 .
 .SS Removing thin pool LVs, thin LVs and snapshots
 .
@@ -1248,8 +1363,10 @@ skipped while mounting read-only:
 .BR lvextend (8),
 .BR lvremove (8),
 .BR lvs (8),
+.BR pvmove (8),
 .BR vgcfgbackup (8),
 .BR vgcfgrestore (8),
+.BR vgreduce (8),
 .P
 .BR dmeventd (8),
 .BR thin_check (8),
