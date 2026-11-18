@@ -659,6 +659,64 @@ Each rmeta SubLV holds RAID metadata.
 \  [lvr10_rmeta_3]  linear /dev/sdd(...)
 .EE
 .
+.SH RAID IMAGES USING MULTIPLE DEVICES
+.
+RAID is normally understood to place each image on one device, but LVM
+does not enforce this.
+If no single PV has enough free space for an image (rimage or rmeta
+SubLV), the allocator will combine space from multiple PVs to build the
+image.  This can happen in lvcreate, lvextend, lvconvert, and in repair.
+It can include PVs the user did not intend to use for the LV,
+e.g. a local system PV in the same VG as shared data PVs.
+LVM does not report this as a problem.
+.P
+An image built from multiple devices can lead to problems:
+.
+.ipbu
+The image is lost if any one of its devices fails, so it is less reliable
+than an image on a single device.
+.
+.ipbu
+Moving the PVs holding the intended images to another system leaves the LV
+incomplete if a part of an image remains on a PV that was not moved.
+.
+.ipbu
+If one device in an image fails, the image is damaged as a whole.
+.B lvconvert --repair
+replaces the entire image, not only the failed device.
+Space for the full image size must be available in the VG (on devices that
+are not used by other images.)  Replacing only the failed device with
+another device of the same size is not sufficient.
+.P
+To avoid these problems:
+.
+.ipbu
+Check which devices each image uses:
+.br
+.B lvs -a -o name,devices
+.I VG
+.
+.ipbu
+List specific PVs on the command line (e.g. lvcreate, lvextend) to
+control the devices where images are allocated.
+.
+.ipbu
+Use
+.B --alloc contiguous
+when creating the LV.  This is a persistent LV setting that ensures an
+image will use a single contiguous run of extents.  If this is not
+possible, the command will fail. Future extensions of the LV also
+require contiguous space on the same PV.
+.
+.ipbu
+To repair an image that was built from multiple devices, make enough
+free space available for a complete image, either with one new PV that is
+large enough, or with several new PVs listed together:
+.br
+.B lvconvert --repair
+.I LV
+.IR NewPV1 " [" NewPV2 " ...]"
+.
 .SH DEVICE FAILURE
 .
 Physical devices in a RAID LV can fail or be lost for multiple reasons.
