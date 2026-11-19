@@ -466,7 +466,7 @@ struct printer {
 static uint32_t _randomise(uint32_t n)
 {
         /* 2^32 - 5 */
-        uint32_t const prime = (~0) - 4;
+        uint32_t const prime = UINT32_MAX - 4;
         return n * prime;
 }
 
