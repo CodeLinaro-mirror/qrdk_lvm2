@@ -440,6 +440,20 @@ static int _read_mda_header_and_metadata(const struct format_type *fmt,
 }
 
 /*
+ * Return the terminating zero-offset entry of a disk_locn array, or NULL
+ * when the array runs into label_end without one.  The returned entry is
+ * guaranteed to lie fully inside [dlocn, label_end).
+ */
+static struct disk_locn *_disk_locn_terminator(struct disk_locn *dlocn,
+					       struct disk_locn *label_end)
+{
+	while ((dlocn + 1) <= label_end && htole64(dlocn->offset))
+		dlocn++;
+
+	return ((dlocn + 1) <= label_end) ? dlocn : NULL;
+}
+
+/*
  * Validate the structural layout of a PV label buffer.
  * Checks pv_header offset, disk_locn array bounds, and extension fit.
  * On success all disk_locn arrays are guaranteed null-terminated within
@@ -471,23 +485,18 @@ int label_check_pv_layout(void *label_buf, struct device *dev,
 	label_end = (struct disk_locn *)((char *)label_buf + LABEL_SIZE);
 
 	/* Data areas */
-	dlocn_xl = pvhdr->disk_areas_xl;
-	while ((dlocn_xl + 1) <= label_end && htole64(dlocn_xl->offset))
-		dlocn_xl++;
-	dlocn_xl++;
-	if (dlocn_xl > label_end) {
+	if (!(dlocn_xl = _disk_locn_terminator(pvhdr->disk_areas_xl, label_end))) {
 		log_error("Disk areas overflow label on %s.", dev_name(dev));
 		return 0;
 	}
+	dlocn_xl++;
 
 	/* Metadata areas */
-	while ((dlocn_xl + 1) <= label_end && htole64(dlocn_xl->offset))
-		dlocn_xl++;
-	dlocn_xl++;
-	if (dlocn_xl > label_end) {
+	if (!(dlocn_xl = _disk_locn_terminator(dlocn_xl, label_end))) {
 		log_error("Metadata areas overflow label on %s.", dev_name(dev));
 		return 0;
 	}
+	dlocn_xl++;
 
 	if (pvhdr_ret)
 		*pvhdr_ret = pvhdr;
