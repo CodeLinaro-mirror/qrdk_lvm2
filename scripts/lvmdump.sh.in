@@ -361,6 +361,13 @@ if (( metadata )); then
 	    name,pe_start 2>> "$log" | "$SED" -e 's/^ *//' |
 	while IFS=, read -r pv pe_start || test -n "$pv"; do
 		test -z "$pv" && continue
+		# A missing PV has no device and pvs prints a placeholder
+		# ("[unknown]") instead of a path - never hand that to dd,
+		# it would be opened relative to the current directory.
+		case "$pv" in
+		/*) ;;
+		*) myecho "  WARNING: skipping $pv (no device)."; continue ;;
+		esac
 		case "$pe_start" in
 		""|*[!0-9]*) myecho "  WARNING: skipping $pv (invalid pe_start: $pe_start)."; continue ;;
 		esac
