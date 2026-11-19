@@ -226,6 +226,21 @@ if check_missing ext2; then
 	umount "$mount_dir"
 	fscheck_ext3
 
+	# Filesystem mounted on more mount points stays mounted after
+	# unmounting one of them - no offline fsck and resize
+	mount "$dev_vg_lv" "$mount_dir"
+	mount --bind "$mount_dir" "$mount_space_dir"
+	mount -o remount,bind,ro "$mount_space_dir"
+	df --output=size "$mount_dir" | tee df1
+	not fsadm -y -e resize $vg_lv 2>err
+	grep "still mounted" err
+	# The resize was refused, so the filesystem must be unchanged.
+	df --output=size "$mount_dir" | tee df2
+	diff df1 df2
+	umount "$mount_space_dir"
+	umount "$mount_dir"
+	fscheck_ext3
+
 	lvresize --fs ignore -y -L20M $vg_lv
 
 	if which debugfs ; then

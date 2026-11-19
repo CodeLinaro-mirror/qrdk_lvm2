@@ -333,6 +333,26 @@ not diff df1 df2
 dd if=/dev/zero of="$mount_dir/zeros2" bs=1M count=10 oflag=direct
 umount "$mount_dir"
 
+# dumpe2fs and e2fsck are only used to prove the filesystem came through
+# untouched, so leave out just this scenario when they are missing.
+if command -v dumpe2fs >/dev/null && command -v e2fsck >/dev/null; then
+	# lvextend, ext4, active, mounted twice, --fs resize --fsmode offline
+	# fs stays mounted after unmounting one mount point - no fsck and resize
+	dumpe2fs -h "$DM_DEV_DIR/$vg/$lv" | grep '^Block count' > bc1
+	mount "$DM_DEV_DIR/$vg/$lv" "$mount_dir"
+	mount --bind "$mount_dir" "$mount_dir_2"
+	mount -o remount,bind,ro "$mount_dir_2"
+	not lvextend --fs resize --fsmode offline -L+10M $vg/$lv 2>err
+	grep "still mounted" err
+	umount "$mount_dir_2"
+	dumpe2fs -h "$DM_DEV_DIR/$vg/$lv" | grep '^Block count' > bc2
+	diff bc1 bc2
+	e2fsck -f -n "$DM_DEV_DIR/$vg/$lv"
+	# fs was not extended, take back the LV extension
+	lvreduce -y --fs ignore -L30M $vg/$lv
+	check lv_field $vg/$lv lv_size "30.00m"
+fi
+
 # lvextend, ext4, active, unmounted, --fs resize --fsmode nochange
 df --output=size "$mount_dir" |tee df1
 lvextend --fs resize --fsmode nochange -L+10M $vg/$lv
@@ -487,6 +507,19 @@ check lv_field $vg/$lv lv_size "100.00m"
 df --output=size "$mount_dir" |tee df2
 # fs size unchanged
 diff df1 df2
+
+# lvreduce, ext4, active, mounted twice, --fs resize (fsmode manage)
+# the fs unmounted for the shrink is mounted again where it was before
+# the abort, so it has to be unmounted before the end of this block
+mount --bind "$mount_dir" "$mount_dir_2"
+mount -o remount,bind,ro "$mount_dir_2"
+not lvreduce -y --fs resize -L60M $vg/$lv 2>err
+grep "still mounted" err
+# df prints one line per device and picks the shorter of the two mount
+# points, so ask about this path directly
+mountpoint -q "$mount_dir"
+umount "$mount_dir_2"
+check lv_field $vg/$lv lv_size "100.00m"
 umount "$mount_dir"
 
 # lvreduce, ext4, active, unmounted, --fs checksize (same as no --fs set)
