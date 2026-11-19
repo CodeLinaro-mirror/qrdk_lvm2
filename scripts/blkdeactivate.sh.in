@@ -356,8 +356,14 @@ deactivate_lvm() {
 		}
 		test -z "${MOUNTED_DEVICE_LIST["$kname"]}" || return 0
 
+		# lvchange asks for confirmation before it deactivates a snapshot
+		# together with its origin.  Do not let it read the answer from
+		# stdin: inside the callers' loops that is the list of devices
+		# still to process and the rest of it would be consumed.  With no
+		# input the answer is 'no' and the snapshot is left to be
+		# deactivated with its origin.
 		echo -n "  [LVM]: deactivating Logical Volume $DM_VG_NAME/$DM_LV_NAME... "
-		if "$LVM" lvchange "${LVM_OPTS[@]}" --config "log{prefix=\"\"} $LVM_CONFIG" -aln "$DM_VG_NAME/$DM_LV_NAME" >&9 2>&8; then
+		if "$LVM" lvchange "${LVM_OPTS[@]}" --config "log{prefix=\"\"} $LVM_CONFIG" -aln "$DM_VG_NAME/$DM_LV_NAME" </dev/null >&9 2>&8; then
 			echo "done"
 		else
 			echo "skipping"
@@ -401,7 +407,7 @@ deactivate_lvm() {
 		done
 
 		echo -n "  [LVM]: deactivating Volume Group $DM_VG_NAME... "
-		if "$LVM" vgchange "${LVM_OPTS[@]}" --config "log{prefix=\"    \"} $LVM_CONFIG" -aln "$DM_VG_NAME" >&9 2>&8; then
+		if "$LVM" vgchange "${LVM_OPTS[@]}" --config "log{prefix=\"    \"} $LVM_CONFIG" -aln "$DM_VG_NAME" </dev/null >&9 2>&8; then
 			echo "done"
 		else
 			echo "skipping"
