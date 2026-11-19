@@ -42,31 +42,19 @@ struct dso_state {
 
 DM_EVENT_LOG_FN("snap")
 
-static int _run(const char *cmd, ...)
+/*
+ * Run a command described by a NULL-terminated argument vector, argv[0] is
+ * the command.  Return 1 when the child ran and exited successfully, 0 when
+ * fork, wait or the command itself failed.
+ */
+static int _run(const char *const argv[])
 {
-        va_list ap;
-        int argc = 1; /* for argv[0], i.e. cmd */
-        int i = 0;
-        const char **argv;
         pid_t pid = fork();
         int status;
 
         if (pid == 0) { /* child */
-                va_start(ap, cmd);
-                while (va_arg(ap, const char *))
-                        ++ argc;
-                va_end(ap);
-
-                /* + 1 for the terminating NULL */
-                argv = alloca(sizeof(const char *) * (argc + 1));
-
-                argv[0] = cmd;
-                va_start(ap, cmd);
-                while ((argv[++i] = va_arg(ap, const char *)));
-                va_end(ap);
-
-                execvp(cmd, (char **)argv);
-                log_sys_error("exec", cmd);
+                execvp(argv[0], (char **) argv);
+                log_sys_error("exec", argv[0]);
                 exit(127);
         }
 
@@ -154,8 +142,10 @@ static void _umount(const char *device, int major, int minor)
 		if (S_ISBLK(st.st_mode) &&
 		    (int) major(st.st_rdev) == major &&
 		    (int) minor(st.st_rdev) == minor) {
+			const char *umount_argv[] = { UMOUNT_COMMAND, "-fl", words[1], NULL };
+
 			log_error("Unmounting invalid snapshot %s at mount point %s.", device, words[1]);
-			if (!_run(UMOUNT_COMMAND, "-fl", words[1], NULL))
+			if (!_run(umount_argv))
 				log_error("Failed to umount snapshot %s at mount point %s: %s.",
 					  device, words[1], strerror(errno));
 		}
