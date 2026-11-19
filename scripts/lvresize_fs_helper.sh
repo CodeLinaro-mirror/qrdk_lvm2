@@ -156,6 +156,26 @@ validate_path() {
 	done
 }
 
+# Mount the filesystem back on $MOUNTDIR, after reading the XFS quota
+# options from the superblock.  $1 names the operation in the log lines
+# (e.g. "cleanup"); when it is empty they just say "remount".
+remount_fs() {
+	# "cleanup " or empty, so the lines read "cleanup remount ..." or
+	# "remount ...".
+	local what=${1:+$1 }
+
+	logmsg "${what}remount ${DEVPATH} ${MOUNTDIR}"
+	if [[ "$FSTYPE" == "xfs" ]]; then
+		detect_xfs_mount_options "$DEVPATH" || logmsg "not using XFS mount options"
+	fi
+
+	if mount -t "$FSTYPE" ${MOUNT_OPTIONS:+-o "$MOUNT_OPTIONS"} "$DEVPATH" "$MOUNTDIR"; then
+		logmsg "${what}remount done"
+	else
+		logerror "${what}remount failed for \"$DEVPATH\" on \"$MOUNTDIR\""
+	fi
+}
+
 # Run on any exit (EXIT trap) or interruption (signal traps).
 # Receives the exit code as $1 so the correct status is preserved:
 # signals pass 2, the EXIT trap passes the shell's real $?.
@@ -177,6 +197,12 @@ cleanup() {
 	if test -n "$TEMPDIR"; then
 		rmdir "$TEMPDIR" 2>/dev/null || true
 		rmdir "${TEMPDIR%/*}" 2>/dev/null || true
+	fi
+
+	# Failed or interrupted before the fs resize was started: the fs
+	# was not changed, so restore the original mount state (--remount).
+	if [[ "$REMOUNT_PENDING" -eq 1 && "$REMOUNT" -eq 1 ]]; then
+		remount_fs "cleanup"
 	fi
 
 	trap - EXIT HUP INT QUIT ABRT TERM
@@ -205,8 +231,11 @@ accept_e2fsck() {
 		die "e2fsck failed: usage or syntax error"
 	test $((ret & 8)) -ne 0 &&
 		die "e2fsck failed: operational error on \"$DEVPATH\""
-	test $((ret & 4)) -ne 0 &&
+	# Errors left uncorrected: cleanup() must not remount a damaged fs.
+	if test $((ret & 4)) -ne 0; then
+		REMOUNT_PENDING=0
 		die "e2fsck failed: filesystem errors left uncorrected on \"$DEVPATH\""
+	fi
 	test $((ret & ~191)) -ne 0 &&
 		die "e2fsck failed with return code $ret on \"$DEVPATH\""
 
@@ -263,6 +292,11 @@ btrfs_devid() {
 
 # Set to 1 while the fs is temporarily mounted on $TEMPDIR
 TMP_MOUNT_DONE=0
+# Set to 1 while the fs is unmounted and a remount on $MOUNTDIR from
+# cleanup() is still safe, because the fs resize has not started yet.
+# Cleared before the resize runs, and also when the fs checker reports
+# errors that were left uncorrected.
+REMOUNT_PENDING=0
 # Set to 1 if the fs resize command fails
 RESIZEFS_FAILED=0
 
@@ -360,6 +394,7 @@ fsextend() {
 		logmsg "unmount ${MOUNTDIR}"
 		umount "$MOUNTDIR" ||
 			die "unmount failed for \"$MOUNTDIR\""
+		REMOUNT_PENDING=1
 		logmsg "unmount done"
 	fi
 
@@ -393,6 +428,10 @@ fsextend() {
 		logmsg "mount done"
 		TMP_MOUNT_DONE=1
 	fi
+
+	# The fs resize starts here, the remount is done below and
+	# cleanup() must not remount the fs from here on.
+	REMOUNT_PENDING=0
 
 	#
 	# DO_FSEXTEND -eq 1: run the core fsextend command
@@ -445,6 +484,7 @@ fsreduce() {
 		logmsg "unmount ${MOUNTDIR}"
 		umount "$MOUNTDIR" ||
 			die "unmount failed for \"$MOUNTDIR\""
+		REMOUNT_PENDING=1
 		logmsg "unmount done"
 	fi
 
@@ -471,6 +511,10 @@ fsreduce() {
 		logmsg "mount done"
 		TMP_MOUNT_DONE=1
 	fi
+
+	# A failed fs resize may leave the fs in an unknown state,
+	# cleanup() must not remount it from here on.
+	REMOUNT_PENDING=0
 
 	#
 	# DO_FSREDUCE -eq 1: run the core fsreduce command
