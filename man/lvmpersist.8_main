@@ -430,6 +430,45 @@ generation number, in which case the lockstart command will update the key
 with the correct value (the generation number is officially determined
 during lockstart.)
 .P
+.SS Host PR policy
+.P
+The lvm.conf setting global/persistent_reservations configures how PR is
+used on the host (a string list in which a single value is currently
+used):
+.TP
+.B persistent_reservations = "auto"
+.br
+Use PR selectively as appropriate.  LVM uses PR automatically only where
+it is known to be useful without any user configuration: with
+use_lvmlockd=1, the first shared sanlock VG in a new environment (no old
+shared VGs visible) is created with global mode 2, using PR instead of
+the lvmlockd global lock (see
+.BR lvmlockd_global ).
+Otherwise, PR is used only when explicitly enabled for a VG with
+.B vgchange --setpersist
+and
+.B vgchange --persist
+(the default).
+.TP
+.B persistent_reservations = "full"
+.br
+Use PR whenever possible and appropriate: commands using devices that do
+not belong to a VG take a PR on them, new VGs are created with PR
+enabled (--setpersist y) when the devices support it, and lvmlockd uses
+PR instead of the global lock (global mode 2) when possible.  If a
+device does not support PR, LVM falls back to the lvmlockd global lock.
+This is recommended when using shared storage.
+.TP
+.B persistent_reservations = "none"
+.br
+Never use PR.  Commands that would start or enable PR fail.  With
+use_lvmlockd=1, lvmlockd uses global mode 1 only, and
+lvmlockd_global=global_mode_2 conflicts with this setting.
+.P
+A pr_key or host_id (see Local Settings above) must be set to use PR,
+and the same policy value should be used on all hosts sharing the same
+devices.
+.P
 .SS vgcreate
 .P
 PR features can be enabled when creating a new VG:
@@ -441,6 +480,13 @@ PR features can be enabled when creating a new VG:
 For local VGs,
 .B --persist start
 can be included to also start PR on the new VG.
+.P
+.B vgcreate --pr
+is a shortcut for
+.B --setpersist y --persist start:
+the command takes a PR on the devices it uses, and the VG is created
+with PR enabled and started.  (The --pr option cannot be combined
+with --setpersist or --persist.)
 .P
 Creating new shared VGs with --setpersist works differently.
 PR is always started for a new shared VG, even without --persist start.
