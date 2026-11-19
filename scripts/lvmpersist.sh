@@ -1489,6 +1489,14 @@ if [[ -z "$LAST_DEVICE" && -z "$VGNAME" ]]; then
 	errorexit "Missing required option: --vg or --device."
 fi
 
+# --vg names one VG.  A VG name cannot begin with "-" or "@"; the lvm
+# command that gets the devices of the VG would take the first as an
+# option and the second as a tag, and either can select the PVs of
+# other VGs.
+if [[ "$VGNAME" == "-"* || "$VGNAME" == "@"* ]]; then
+	errorexit "Invalid VG name: $VGNAME."
+fi
+
 if [[ -n "$PRTYPE_ARG" && -n "$ACCESS" ]]; then
 	errorexit "Set --prtype or --access, not both."
 fi
@@ -1697,7 +1705,7 @@ get_devices_from_vg() {
 	local REPORT
 	# lvm also prints messages to stdout (e.g. "Retrying metadata scan."),
 	# -qq turns them off without affecting the report.
-	if ! REPORT=$("$LVM" vgs -qq --nolocking --noheadings --separator : --sort pv_uuid --o pv_name --rows --config log/prefix=\"\" "$VGNAME"); then
+	if ! REPORT=$("$LVM" vgs -qq --nolocking --noheadings --separator : --sort pv_uuid --o pv_name --rows --config log/prefix=\"\" -- "$VGNAME"); then
 		die "failed to get devices from VG $VGNAME."
 	fi
 	# The report is a single line, anything printed before it
