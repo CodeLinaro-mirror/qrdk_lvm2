@@ -1077,6 +1077,18 @@ resize() {
 	return 0
 }
 
+# tune2fs prints dates as ctime() text, e.g. "Tue Nov 10 16:27:57 2026",
+# but the line a date is read from may be a string stored in the superblock.
+# This is a character gate, not a date parser: reject anything that is not
+# plain text before it reaches date -d, which would honour a TZ="..."
+# prefix and open the file it names.  The string can only be planted in a
+# crafted superblock, so the gate is defence in depth and has no test.
+date_is_plain_text() {
+	case "$1" in
+	  *[!A-Za-z0-9:\ ]*|"") return 1 ;;
+	esac
+}
+
 ####################################
 # Calculate diff between two dates
 #  LC_ALL=C input is expected the
@@ -1086,7 +1098,8 @@ diff_dates() {
 	local D1
 	local D2
 
-	if ! D1=$("$DATE" -u -d"$1" +%s 2>/dev/null) ||
+	if ! date_is_plain_text "$1" || ! date_is_plain_text "$2" ||
+	   ! D1=$("$DATE" -u -d"$1" +%s 2>/dev/null) ||
 	   ! D2=$("$DATE" -u -d"$2" +%s 2>/dev/null); then
 		verbose "Cannot parse date \"$1\" or \"$2\"."
 		echo 1
