@@ -188,6 +188,29 @@ of a device-mapper device fails, retry it and force removal.
 .br
 .B blkdeactivate -d force,retry
 .
+.SH ENVIRONMENT VARIABLES
+.
+.TP
+.B DM_DEV_DIR
+The device directory name.
+Defaults to "\fI/dev\fP".
+A value is used only when its \fImapper/control\fP node is owned by root,
+and the resolved path must be free of write access for other users
+(sticky directories like \fI/tmp\fP are accepted); otherwise
+\fBblkdeactivate\fP refuses to run or falls back to the default.
+.
+.TP
+.B LVM_BINARY
+The LVM2 binary to use.
+Defaults to "\fBlvm\fP" and must be an absolute path to a root-owned
+executable.
+.
+.TP
+.B DMSETUP_BINARY
+The dmsetup binary to use.
+Defaults to "\fBdmsetup\fP" and must be an absolute path to a root-owned
+executable.
+.
 .SH SEE ALSO
 .
 .nh

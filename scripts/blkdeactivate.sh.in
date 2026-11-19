@@ -23,7 +23,8 @@
 #       umount
 #   }
 #   dmsetup >= 1.02.68 (--retry option support)
-#   lvm >= 2.2.89 (activation/retry_deactivation config support)
+#   lvm >= 2.02.108 (activation/retry_deactivation config support,
+#                    lv_dm_path report field)
 #
 
 shopt -s dotglob nullglob
@@ -32,7 +33,11 @@ PATH="/sbin:/usr/sbin:/bin:/usr/bin"
 
 TOOL=blkdeactivate
 
+# Device-mapper nodes are looked up in the device-mapper directory, which
+# the test suite relocates with DM_DEV_DIR; kernel nodes that only
+# devtmpfs creates (dm-N, mdX) are always in /dev.
 DEV_DIR="/dev"
+DM_DEV_DIR="${DM_DEV_DIR:-$DEV_DIR}"
 SYS_BLK_DIR="/sys/block"
 
 MDADM="/sbin/mdadm"
@@ -333,7 +338,7 @@ deactivate_holders_or_skip() {
 
 deactivate_dm() {
 	local xname=$name
-	test -b "$DEV_DIR/mapper/$xname" || return 0
+	test -b "$DM_DEV_DIR/mapper/$xname" || return 0
 	test -z "${SKIP_DEVICE_LIST["$kname"]}" || return 1
 	test -z "${MOUNTED_DEVICE_LIST["$kname"]}" || return 0
 
@@ -343,7 +348,7 @@ deactivate_dm() {
 		return 1
 	}
 
-	deactivate_holders_or_skip "$DEV_DIR/mapper/$xname" || return 1
+	deactivate_holders_or_skip "$DM_DEV_DIR/mapper/$xname" || return 1
 	test -z "${MOUNTED_DEVICE_LIST["$kname"]}" || return 0
 
 	echo -n "  [DM]: deactivating $devtype device $xname ($kname)... "
@@ -357,7 +362,7 @@ deactivate_dm() {
 }
 
 deactivate_lvm() {
-	local DM_VG_NAME DM_LV_NAME lv_list lv split_out
+	local DM_VG_NAME DM_LV_NAME lv_paths lv_dm_path lv_path split_out
 	local devices holder_rc lv_kname lv_mnt
 
 	# Skip LVM device deactivation if DM tools missing.
@@ -371,7 +376,12 @@ deactivate_lvm() {
 		return 1
 	fi
 	eval "$split_out"
-	test -b "$DEV_DIR/$DM_VG_NAME/$DM_LV_NAME" || return 0
+	# VG and LV names are read from the disk, so $DM_DEV_DIR/$DM_VG_NAME
+	# need not be the directory of this VG (e.g. a VG named "mapper" or
+	# "md") and a device found there need not be this LV.  This device was
+	# found by its device-mapper name, which is what $DM_DEV_DIR/mapper
+	# holds.
+	test -b "$DM_DEV_DIR/mapper/$name" || return 0
 	test -z "${SKIP_DEVICE_LIST["$kname"]}" || return 1
 	test -z "${MOUNTED_DEVICE_LIST["$kname"]}" || return 0
 	test -z "${SKIP_VG_LIST["$DM_VG_NAME"]}" || return 1
@@ -384,7 +394,7 @@ deactivate_lvm() {
 			return 1
 		}
 		# Deactivating only the LV specified
-		deactivate_holders_or_skip "$DEV_DIR/$DM_VG_NAME/$DM_LV_NAME" || {
+		deactivate_holders_or_skip "$DM_DEV_DIR/mapper/$name" || {
 			add_device_to_skip_list
 			return 1
 		}
@@ -412,13 +422,29 @@ deactivate_lvm() {
 			return 1
 		}
 		# Deactivating the whole VG the LV is part of
-		lv_list=$("$LVM" vgs --config "$LVM_CONFIG" --noheadings --rows -o lv_name "$DM_VG_NAME" 2>&8) || {
+		#
+		# lv_dm_path is asked for rather than lv_name because the device
+		# name escapes "-" as "--" (a-b in VG vg is vg-a--b), so lv_name
+		# would mean rebuilding the escaped name here.
+		#
+		# The report asks for one field, so without --rows lvs prints
+		# one lv_dm_path per line.  --rows transposes the report, so
+		# every value of that field lands on one line separated by a
+		# space; a path holding a space cannot survive that, while
+		# reading the paths line by line keeps each one whole.
+		#
+		# The path is built from lvm's device directory, which need not be
+		# $DM_DEV_DIR and may hold a space, so keep only the device-mapper
+		# name from it and look the device up under $DM_DEV_DIR, as the
+		# single LV path above does.
+		lv_paths=$("$LVM" lvs --config "$LVM_CONFIG" --noheadings -o lv_dm_path "$DM_VG_NAME" 2>&8) || {
 			add_vg_to_skip_list
 			return 1
 		}
-		for lv in $lv_list; do
-			test -b "$DEV_DIR/$DM_VG_NAME/$lv" || continue
-			if devices=$("${LSBLK[@]}" --nodeps "$DEV_DIR/$DM_VG_NAME/$lv"); then
+		while read -r lv_dm_path; do
+			lv_path="$DM_DEV_DIR/mapper/${lv_dm_path##*/}"
+			test -b "$lv_path" || continue
+			if devices=$("${LSBLK[@]}" --nodeps "$lv_path"); then
 				read -r _ lv_kname _ lv_mnt <<< "$devices"
 				lv_mnt=$(unhex_escape "$lv_mnt")
 				# A mounted LV in this VG may not be in MOUNTED_DEVICE_LIST
@@ -429,7 +455,7 @@ deactivate_lvm() {
 					return 0
 				fi
 			fi
-			deactivate_holders "$DEV_DIR/$DM_VG_NAME/$lv" || {
+			deactivate_holders "$lv_path" || {
 				holder_rc=$?
 				test "$holder_rc" -eq 2 || {
 					add_vg_to_skip_list
@@ -438,7 +464,7 @@ deactivate_lvm() {
 				add_vg_to_mounted_list
 				return 0
 			}
-		done
+		done <<< "$lv_paths"
 
 		echo -n "  [LVM]: deactivating Volume Group $DM_VG_NAME... "
 		if "$LVM" vgchange "${LVM_OPTS[@]}" --config "log{prefix=\"    \"} $LVM_CONFIG" -aln "$DM_VG_NAME" </dev/null >&9 2>&8; then
@@ -492,7 +518,7 @@ deactivate_md() {
 
 deactivate_vdo() {
 	local xname=$name
-	test -b "$DEV_DIR/mapper/$xname" || return 0
+	test -b "$DM_DEV_DIR/mapper/$xname" || return 0
 	test -z "${SKIP_DEVICE_LIST["$kname"]}" || return 1
 	test -z "${MOUNTED_DEVICE_LIST["$kname"]}" || return 0
 
@@ -502,7 +528,7 @@ deactivate_vdo() {
 		return 1
 	}
 
-	deactivate_holders_or_skip "$DEV_DIR/mapper/$xname" || return 1
+	deactivate_holders_or_skip "$DM_DEV_DIR/mapper/$xname" || return 1
 	test -z "${MOUNTED_DEVICE_LIST["$kname"]}" || return 0
 
 	echo -n "  [VDO]: deactivating VDO volume $xname... "
@@ -715,6 +741,19 @@ get_vdoopts() {
 }
 
 set_env() {
+	# DM_DEV_DIR can be overridden (e.g. by the test suite); make sure a
+	# non-root user cannot replace it.  The mapper directory is validated
+	# (sticky world-writable parents like /tmp are allowed) because a
+	# root-owned control node alone does not make the path trustworthy.
+	if test ! -c "$DM_DEV_DIR/mapper/control" ||
+	   test "$(stat -c '%u' "$DM_DEV_DIR/mapper/control")" != "0"; then
+		DM_DEV_DIR=$DEV_DIR
+	else
+		DM_DEV_DIR=$(readlink -f "$DM_DEV_DIR") ||
+			error "Cannot resolve DM_DEV_DIR \"$DM_DEV_DIR\"."
+		validate_path DM_DEV_DIR "$DM_DEV_DIR/mapper"
+	fi
+
 	# Fail early when the tools needed for device enumeration are missing
 	# instead of silently reporting success without doing anything.
 	test -x "${LSBLK[0]}" || error "${LSBLK[0]} is required."
