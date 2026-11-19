@@ -357,6 +357,19 @@ int fs_get_info(struct cmd_context *cmd, struct logical_volume *lv, struct fs_in
 			stack;
 	}
 
+	/*
+	 * The mount table only shows mounts that are visible to this command.
+	 * An xfs that is still mounted elsewhere (e.g. in another mount
+	 * namespace) has the same possibly incorrect FSLASTBLOCK, and no
+	 * mount point to get the size from, so the size is not known.
+	 */
+	if (ret && !fsi->mounted && !strcmp(fsi->fstype, "xfs") &&
+	    dm_device_has_mounted_fs(MAJOR(st_top.st_rdev), MINOR(st_top.st_rdev))) {
+		log_warn("WARNING: xfs on %s is in use, but no mount point was found, file system size is unknown.",
+			 fsi->fs_dev_path);
+		fsi->fs_last_byte = 0;
+	}
+
 	fsi->unmounted = !fsi->mounted;
 	return ret;
 }
