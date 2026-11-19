@@ -36,20 +36,23 @@ DEV_DIR="/dev"
 SYS_BLK_DIR="/sys/block"
 
 MDADM="/sbin/mdadm"
-MOUNTPOINT="/usr/bin/mountpoint"
 MPATHD="/sbin/multipathd"
 UMOUNT="/bin/umount"
 VDO="/bin/vdo"
 
 sbindir="@SBINDIR@"
 
-if test -x "$UMOUNT" && "$UMOUNT" --help | grep -q -- "--all-targets" ; then
-	UMOUNT_OPTS=("--all-targets")
-	FINDMNT=()
-else
-	UMOUNT_OPTS=()
-	FINDMNT=(/bin/findmnt -r --noheadings -u -o TARGET)
-fi
+# findmnt answers whether a device is still mounted, and lists the mount
+# points to unmount when umount cannot do all of them at once.  It is
+# optional: lsblk can answer the same question, only less precisely.
+FINDMNT=(/bin/findmnt -r --noheadings -u -o TARGET)
+test -x "${FINDMNT[0]}" || FINDMNT=()
+# Without --all-targets the mount points of one device are unmounted one
+# by one and only the mount point just tried has to be checked, which
+# needs findmnt to list them.  --one-by-one asks for that mode; the
+# umount probe after the options fills in the default.
+UMOUNT_ONE_BY_ONE=0
+UMOUNT_OPTS=()
 DMSETUP_OPTS=()
 LVM_OPTS=()
 MDADM_OPTS=()
@@ -141,6 +144,7 @@ usage() {
 	    -r | --mdraidoptions MDRAID_OPTIONS Comma separated MD RAID specific options
 	    -o | --vdooptions    VDO_OPTIONS    Comma separated VDO specific options
 	    -u | --umount                       Unmount the device if mounted
+	    -1 | --one-by-one                   Unmount the mount points one at a time
 	    -v | --verbose                      Verbose mode (also implies -e)
 
 	  Device specific options:
@@ -215,16 +219,49 @@ unhex_escape() {
 	printf '%s' "$out$str"
 }
 
-device_umount_one() {
-	local split_out
+# A failed umount does not tell whether the device is still mounted and
+# neither does checking the mount point path: the path may be unreachable
+# or gone while the device is still mounted there or elsewhere.  Ask the
+# source the mount point came from about the device instead.
+device_or_mount_is_mounted() {
+	local kname=$1 mnt=$2
+	local devices dev target
 
+	# When every mount point of the device was tried at once, any mount
+	# point of it counts.  When they are unmounted one by one, findmnt
+	# answers about the mount point just tried, and the device check
+	# below still covers the rest.
+	if test "$UMOUNT_ONE_BY_ONE" -eq 1; then
+		# findmnt exits 1 both when nothing is mounted and when
+		# the lookup fails, so its "nothing found" does not say the
+		# device is gone.  Only a line naming the mount point just
+		# tried is taken as proof; anything else falls through to
+		# the device check below.
+		while read -r target; do
+			test "$(unhex_escape "$target")" = "$mnt" && return 0
+		done <<< "$("${FINDMNT[@]}" "$DEV_DIR/$kname" 2>&8)"
+	fi
+
+	# Consider the device mounted if it can't be checked.  Plain
+	# lsblk leaves out RAM disks and the devices stacked on them,
+	# which would make a mounted device look unmounted; --all keeps
+	# them in the list.
+	devices=$("${LSBLK[@]}" -a 2>&8) || return 0
+	while read -r _ dev _ target; do
+		test "$dev" = "$kname" && test -n "$target" && return 0
+	done <<< "$devices"
+
+	return 1
+}
+
+device_umount_one() {
 	test -z "$mnt" && return 0
 
 	if test -z "${SKIP_UMOUNT_LIST["$mnt"]}" && test "$DO_UMOUNT" -eq 1; then
 		echo -n "  [UMOUNT]: unmounting $name ($kname) mounted on $mnt... "
 		if "$UMOUNT" "${UMOUNT_OPTS[@]}" "$mnt" >&9 2>&8; then
 			echo "done"
-		elif "$MOUNTPOINT" -q "$mnt"; then
+		elif device_or_mount_is_mounted "$kname" "$mnt"; then
 			echo "skipping"
 			add_device_to_skip_list
 			return 1
@@ -251,18 +288,15 @@ device_umount() {
 
 	mnt=$(unhex_escape "$mnt")
 
-	# FINDMNT is defined only if umount --all-targets is not available.
-	# In that case, read the list of multiple mount points of one device
-	# using FINDMNT and unmount it one by one manually.
-	if test ${#FINDMNT[@]} -eq 0; then
-		device_umount_one
-	else
+	if test "$UMOUNT_ONE_BY_ONE" -eq 1; then
 		while read -r mnt; do
 			mnt=$(unhex_escape "$mnt")
 			device_umount_one || failures=1
-		done <<< "$("${FINDMNT[@]}" "$DEV_DIR/$kname")"
+		done <<< "$("${FINDMNT[@]}" "$DEV_DIR/$kname" 2>&8)"
 		return "$failures"
 	fi
+
+	device_umount_one
 }
 
 deactivate_holders() {
@@ -685,12 +719,8 @@ set_env() {
 	# instead of silently reporting success without doing anything.
 	test -x "${LSBLK[0]}" || error "${LSBLK[0]} is required."
 	test -x "${SORT_MNT[0]}" || error "${SORT_MNT[0]} is required."
-	if test ${#FINDMNT[@]} -ne 0; then
-		test -x "${FINDMNT[0]}" || error "${FINDMNT[0]} is required."
-	fi
 	if test "$DO_UMOUNT" -eq 1; then
 		test -x "$UMOUNT" || error "$UMOUNT is required for unmounting."
-		test -x "$MOUNTPOINT" || error "$MOUNTPOINT is required for unmounting."
 	fi
 
 	# fd 8: tool stderr (shown with -e/-v)
@@ -788,12 +818,26 @@ while test $# -ne 0; do
 		-r|--mdraidoptions) require_arg "$@"; shift; get_mdraidopts "$1" ;;
 		-o|--vdooptions) require_arg "$@"; shift; get_vdoopts "$1" ;;
 		-u|--umount) DO_UMOUNT=1 ;;
+		-1|--one-by-one) UMOUNT_ONE_BY_ONE=1 ;;
 		-v|--verbose) VERBOSE=1 ; ERRORS=1 ;;
 		-vv) VERBOSE=1 ; ERRORS=1 ; set -x ;;
 		*) break ;;
 	esac
 	shift
 done
+
+# Probe umount for --all-targets, so that one invocation can unmount every
+# mount point of a device.  An older umount can unmount only one mount
+# point at a time; these are then unmounted one by one, which --one-by-one
+# selects on any umount.
+if test "$UMOUNT_ONE_BY_ONE" -eq 1; then
+	test ${#FINDMNT[@]} -ne 0 || error "--one-by-one requires findmnt."
+elif test -x "$UMOUNT" &&
+     "$UMOUNT" --help | grep -q -- "--all-targets"; then
+	UMOUNT_OPTS=("--all-targets")
+elif test ${#FINDMNT[@]} -ne 0; then
+	UMOUNT_ONE_BY_ONE=1
+fi
 
 validate_override LVM_BINARY
 validate_override DMSETUP_BINARY

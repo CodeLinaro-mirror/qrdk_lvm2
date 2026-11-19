@@ -31,6 +31,7 @@ blkdeactivate \(em Utility to deactivate block devices
 .IR mdraid_options ]
 .RB [ -m | --mpathoptions\ \c
 .IR mpath_options ]
+.RB [ -1 | --one-by-one ]
 .RB [ -u | --umount ]
 .RB [ -o | --vdooptions\ \c
 .IR vdo_options ]
@@ -128,6 +129,13 @@ all the paths are unavailable for any underlying device-mapper multipath
 device.
 .
 .RE
+.
+.TP
+.BR -1 | --one-by-one
+Unmount the mount points of a device one at a time instead of unmounting
+all of them with one \fBumount\fP(8) call.
+This is the mode used automatically when \fBumount\fP(8) does not
+support the \fB--all-targets\fP option.
 .
 .TP
 .BR -u | --umount
