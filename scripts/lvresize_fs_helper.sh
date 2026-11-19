@@ -247,7 +247,7 @@ accept_e2fsck() {
 	logmsg "e2fsck done"
 }
 
-btrfs_path_major_minor() {
+device_major_minor() {
 	local STAT TARGET
 
 	TARGET=$(readlink -e "$1") ||
@@ -263,17 +263,17 @@ btrfs_devid() {
 	local devpath=$1
 	local devid devinfo major_minor path_major_minor show_output
 
-	major_minor=$(btrfs_path_major_minor "$devpath")
+	major_minor=$(device_major_minor "$devpath")
 
 	show_output=$(LC_ALL=C btrfs filesystem show "$devpath") ||
 		die "btrfs filesystem show failed on \"$devpath\""
 
 	# Multi-device btrfs: walk btrfs filesystem show output line by line.
-	# Device lines may be /dev/mapper/*; resolve via btrfs_path_major_minor.
+	# Device lines may be /dev/mapper/*; resolve via device_major_minor.
 	while IFS= read -r devinfo; do
 		case "$devinfo" in
 		*devid*)
-			path_major_minor=$(btrfs_path_major_minor "${devinfo#* path }")
+			path_major_minor=$(device_major_minor "${devinfo#* path }")
 			# compare Major:Minor
 			[ "$major_minor" = "$path_major_minor" ] || continue
 			devid=${devinfo##*devid}
@@ -389,12 +389,53 @@ cleanup_temp_mount() {
 	rmdir "${TEMPDIR%/*}" 2>/dev/null || true
 }
 
+# Decode the 3 digit octal escapes (\040 etc.) of a mount table field.
+# fsadm.sh carries the same escape decoding and explains why a single
+# printf %b eats the digit after an escape; the two scripts are installed
+# on their own, so the copy is deliberate.  Keep the loop in sync with
+# fsadm's copy; this one prints because its caller only reports the name.
+decode_mount_field() {
+	local IN=$1
+	local OUT=
+
+	while test "${IN#*\\}" != "$IN"; do
+		OUT="$OUT${IN%%\\*}\\0"
+		IN=${IN#*\\}
+	done
+	printf '%b' "$OUT$IN"
+}
+
+# Verify the fs is really unmounted after unmounting $MOUNTDIR.
+# A fs mounted on more mount points (e.g. bind mount) stays mounted, and
+# e2fsck -f would still modify it when the remaining mount is read-only.
+# The caller marks the fs as remountable before the check, so dying still
+# remounts $MOUNTDIR from cleanup() under --remount.
+check_unmounted() {
+	local major_minor devno dir
+
+	major_minor=$(device_major_minor "$DEVPATH")
+
+	# A mount in another mount namespace keeps the fs mounted as well and
+	# /proc/self/mountinfo does not show it, so every process's mountinfo
+	# is read; that covers the self entry too.  A process may exit while
+	# its file is read, which is expected and not an error here.
+	test -r /proc/self/mountinfo ||
+		die "cannot read mount information for \"$DEVPATH\""
+
+	# mountinfo fields: id parent major:minor root mountpoint ...
+	while read -r _ _ devno _ dir _; do
+		[ "$devno" != "$major_minor" ] ||
+			die "\"$DEVPATH\" is still mounted on \"$(decode_mount_field "$dir")\""
+	done < <(cat /proc/[0-9]*/mountinfo 2>/dev/null)
+}
+
 fsextend() {
 	if [ "$DO_UNMOUNT" -eq 1 ]; then
 		logmsg "unmount ${MOUNTDIR}"
 		umount "$MOUNTDIR" ||
 			die "unmount failed for \"$MOUNTDIR\""
 		REMOUNT_PENDING=1
+		check_unmounted
 		logmsg "unmount done"
 	fi
 
@@ -485,6 +526,7 @@ fsreduce() {
 		umount "$MOUNTDIR" ||
 			die "unmount failed for \"$MOUNTDIR\""
 		REMOUNT_PENDING=1
+		check_unmounted
 		logmsg "unmount done"
 	fi
 
