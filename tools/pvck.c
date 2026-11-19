@@ -2934,7 +2934,7 @@ __attribute__((nonnull(1, 2, 3)))
 static int _check_metadata_file(struct cmd_context *cmd, struct metadata_file *mf,
 				char *text_buf, uint64_t text_size)
 {
-	char *vgid, *p;
+	char *vgid;
 	int namelen;
 
 	if (text_size < NAME_LEN+1) {
@@ -2962,10 +2962,9 @@ static int _check_metadata_file(struct cmd_context *cmd, struct metadata_file *m
 		return 0;
 	}
 
-	/* Check last 3 bytes of text_buf[text_size] for valid '\n\n\0' ending.
+	/* Check the last three bytes of text_buf for a valid '\n\n\0' ending.
 	 * text_size >= NAME_LEN+1 (>= 129) ensured by check above. */
-	p = text_buf + text_size - 1;
-	if (*p != '\0' || *(--p) != '\n' || *(--p) != '\n')
+	if (memcmp(text_buf + text_size - 3, "\n\n\0", 3))
 		log_warn("WARNING: Unexpected final bytes of raw metadata, expected \\n\\n\\0.");
 
 	if (_check_vgname_start(text_buf, &namelen)) {
