@@ -289,6 +289,10 @@ key and reservation from the VG devices, disabling the ability of the
 other host to write to the devices.
 (This command applies to local VGs, for which a single host can be
 started at once.)
+The command fails without changing PR if a PV in the VG is missing,
+because the other host would still be able to write to the missing device.
+(With --majoritypvs, missing PVs are accepted, and the other host's key
+and reservation remain on them.)
 .P
 .B vgchange --persist check
 .I VG

@@ -837,6 +837,16 @@ do_takeover() {
 	require_opt OURKEY ourkey
 	require_opt REMKEY removekey
 
+	# Takeover is a fencing operation, like remove: the other host's
+	# key and reservation must be removed from all PV devices.  If any
+	# device is missing, the other host may retain its key on the
+	# missing device and still do I/O there.  Fail before making any
+	# PR changes: the check below requires REMKEY on every device, so
+	# a partial takeover could not be repeated.
+	if [[ "$MISSING_DEV_COUNT" -gt 0 ]]; then
+		die "start $GROUP failed: cannot remove key $REMKEY, $MISSING_DEV_COUNT missing device(s) in VG $VGNAME."
+	fi
+
 	err=0
 
 	for dev in "${DEVICES[@]}"; do

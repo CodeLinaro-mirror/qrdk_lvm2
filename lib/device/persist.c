@@ -2492,6 +2492,7 @@ int persist_start(struct cmd_context *cmd, struct volume_group *vg,
 	int prtype;
 	int args = 0;
 	int pv_count = 0;
+	int missing_count = 0;
 	int status;
 
 	if (update_our_key) {
@@ -2539,8 +2540,10 @@ int persist_start(struct cmd_context *cmd, struct volume_group *vg,
  key_done:
 
 	dm_list_iterate_items(pvl, &vg->pvs) {
-		if (!(dev = pvl->pv->dev))
+		if (!(dev = pvl->pv->dev)) {
+			missing_count++;
 			continue;
+		}
 		if (!dev_allow_pr(cmd, dev)) {
 			log_error("Persistent reservation not supported for device type %s.", dev_name(dev));
 			return 0;
@@ -2549,6 +2552,24 @@ int persist_start(struct cmd_context *cmd, struct volume_group *vg,
 	}
 	if (!pv_count)
 		return_0;
+
+	/*
+	 * Starting with removekey is a fencing operation, like
+	 * persist_remove(): the other host's key and reservation must
+	 * be removed from all PV devices.  If any PV device is missing,
+	 * the other host may retain its key on that device and still do
+	 * I/O, so the start must fail.  Fail before changing any PR
+	 * state: lvmpersist start --removekey requires the key on every
+	 * device, so a partial takeover could not be repeated once the
+	 * missing device returns.  A command that has been told to
+	 * handle missing PVs (--majoritypvs) accepts the incomplete
+	 * takeover.
+	 */
+	if (remkey && missing_count && !cmd->handles_missing_pvs) {
+		log_error("Cannot start PR and remove key %s: %d PV device(s) missing in VG %s.",
+			  rem_key_buf, missing_count, vg->name);
+		return 0;
+	}
 
 	/*
 	 * Enforce one host being started at a time for ex access,
