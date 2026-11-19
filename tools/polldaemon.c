@@ -561,6 +561,7 @@ static int _lvmpolld_poll_for_all_vgs(struct cmd_context *cmd,
 	struct dm_list *first;
 	struct poll_id_list *idl, *tlv;
 	unsigned finished;
+	int r;
 	lvmpolld_parms_t lpdp = {
 		.parms = parms
 	};
@@ -569,8 +570,12 @@ static int _lvmpolld_poll_for_all_vgs(struct cmd_context *cmd,
 
 	handle->custom_handle = &lpdp;
 
-	if (ECMD_PROCESSED !=
-	    process_each_vg(cmd, 0, NULL, NULL, NULL, 0, 0, handle, _lvmpolld_init_poll_vg))
+	r = process_each_vg(cmd, 0, NULL, NULL, NULL, 0, 0, handle, _lvmpolld_init_poll_vg);
+
+	/* lpdp is local here, do not leave it in the caller's handle. */
+	handle->custom_handle = NULL;
+
+	if (ECMD_PROCESSED != r)
 		return_0;
 
 	first = dm_list_first(&lpdp.idls);
