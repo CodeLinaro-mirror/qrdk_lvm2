@@ -2780,7 +2780,7 @@ static int _udev_notify_sem_destroy(uint32_t cookie, int semid)
 static int _udev_notify_sem_create(uint32_t *cookie, int *semid)
 {
 	int fd;
-	int gen_semid;
+	int gen_semid = -1;
 	int val;
 	uint16_t base_cookie;
 	uint32_t gen_cookie;
