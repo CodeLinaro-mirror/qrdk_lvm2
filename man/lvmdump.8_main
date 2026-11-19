@@ -121,6 +121,8 @@ Print help message
 Gather LVM metadata from the PVs
 This option generates a 1:1 dump of the metadata area from all PVs visible
 to the system, which can cause the dump to increase in size considerably.
+All copies together are limited to half of the space available in the
+filesystem of the dump; PVs that do not fit are skipped with a warning.
 However, the metadata dump may represent a valuable diagnostic resource.
 .
 .TP

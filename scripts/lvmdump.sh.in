@@ -356,9 +356,19 @@ if (( metadata )); then
 
 	run "$MKDIR" -p "$dir/metadata"
 
+	# pe_start is read from the PVs themselves, so limit all copies together
+	# to half of the space available in the filesystem of the dump; the
+	# other half is left for the tarball and for the system.  PVs are taken
+	# in order of pe_start, so large ones cannot crowd out the rest.
+	free_space=$("$STAT" -f -c '%a %S' "$dir" 2>> "$log") || free_space="0 0"
+	free_blocks=${free_space% *}
+	block_bytes=${free_space#* }
+	# pe_start is a 512-byte sector count, so the budget is one too.
+	md_space_sectors=$(( free_blocks * block_bytes / 512 / 2 ))
+
 	{
 	"$LVM" pvs --separator , --noheadings --units s --nosuffix -o \
-	    name,pe_start 2>> "$log" | "$SED" -e 's/^ *//' |
+	    name,pe_start -O pe_start 2>> "$log" | "$SED" -e 's/^ *//' |
 	while IFS=, read -r pv pe_start || test -n "$pv"; do
 		test -z "$pv" && continue
 		# A missing PV has no device and pvs prints a placeholder
@@ -376,6 +386,11 @@ if (( metadata )); then
 			myecho "  WARNING: skipping $pv (pe_start $pe_start too large)."
 			continue
 		fi
+		if [ "$pe_start" -gt "$md_space_sectors" ]; then
+			myecho "  WARNING: skipping $pv (pe_start $pe_start, not enough free space in $dir)."
+			continue
+		fi
+		md_space_sectors=$(( md_space_sectors - pe_start ))
 		myecho "  $pv"
 		run "$DD" "if=$pv" "of=$dir/metadata/${pv##*/}" "${DDFLAGS[@]}" count="$(( (pe_start + 7) / 8 ))" 2>> "$log"
 	done
