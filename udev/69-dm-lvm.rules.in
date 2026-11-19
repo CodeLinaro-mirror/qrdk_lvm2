@@ -85,11 +85,18 @@ LABEL="lvm_scan"
 # (using checkcomplete) will do nothing, so that
 # no event-based autoactivation will be happen.
 #
+# The unit name is given with an explicit .service
+# suffix.  VG names may contain dots, and without
+# the suffix systemd-run takes a VG name that ends
+# in a unit type as the type of the unit, so that
+# e.g. VG "foo.service" would use the unit
+# lvm-activate-foo.service which belongs to VG "foo".
+#
 # TODO: adjust the output of vgchange -aay so that
 # it's better suited to appearing in the journal.
 
 IMPORT{program}="(LVM_EXEC)/lvm pvscan --cache --listvg --checkcomplete --vgonline --autoactivation event --udevoutput --journal=output $env{DEVNAME}"
-ENV{LVM_VG_NAME_COMPLETE}=="?*", RUN+="(SYSTEMDRUN) --no-block --property DefaultDependencies=no --unit lvm-activate-$env{LVM_VG_NAME_COMPLETE} (LVM_EXEC)/lvm vgchange -aay --autoactivation event $env{LVM_VG_NAME_COMPLETE}"
+ENV{LVM_VG_NAME_COMPLETE}=="?*", RUN+="(SYSTEMDRUN) --no-block --property DefaultDependencies=no --unit lvm-activate-$env{LVM_VG_NAME_COMPLETE}.service (LVM_EXEC)/lvm vgchange -aay --autoactivation event $env{LVM_VG_NAME_COMPLETE}"
 GOTO="lvm_end"
 
 LABEL="lvm_end"
