@@ -137,7 +137,7 @@ BLOCKSIZE=
 BLOCKCOUNT=
 MOUNTPOINT=
 MOUNTED=
-REMOUNT=
+REMOUNT_DIR=
 PROCDIR="/proc"
 PROCMOUNTS="$PROCDIR/mounts"
 PROCSELFMOUNTINFO="$PROCDIR/self/mountinfo"
@@ -290,10 +290,10 @@ cleanup() {
 		"$RMDIR" "${TEMPDIR%/*}" 2>/dev/null || warning "Failed to remove \"${TEMPDIR%/*}\"."
 		TEMPDIR=
 	fi
-	if test -n "$REMOUNT"; then
+	if test -n "$REMOUNT_DIR"; then
 		verbose "Remounting unmounted filesystem back."
-		dry "$MOUNT" "$VOLUME" "$MOUNTED" ||
-			warning "Failed to remount \"$VOLUME\" on \"$MOUNTED\"."
+		dry "$MOUNT" "$VOLUME" "$REMOUNT_DIR" ||
+			warning "Failed to remount \"$VOLUME\" on \"$REMOUNT_DIR\"."
 	fi
 	trap - EXIT HUP INT QUIT ABRT TERM
 
@@ -681,10 +681,21 @@ yes_no() {
 	return 1
 }
 
+# Unmount the filesystem and verify it is really unmounted.
+# A filesystem mounted on more mount points (bind mount, other mount
+# namespace) stays mounted after unmounting MOUNTED, and offline fsck -f
+# would still modify it when the remaining mount is read-only.
+# Sets: REMOUNT_DIR, captured before detect_mounted() overwrites MOUNTED.
 try_umount() {
 	test "$DRY" -ne 0 || yes_no "Do you want to unmount \"$MOUNTED\"" ||
 		error "Cannot proceed with mounted filesystem \"$MOUNTED\"."
 	dry "$UMOUNT" "$MOUNTED" || error "Failed to unmount \"$MOUNTED\"."
+	test "$DRY" -eq 0 || return 0
+	REMOUNT_DIR=$MOUNTED
+	if detect_mounted; then
+		error "Cannot $ACTION device \"$VOLUME\" with filesystem still mounted on \"$MOUNTED\"." \
+		      "Unmount it from all mount points (bind mounts, other mount namespaces) first."
+	fi
 }
 
 validate_parsing() {
@@ -750,9 +761,6 @@ resize_ext() {
 			verbose "\"$FSTYPE\" resizes only unmounted filesystem."
 			try_umount
 		fi
-		if test "$DRY" -eq 0; then
-			REMOUNT=$MOUNTED
-		fi
 		if test "$DRY" -eq 0 || test "$IS_MOUNTED" -eq 1; then
 			# Forced fsck -f for unmounted extX filesystem.
 			FLAG=$(get_fsck_mode)
@@ -768,7 +776,7 @@ resize_ext() {
 # Resize reiserfs filesystem
 # - unmounted for upsize
 # - unmounted for downsize
-# Sets: REMOUNT
+# Sets: REMOUNT_DIR
 #############################
 resize_reiser() {
 	local i
@@ -792,9 +800,6 @@ resize_reiser() {
 	if detect_mounted; then
 		verbose "ReiserFS resizes only unmounted filesystem."
 		try_umount
-	fi
-	if test "$DRY" -eq 0; then
-		REMOUNT=$MOUNTED
 	fi
 	test "$DRY" -eq 0 || warning "Only ReiserFS geometry was checked; its filesystem checker can replay the journal."
 	verbose "Resizing filesystem on device \"$VOLUME\" to $NEWSIZE bytes ($BLOCKCOUNT -> $NEWBLOCKCOUNT blocks of $BLOCKSIZE bytes)."
