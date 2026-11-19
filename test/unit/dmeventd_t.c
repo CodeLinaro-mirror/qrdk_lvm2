@@ -217,17 +217,17 @@ static void _write_message(int fd, uint32_t cmd, const char *data)
 {
 	size_t size = strlen(data);
 	size_t total = 2 * sizeof(uint32_t) + size;
-	uint32_t *buf;
+	uint32_t hdr[2] = { htonl(cmd), htonl(size) };
+	char *buf;
 	ssize_t written;
 
 	buf = malloc(total);
 	T_ASSERT(buf);
-	buf[0] = htonl(cmd);
-	buf[1] = htonl(size);
-	memcpy((char *) buf + 2 * sizeof(uint32_t), data, size);
+	memcpy(buf, hdr, sizeof(hdr));
+	memcpy(buf + sizeof(hdr), data, size);
 
 	for (written = 0; written < (ssize_t) total; ) {
-		ssize_t n = write(fd, (char *) buf + written, total - written);
+		ssize_t n = write(fd, buf + written, total - written);
 		T_ASSERT(n > 0);
 		written += n;
 	}
