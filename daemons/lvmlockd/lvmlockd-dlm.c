@@ -924,8 +924,11 @@ int lm_refresh_lv_start_dlm(struct action *act)
 	vgname = p;
 
 	/* skip past vgname */
-	while (*p != '/')
+	while (*p && *p != '/')
 		p++;
+
+	if (!*p)
+		return -EINVAL;
 
 	/* terminate vgname */
 	*p = '\0';
@@ -936,6 +939,8 @@ int lm_refresh_lv_start_dlm(struct action *act)
 		p++;
 
 	lvname = p;
+	if (!*lvname)
+		return -EINVAL;
 
 	memset(command, 0, sizeof(command));
 	memset(run_uuid, 0, sizeof(run_uuid));
