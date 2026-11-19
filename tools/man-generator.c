@@ -1454,13 +1454,11 @@ static int _read_meta_field(FILE *fp, const char *key,
 		/* Key must be followed by whitespace or '=', not another letter */
 		if (*value != ' ' && *value != '\t' && *value != '=')
 			continue;
-		while (*value == ' ' || *value == '\t')
-			value++;
+		value += strspn(value, " \t");
 		if (*value != '=')
 			continue;
 		value++;
-		while (*value == ' ' || *value == '\t')
-			value++;
+		value += strspn(value, " \t");
 		len = strlen(value);
 		if (len > 0 && value[len - 1] == '\n')
 			len--;
