@@ -1845,8 +1845,9 @@ static struct logical_volume *_set_up_mirror_log(struct cmd_context *cmd,
 	} else if ((lv_name = strstr(lv->name, MIRROR_SYNC_LAYER))) {
 		len = lv_name - lv->name;
 		tmp_name = alloca(len + 1);
+		memcpy(tmp_name, lv->name, len);
 		tmp_name[len] = '\0';
-		lv_name = strncpy(tmp_name, lv->name, len);
+		lv_name = tmp_name;
 		suffix = "_mlog";
 	} else {
 		lv_name = lv->name;
