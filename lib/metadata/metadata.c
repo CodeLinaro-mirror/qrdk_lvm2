@@ -5289,13 +5289,15 @@ int get_visible_lvs_using_pv(struct cmd_context *cmd, struct volume_group *vg, s
 int lv_is_linear(const struct logical_volume *lv)
 {
 	const struct lv_segment *seg = first_seg(lv);
-	return segtype_is_linear(seg->segtype);
+
+	return seg && segtype_is_linear(seg->segtype);
 }
 
 int lv_is_striped(const struct logical_volume *lv)
 {
 	const struct lv_segment *seg = first_seg(lv);
-	return segtype_is_striped(seg->segtype);
+
+	return seg && segtype_is_striped(seg->segtype);
 }
 
 int setting_str_list_add(const char *field, uint64_t val, char *val_str, struct dm_list *result, struct dm_pool *mem)
