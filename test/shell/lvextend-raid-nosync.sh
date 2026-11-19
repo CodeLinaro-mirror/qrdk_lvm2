@@ -106,9 +106,11 @@ check lv_field $vg/$lv1 lv_size "32.00m"
 check lv_attr_bit type $vg/$lv1 "R"
 # Shrinking a RAID LV needs dm-raid 1.9.0.  Do not pass --fs ignore:
 # without libblkid only the fsadm-based fs handling exists, and the LV
-# has no filesystem to resize anyway.
+# has no filesystem to resize anyway.  Such a build cannot tell that
+# either, so it still asks before shrinking an active LV: answer the
+# confirmation instead of relying on stdin.
 if aux have_raid 1 9 0; then
-	lvresize -L 28M $vg/$lv1
+	lvresize --yes -L 28M $vg/$lv1
 	check lv_field $vg/$lv1 lv_size "28.00m"
 	check lv_attr_bit type $vg/$lv1 "R"
 fi
