@@ -250,11 +250,36 @@ int fid_remove_mda(struct format_instance *fid, struct metadata_area *mda,
 struct metadata_area *fid_get_mda_indexed(struct format_instance *fid,
 		const char *key, size_t key_len, const unsigned sub_key);
 
-#define seg_pvseg(seg, s)	(seg)->areas[(s)].u.pv.pvseg
-#define seg_dev(seg, s)		(seg)->areas[(s)].u.pv.pvseg->pv->dev
-#define seg_pe(seg, s)		(seg)->areas[(s)].u.pv.pvseg->pe
-#define seg_le(seg, s)		(seg)->areas[(s)].u.lv.le
-#define seg_metale(seg, s)	(seg)->meta_areas[(s)].u.lv.le
+/*
+ * Segment area access used inside the library; the commands get the subset
+ * they call from metadata-exported.h.  Use the macros below rather than
+ * calling these directly: they pass __func__ so a failed access names its
+ * caller.
+ */
+area_type_t _seg_metatype(const struct lv_segment *seg, uint32_t s, const char *where);
+struct pv_segment *_seg_pvseg(const struct lv_segment *seg, uint32_t s, const char *where);
+struct device *_seg_dev(const struct lv_segment *seg, uint32_t s, const char *where);
+uint32_t _seg_pe(const struct lv_segment *seg, uint32_t s, const char *where);
+uint32_t _seg_le(const struct lv_segment *seg, uint32_t s, const char *where);
+uint32_t _seg_metale(const struct lv_segment *seg, uint32_t s, const char *where);
+void _set_seg_lv(struct lv_segment *seg, uint32_t s, struct logical_volume *lv, const char *where);
+void _set_seg_pvseg(struct lv_segment *seg, uint32_t s, struct pv_segment *pvseg, const char *where);
+void _set_seg_le(struct lv_segment *seg, uint32_t s, uint32_t le, const char *where);
+void _set_seg_metalv(struct lv_segment *seg, uint32_t s, struct logical_volume *lv, const char *where);
+void _set_seg_metale(struct lv_segment *seg, uint32_t s, uint32_t le, const char *where);
+
+#define seg_metatype(seg, s)		_seg_metatype((seg), (s), __func__)
+#define seg_pvseg(seg, s)		_seg_pvseg((seg), (s), __func__)
+#define seg_dev(seg, s)			_seg_dev((seg), (s), __func__)
+#define seg_pe(seg, s)			_seg_pe((seg), (s), __func__)
+#define seg_le(seg, s)			_seg_le((seg), (s), __func__)
+#define seg_metale(seg, s)		_seg_metale((seg), (s), __func__)
+
+#define set_seg_lv(seg, s, lv)		_set_seg_lv((seg), (s), (lv), __func__)
+#define set_seg_pvseg(seg, s, pvseg)	_set_seg_pvseg((seg), (s), (pvseg), __func__)
+#define set_seg_le(seg, s, le)		_set_seg_le((seg), (s), (le), __func__)
+#define set_seg_metalv(seg, s, lv)	_set_seg_metalv((seg), (s), (lv), __func__)
+#define set_seg_metale(seg, s, le)	_set_seg_metale((seg), (s), (le), __func__)
 
 struct name_list {
 	struct dm_list list;

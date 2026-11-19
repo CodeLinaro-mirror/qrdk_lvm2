@@ -140,8 +140,9 @@ static struct dm_list *_format_pvsegs(struct dm_pool *mem, const struct lv_segme
 	for (s = 0; s < seg->area_count; s++) {
 		switch (metadata_areas_only ? seg_metatype(seg, s) : seg_type(seg, s)) {
 		case AREA_LV:
-			lv = metadata_areas_only ? seg_metalv(seg, s) : seg_lv(seg, s);
-			seg_len = metadata_areas_only ? seg_metalv(seg, s)->le_count : seg_lv(seg, s)->le_count;
+			if (!(lv = metadata_areas_only ? seg_metalv(seg, s) : seg_lv(seg, s)))
+				goto_bad;
+			seg_len = lv->le_count;
 			visible = lv_is_visible(lv);
 			name = lv->name;
 			extent = metadata_areas_only ? seg_le(seg, s) : 0;
@@ -1372,9 +1373,13 @@ static int _sublvs_remove_after_reshape(const struct logical_volume *lv)
 	uint32_t s;
 	struct lv_segment *seg = first_seg(lv);
 
-	for (s = 0; s < seg->area_count; s++)
-		if (seg_lv(seg, s)->status & LV_REMOVE_AFTER_RESHAPE)
+	for (s = 0; s < seg->area_count; s++) {
+		const struct logical_volume *sub_lv = seg_lv(seg, s);
+
+		/* An area that holds no LV is not a sub-LV to remove. */
+		if (sub_lv && (sub_lv->status & LV_REMOVE_AFTER_RESHAPE))
 			return 1;
+	}
 
 	return 0;
 }
@@ -1904,4 +1909,251 @@ int lv_has_constant_stripes(struct logical_volume *lv)
 	}
 
 	return 1;
+}
+
+/*
+ * Area accessors.
+ *
+ * A segment has area_count slots in seg->areas, and the same number in
+ * seg->meta_areas when the segment declares that array.  Either array can
+ * be absent - a segment type without meta areas, or a segment whose areas
+ * were all extracted - and an absent array means no area rather than a bad
+ * access: a type query answers unassigned, while asking for the LV or the
+ * PV it cannot hold is reported like any other impossible request.  Each
+ * slot that does exist is tagged with the kind of area it holds, and
+ * following the union of a slot that holds another kind would read a
+ * pv_segment pointer or a pe number as an LV, so the accessors check the
+ * tag and never return a slot of the wrong type.  A failure is reported at
+ * debug level with the INTERNAL_ERROR prefix: the test suite runs with
+ * abort_on_internal_errors set, so a bad access fails a test and names the
+ * caller, while a normal run only sees NULL and carries on.
+ *
+ * _area_at() and _meta_area_at() are the only places that check an index,
+ * and they return the slot, so an accessor reads the tag from the slot
+ * instead of calling one of the checked readers again: that would repeat a
+ * check which has just passed and would name the accessor, not its caller,
+ * in the message.  The two arrays are separate and each may be absent, so
+ * each has its own function rather than a flag on one.  _area_typed() is
+ * the single place that checks a slot's tag, so every reader that follows
+ * a union member reports a wrong kind the same way.
+ */
+static const struct lv_segment_area *_area_at(const struct lv_segment *seg,
+					      uint32_t s, const char *where)
+{
+	if (!seg->areas) {
+		log_debug(INTERNAL_ERROR "Areas of LV %s are not present (in %s).",
+			  seg->lv ? seg->lv->name : "?", where);
+		return NULL;
+	}
+	if (s >= seg->area_count) {
+		log_debug(INTERNAL_ERROR "Area %u of LV %s is past area_count %u (in %s).",
+			  s, seg->lv ? seg->lv->name : "?", seg->area_count, where);
+		return NULL;
+	}
+
+	return &seg->areas[s];
+}
+
+static const struct lv_segment_area *_meta_area_at(const struct lv_segment *seg,
+						   uint32_t s, const char *where)
+{
+	if (!seg->meta_areas) {
+		log_debug(INTERNAL_ERROR "Meta area %u of LV %s is not present (in %s).",
+			  s, seg->lv ? seg->lv->name : "?", where);
+		return NULL;
+	}
+	if (s >= seg->area_count) {
+		log_debug(INTERNAL_ERROR "Meta area %u of LV %s is past area_count %u (in %s).",
+			  s, seg->lv ? seg->lv->name : "?", seg->area_count, where);
+		return NULL;
+	}
+
+	return &seg->meta_areas[s];
+}
+
+static const struct lv_segment_area *_area_typed(const struct lv_segment *seg,
+						 const struct lv_segment_area *area,
+						 area_type_t type, uint32_t s,
+						 const char *what, const char *where)
+{
+	if (area->type == AREA_UNASSIGNED)
+		return NULL;
+	if (area->type != type) {
+		log_debug(INTERNAL_ERROR "%s %u of LV %s is not %s area (in %s).",
+			  what, s, seg->lv ? seg->lv->name : "?",
+			  (type == AREA_LV) ? "an LV" : "a PV", where);
+		return NULL;
+	}
+	return area;
+}
+
+struct logical_volume *_seg_lv(const struct lv_segment *seg, uint32_t s,
+			       const char *where)
+{
+	const struct lv_segment_area *area;
+
+	if (!(area = _area_at(seg, s, where)) ||
+	    !(area = _area_typed(seg, area, AREA_LV, s, "Area", where)))
+		return NULL;
+	return area->u.lv.lv;
+}
+
+struct pv_segment *_seg_pvseg(const struct lv_segment *seg, uint32_t s,
+			      const char *where)
+{
+	const struct lv_segment_area *area;
+
+	if (!(area = _area_at(seg, s, where)) ||
+	    !(area = _area_typed(seg, area, AREA_PV, s, "Area", where)))
+		return NULL;
+	return area->u.pv.pvseg;
+}
+
+struct physical_volume *_seg_pv(const struct lv_segment *seg, uint32_t s,
+				const char *where)
+{
+	struct pv_segment *pvseg;
+
+	if (!(pvseg = _seg_pvseg(seg, s, where)))
+		return NULL;
+	return pvseg->pv;
+}
+
+struct device *_seg_dev(const struct lv_segment *seg, uint32_t s, const char *where)
+{
+	struct pv_segment *pvseg;
+
+	if (!(pvseg = _seg_pvseg(seg, s, where)) || !pvseg->pv)
+		return NULL;
+	return pvseg->pv->dev;
+}
+
+uint32_t _seg_pe(const struct lv_segment *seg, uint32_t s, const char *where)
+{
+	struct pv_segment *pvseg;
+
+	if (!(pvseg = _seg_pvseg(seg, s, where)))
+		return 0;
+	return pvseg->pe;
+}
+
+uint32_t _seg_le(const struct lv_segment *seg, uint32_t s, const char *where)
+{
+	const struct lv_segment_area *area;
+
+	if (!(area = _area_at(seg, s, where)) ||
+	    !(area = _area_typed(seg, area, AREA_LV, s, "Area", where)))
+		return 0;
+	return area->u.lv.le;
+}
+
+struct logical_volume *_seg_metalv(const struct lv_segment *seg, uint32_t s,
+				   const char *where)
+{
+	const struct lv_segment_area *area;
+
+	if (!(area = _meta_area_at(seg, s, where)) ||
+	    !(area = _area_typed(seg, area, AREA_LV, s, "Meta area", where)))
+		return NULL;
+	return area->u.lv.lv;
+}
+
+uint32_t _seg_metale(const struct lv_segment *seg, uint32_t s, const char *where)
+{
+	const struct lv_segment_area *area;
+
+	if (!(area = _meta_area_at(seg, s, where)) ||
+	    !(area = _area_typed(seg, area, AREA_LV, s, "Meta area", where)))
+		return 0;
+	return area->u.lv.le;
+}
+
+area_type_t _seg_type(const struct lv_segment *seg, uint32_t s, const char *where)
+{
+	const struct lv_segment_area *area;
+
+	if (!seg->areas)
+		return AREA_UNASSIGNED;
+	if (!(area = _area_at(seg, s, where)))
+		return AREA_UNASSIGNED;
+	return area->type;
+}
+
+/*
+ * Meta areas exist only for segment types that declare them, so a
+ * missing array means "no meta area" rather than a bad access.
+ */
+area_type_t _seg_metatype(const struct lv_segment *seg, uint32_t s, const char *where)
+{
+	const struct lv_segment_area *area;
+
+	if (!seg->meta_areas)
+		return AREA_UNASSIGNED;
+	if (!(area = _meta_area_at(seg, s, where)))
+		return AREA_UNASSIGNED;
+	return area->type;
+}
+
+/*
+ * Writers, reached through the same macros.  Each stores the object and
+ * sets the tag to match it: AREA_LV or AREA_PV for a real object and
+ * unassigned for NULL, so a cleared area cannot be read as the kind it
+ * used to hold.  An LV area that is cleared loses its le as well.
+ *
+ * They call _area_at()/_meta_area_at() for the index check and then update
+ * the array themselves: taking the slot from a read helper would mean
+ * casting the const view away.  The le writers also go through the tag
+ * check, since only an LV area carries an le.
+ */
+static void _set_area_lv(struct lv_segment_area *area, struct logical_volume *lv)
+{
+	area->u.lv.lv = lv;
+	area->type = lv ? AREA_LV : AREA_UNASSIGNED;
+	if (!lv)
+		area->u.lv.le = 0;
+}
+
+void _set_seg_lv(struct lv_segment *seg, uint32_t s, struct logical_volume *lv,
+		 const char *where)
+{
+	if (!_area_at(seg, s, where))
+		return;
+	_set_area_lv(&seg->areas[s], lv);
+}
+
+void _set_seg_pvseg(struct lv_segment *seg, uint32_t s, struct pv_segment *pvseg,
+		    const char *where)
+{
+	if (!_area_at(seg, s, where))
+		return;
+	seg->areas[s].u.pv.pvseg = pvseg;
+	seg->areas[s].type = pvseg ? AREA_PV : AREA_UNASSIGNED;
+}
+
+void _set_seg_le(struct lv_segment *seg, uint32_t s, uint32_t le, const char *where)
+{
+	const struct lv_segment_area *area;
+
+	if (!(area = _area_at(seg, s, where)) ||
+	    !_area_typed(seg, area, AREA_LV, s, "Area", where))
+		return;
+	seg->areas[s].u.lv.le = le;
+}
+
+void _set_seg_metalv(struct lv_segment *seg, uint32_t s, struct logical_volume *lv,
+		     const char *where)
+{
+	if (!_meta_area_at(seg, s, where))
+		return;
+	_set_area_lv(&seg->meta_areas[s], lv);
+}
+
+void _set_seg_metale(struct lv_segment *seg, uint32_t s, uint32_t le, const char *where)
+{
+	const struct lv_segment_area *area;
+
+	if (!(area = _meta_area_at(seg, s, where)) ||
+	    !_area_typed(seg, area, AREA_LV, s, "Meta area", where))
+		return;
+	seg->meta_areas[s].u.lv.le = le;
 }

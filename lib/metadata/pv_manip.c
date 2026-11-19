@@ -409,8 +409,7 @@ int check_pv_segments(struct volume_group *vg)
 				if (seg_type(peg->lvseg, s) != AREA_PV) {
 					log_error("Wrong lvseg area type");
 					ret = 0;
-				}
-				if (seg_pvseg(peg->lvseg, s) != peg) {
+				} else if (seg_pvseg(peg->lvseg, s) != peg) {
 					log_error("Inconsistent pvseg pointers");
 					ret = 0;
 				}

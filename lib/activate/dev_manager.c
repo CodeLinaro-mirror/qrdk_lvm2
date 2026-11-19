@@ -18,6 +18,7 @@
 #include "lib/misc/lvm-string.h"
 #include "fs.h"
 #include "lib/config/defaults.h"
+#include "lib/metadata/metadata.h"
 #include "lib/metadata/segtype.h"
 #include "lib/display/display.h"
 #include "lib/commands/toolcontext.h"
@@ -3153,9 +3154,11 @@ static int _add_error_area(struct dev_manager *dm, struct dm_tree_node *node,
 		 * we don't have the struct definition available.
 		 */
 		struct dm_tree **tree = (struct dm_tree **) node;
+		uint32_t offset = (seg_type(seg, s) == AREA_LV) ? seg_le(seg, s) : 0;
+
 		if (!(dlid = _add_error_or_zero_device(dm, *tree, seg, s, use_zero)))
 			return_0;
-		if (!dm_tree_node_add_target_area(node, NULL, dlid, extent_size * seg_le(seg, s)))
+		if (!dm_tree_node_add_target_area(node, NULL, dlid, extent_size * offset))
 			return_0;
 	} else
 		if (!dm_tree_node_add_target_area(node, dm->cmd->stripe_filler, NULL, UINT64_C(0)))

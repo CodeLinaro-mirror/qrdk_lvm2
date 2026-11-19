@@ -788,6 +788,7 @@ static int _raid_remove_top_layer(struct logical_volume *lv,
 {
 	struct lv_list *lvl_array, *lvl;
 	struct lv_segment *seg = first_seg(lv);
+	struct logical_volume *data_lv, *meta_lv;
 
 	if (!seg_is_mirrored(seg)) {
 		log_error(INTERNAL_ERROR
@@ -808,21 +809,26 @@ static int _raid_remove_top_layer(struct logical_volume *lv,
 		return 0;
 	}
 
-	/* Add last metadata area to removal_lvs */
-	lvl_array[0].lv = seg_metalv(seg, 0);
-	lv_set_visible(seg_metalv(seg, 0));
-	if (!remove_seg_from_segs_using_this_lv(seg_metalv(seg, 0), seg))
+	/* Read both sub LVs before either area is cleared */
+	if (!(meta_lv = seg_metalv(seg, 0)) ||
+	    !(data_lv = seg_lv(seg, 0)))
 		return_0;
-	seg_metatype(seg, 0) = AREA_UNASSIGNED;
+
+	/* Add last metadata area to removal_lvs */
+	lvl_array[0].lv = meta_lv;
+	lv_set_visible(meta_lv);
+	if (!remove_seg_from_segs_using_this_lv(meta_lv, seg))
+		return_0;
+	set_seg_metalv(seg, 0, NULL);
 	dm_list_add(removal_lvs, &(lvl_array[0].list));
 
 	/* Remove RAID layer and add residual LV to removal_lvs*/
-	seg_lv(seg, 0)->status &= ~RAID_IMAGE;
-	lv_set_visible(seg_lv(seg, 0));
-	lvl_array[1].lv = seg_lv(seg, 0);
+	data_lv->status &= ~RAID_IMAGE;
+	lv_set_visible(data_lv);
+	lvl_array[1].lv = data_lv;
 	dm_list_add(removal_lvs, &(lvl_array[1].list));
 
-	if (!remove_layer_from_lv(lv, seg_lv(seg, 0)))
+	if (!remove_layer_from_lv(lv, data_lv))
 		return_0;
 
 	lv->status &= ~(MIRRORED | RAID);
@@ -3664,8 +3670,8 @@ static int _extract_image_components(struct lv_segment *seg, uint32_t idx,
 	    !remove_seg_from_segs_using_this_lv(meta_lv, seg))
 		return_0;
 
-	seg_type(seg, idx) = AREA_UNASSIGNED;
-	seg_metatype(seg, idx) = AREA_UNASSIGNED;
+	set_seg_lv(seg, idx, NULL);
+	set_seg_metalv(seg, idx, NULL);
 
 	if (!(data_lv_name = _generate_raid_name(data_lv, "extracted", -1)) ||
 	    !(meta_lv_name = _generate_raid_name(meta_lv, "extracted", -1)))
@@ -4882,14 +4888,14 @@ static int _extract_image_component_error_seg(struct lv_segment *seg,
 
 	switch (type) {
 		case RAID_META:
-			lv = seg_metalv(seg, idx);
-			seg_metalv(seg, idx) = NULL;
-			seg_metatype(seg, idx) = AREA_UNASSIGNED;
+			if (!(lv = seg_metalv(seg, idx)))
+				return_0;
+			set_seg_metalv(seg, idx, NULL);
 			break;
 		case RAID_IMAGE:
-			lv = seg_lv(seg, idx);
-			seg_lv(seg, idx) = NULL;
-			seg_type(seg, idx) = AREA_UNASSIGNED;
+			if (!(lv = seg_lv(seg, idx)))
+				return_0;
+			set_seg_lv(seg, idx, NULL);
 			break;
 		default:
 			log_error(INTERNAL_ERROR "Bad type provided to %s.", __func__);
@@ -5362,7 +5368,6 @@ static int _striped_to_raid0_move_segs_to_raid0_lvs(struct logical_volume *lv,
 							 0 /* chunk_size */, 0 /* region_size */, 0, NULL)))
 				return_0;
 
-			seg_type(seg_new, 0) = AREA_UNASSIGNED;
 			dm_list_add(&dlv->segments, &seg_new->list);
 			le += seg_from->area_len;
 
@@ -6249,14 +6254,14 @@ static void _switch_area_lvs(struct lv_segment *seg, uint32_t s1, uint32_t s2)
 	struct logical_volume *lvt;
 
 	lvt = seg_lv(seg, s1);
-	seg_lv(seg, s1) = seg_lv(seg, s2);
-	seg_lv(seg, s2) = lvt;
+	set_seg_lv(seg, s1, seg_lv(seg, s2));
+	set_seg_lv(seg, s2, lvt);
 
 	/* Be cautious */
 	if (seg->meta_areas) {
 		lvt = seg_metalv(seg, s1);
-		seg_metalv(seg, s1) = seg_metalv(seg, s2);
-		seg_metalv(seg, s2) = lvt;
+		set_seg_metalv(seg, s1, seg_metalv(seg, s2));
+		set_seg_metalv(seg, s2, lvt);
 	}
 }
 

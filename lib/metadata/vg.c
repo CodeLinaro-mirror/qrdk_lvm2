@@ -515,27 +515,33 @@ int vg_set_extent_size(struct volume_group *vg, uint32_t new_extent_size)
 
 			/* foreach area */
 			for (s = 0; s < seg->area_count; s++) {
+				uint32_t le;
+
 				switch (seg_type(seg, s)) {
 				case AREA_PV:
+					if (!(pvseg = seg_pvseg(seg, s)))
+						return_0;
 					if (!_recalc_extents
-					    (&seg_pe(seg, s),
+					    (&pvseg->pe,
 					     lv->name,
 					     " pvseg start", old_extent_size,
 					     new_extent_size))
 						return_0;
 					if (!_recalc_extents
-					    (&seg_pvseg(seg, s)->len,
+					    (&pvseg->len,
 					     lv->name,
 					     " pvseg length", old_extent_size,
 					     new_extent_size))
 						return_0;
 					break;
 				case AREA_LV:
+					le = seg_le(seg, s);
 					if (!_recalc_extents
-					    (&seg_le(seg, s), lv->name,
+					    (&le, lv->name,
 					     " area start", old_extent_size,
 					     new_extent_size))
 						return_0;
+					set_seg_le(seg, s, le);
 					break;
 				case AREA_UNASSIGNED:
 					log_error("Unassigned area %u found in "

@@ -1159,7 +1159,7 @@ static int _release_and_discard_lv_segment_area(struct lv_segment *seg, uint32_t
 			return_0;
 
 		if (seg->area_len == area_reduction)
-			seg_type(seg, s) = AREA_UNASSIGNED;
+			set_seg_pvseg(seg, s, NULL);
 
 		return 1;
 	}
@@ -1234,9 +1234,7 @@ static int _release_and_discard_lv_segment_area(struct lv_segment *seg, uint32_t
 		if (!remove_seg_from_segs_using_this_lv(lv, seg))
 			return_0;
 
-		seg_lv(seg, s) = NULL;
-		seg_le(seg, s) = 0;
-		seg_type(seg, s) = AREA_UNASSIGNED;
+		set_seg_lv(seg, s, NULL);
 	}
 
 	/* When removed last VDO user automatically removes VDO pool */
@@ -1322,17 +1320,18 @@ int move_lv_segment_area(struct lv_segment *seg_to, uint32_t area_to,
 int set_lv_segment_area_pv(struct lv_segment *seg, uint32_t area_num,
 			   struct physical_volume *pv, uint32_t pe)
 {
+	struct pv_segment *pvseg;
+
 	if (area_num >= seg->area_count) {
 		log_error(INTERNAL_ERROR "Area number too high (%u >= %u) for segment of LV %s.",
 			  area_num, seg->area_count, display_lvname(seg->lv));
 		return 0;
 	}
 
-	seg->areas[area_num].type = AREA_PV;
-
-	if (!(seg_pvseg(seg, area_num) =
-	      assign_peg_to_lvseg(pv, pe, seg->area_len, seg, area_num)))
+	if (!(pvseg = assign_peg_to_lvseg(pv, pe, seg->area_len, seg, area_num)))
 		return_0;
+
+	set_seg_pvseg(seg, area_num, pvseg);
 
 	return 1;
 }
@@ -1360,17 +1359,15 @@ int set_lv_segment_area_lv(struct lv_segment *seg, uint32_t area_num,
 				  display_lvname(seg->lv));
 			return 0;
 		}
-		seg->meta_areas[area_num].type = AREA_LV;
-		seg_metalv(seg, area_num) = lv;
+		set_seg_metalv(seg, area_num, lv);
 		if (le) {
 			log_error(INTERNAL_ERROR "Meta le != 0.");
 			return 0;
 		}
-		seg_metale(seg, area_num) = 0;
+		set_seg_metale(seg, area_num, 0);
 	} else {
-		seg->areas[area_num].type = AREA_LV;
-		seg_lv(seg, area_num) = lv;
-		seg_le(seg, area_num) = le;
+		set_seg_lv(seg, area_num, lv);
+		set_seg_le(seg, area_num, le);
 	}
 
 	if (!add_seg_to_segs_using_this_lv(lv, seg))
@@ -1607,9 +1604,7 @@ static int _lv_reduce(struct logical_volume *lv, uint32_t extents, int delete)
 					/* Just dropping reference on origin when pending delete */
 					if (!remove_seg_from_segs_using_this_lv(seg_lv(seg, 0), seg))
 						return_0;
-					seg_lv(seg, 0) = NULL;
-					seg_le(seg, 0) = 0;
-					seg_type(seg, 0) = AREA_UNASSIGNED;
+					set_seg_lv(seg, 0, NULL);
 					if (seg->pool_lv && !detach_pool_lv(seg))
 						return_0;
 				} else if (!lv_remove(seg_lv(seg, 0)))

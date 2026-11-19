@@ -567,11 +567,6 @@ struct lv_segment {
 	uint32_t vdo_pool_virtual_extents;	/* For VDO-pool */
 };
 
-#define seg_type(seg, s)	(seg)->areas[(s)].type
-#define seg_pv(seg, s)		(seg)->areas[(s)].u.pv.pvseg->pv
-#define seg_lv(seg, s)		(seg)->areas[(s)].u.lv.lv
-#define seg_metalv(seg, s)	(seg)->meta_areas[(s)].u.lv.lv
-#define seg_metatype(seg, s)	(seg)->meta_areas[(s)].type
 
 struct pe_range {
 	struct dm_list list;
@@ -1545,5 +1540,20 @@ int lv_integrity_mismatches(struct cmd_context *cmd, const struct logical_volume
 int lv_raid_integrity_total_mismatches(struct cmd_context *cmd, const struct logical_volume *lv, uint64_t *mismatches);
 
 int setting_str_list_add(const char *field, uint64_t val, char *val_str, struct dm_list *result, struct dm_pool *mem);
+
+/*
+ * Segment area access for the commands.  Use the macros below rather than
+ * calling these directly: they pass __func__ so a failed access names its
+ * caller.  The accessors the commands do not call are in metadata.h.
+ */
+area_type_t _seg_type(const struct lv_segment *seg, uint32_t s, const char *where);
+struct logical_volume *_seg_lv(const struct lv_segment *seg, uint32_t s, const char *where);
+struct physical_volume *_seg_pv(const struct lv_segment *seg, uint32_t s, const char *where);
+struct logical_volume *_seg_metalv(const struct lv_segment *seg, uint32_t s, const char *where);
+
+#define seg_type(seg, s)		_seg_type((seg), (s), __func__)
+#define seg_lv(seg, s)			_seg_lv((seg), (s), __func__)
+#define seg_pv(seg, s)			_seg_pv((seg), (s), __func__)
+#define seg_metalv(seg, s)		_seg_metalv((seg), (s), __func__)
 
 #endif

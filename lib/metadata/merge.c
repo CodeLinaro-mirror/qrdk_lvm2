@@ -1009,28 +1009,29 @@ static int _lv_split_segment(struct logical_volume *lv, struct lv_segment *seg,
 
 	/* Adjust the PV mapping */
 	for (s = 0; s < seg->area_count; s++) {
-		seg_type(split_seg, s) = seg_type(seg, s);
+		struct logical_volume *area_lv;
+		struct pv_segment *pvseg;
 
 		/* Split area at the offset */
 		switch (seg_type(seg, s)) {
 		case AREA_LV:
-			if (!set_lv_segment_area_lv(split_seg, s, seg_lv(seg, s),
+			if (!(area_lv = seg_lv(seg, s)))
+				return_0;
+			if (!set_lv_segment_area_lv(split_seg, s, area_lv,
 						    seg_le(seg, s) + seg->area_len, 0))
 				return_0;
 			log_debug_alloc("Split %s:%u[%u] at %u: %s LE %u.", lv->name,
-					seg->le, s, le, seg_lv(seg, s)->name,
+					seg->le, s, le, area_lv->name,
 					seg_le(split_seg, s));
 			break;
 
 		case AREA_PV:
-			if (!(seg_pvseg(split_seg, s) =
-			     assign_peg_to_lvseg(seg_pv(seg, s),
-						 seg_pe(seg, s) +
-						     seg->area_len,
-						 seg_pvseg(seg, s)->len -
-						     seg->area_len,
-						 split_seg, s)))
+			if (!(pvseg = assign_peg_to_lvseg(seg_pv(seg, s),
+							  seg_pe(seg, s) + seg->area_len,
+							  seg_pvseg(seg, s)->len - seg->area_len,
+							  split_seg, s)))
 				return_0;
+			set_seg_pvseg(split_seg, s, pvseg);
 			log_debug_alloc("Split %s:%u[%u] at %u: %s PE %u.", lv->name,
 					seg->le, s, le,
 					dev_name(seg_dev(seg, s)),
