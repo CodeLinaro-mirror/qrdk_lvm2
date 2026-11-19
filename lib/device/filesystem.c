@@ -158,7 +158,7 @@ static int _fs_get_mnt(struct fs_info *fsi, dev_t devt)
 	return 1;
 }
 
-static int _btrfs_get_mnt(struct fs_info *fsi, dev_t lv_devt)
+static int _btrfs_get_mnt(struct fs_info *fsi, dev_t fs_devt)
 {
 	char devices_path[PATH_MAX];
 	char rdev_path[PATH_MAX];
@@ -171,6 +171,7 @@ static int _btrfs_get_mnt(struct fs_info *fsi, dev_t lv_devt)
 	int ret = 1;
 	int fd = -1;
 	ssize_t r;
+	int found = 0;
 
 	/* For a mounted btrfs, there will be a sys dir like /sys/fs/btrfs/$uuid/devices */
 	if (dm_snprintf(devices_path, sizeof(devices_path), "%sfs/btrfs/%s/devices",
@@ -236,18 +237,33 @@ static int _btrfs_get_mnt(struct fs_info *fsi, dev_t lv_devt)
 		}
 
 		devt = MKDEV(major, minor);
-		if (devt == lv_devt)
-			fsi->mounted = 1;
+		if (devt == fs_devt)
+			found = 1;
 
 		if (fsi->mount_dir[0] == 0)
 			_fs_get_mnt(fsi, devt);
 
-		if (fsi->mounted && fsi->mount_dir[0])
+		if (found && fsi->mount_dir[0])
 			break;
 	}
 
 	if (closedir(dr))
 		log_sys_debug("closedir", devices_path);
+
+	/*
+	 * The uuid read from the device is not unique (copy, snapshot or
+	 * crafted superblock), and _fs_get_mnt reports the mount of any
+	 * device of the mounted btrfs with that uuid.  It is the mount of
+	 * this fs only if its device is one of the devices listed in sysfs.
+	 */
+	if (!found) {
+		if (fsi->mount_dir[0])
+			log_debug("fs_get_info %s is not a device of btrfs %s mounted \"%s\"",
+				  fsi->fs_dev_path, fsi->uuid, fsi->mount_dir);
+		fsi->mount_dir[0] = 0;
+	}
+
+	fsi->mounted = found;
 
 	if (fsi->mounted && fsi->mount_dir[0] == 0) {
 		log_error("Couldn't get mount point for %s.", fsi->fs_dev_path);
@@ -347,7 +363,7 @@ int fs_get_info(struct cmd_context *cmd, struct logical_volume *lv, struct fs_in
 	}
 
 	if (!strcmp(fsi->fstype, "btrfs"))
-		ret = _btrfs_get_mnt(fsi, st_lv.st_rdev);
+		ret = _btrfs_get_mnt(fsi, st_top.st_rdev);
 	else
 		ret = _fs_get_mnt(fsi, st_top.st_rdev);
 
