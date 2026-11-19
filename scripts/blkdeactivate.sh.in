@@ -197,14 +197,14 @@ is_top_level_device() {
 # lsblk and findmnt raw output (\xHH encoded blanks, backslashes and
 # non-printable characters) must be decoded before the path is used.
 unhex_escape() {
-	local str=$1 out= hex
+	local str=$1 out='' hex
 
 	while [[ "$str" == *'\x'* ]]; do
 		out+=${str%%\\x*}
 		str=${str#*\\x}
 		hex=${str:0:2}
 		if [[ "$hex" == [0-9a-fA-F][0-9a-fA-F] ]]; then
-			printf -v hex "\\x$hex"
+			printf -v hex '%b' "\\x$hex"
 			out+=$hex
 			str=${str:2}
 		else
