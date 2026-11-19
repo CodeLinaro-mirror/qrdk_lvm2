@@ -184,13 +184,42 @@ else
 	dir="$HOME/$dirbase"
 fi
 
+# Everything below is written by path into $dir, so its checks hold only
+# while no other user can replace $dir or one of its parents.  As root,
+# require a trusted parent (see validate_path) and use its canonical
+# path from here on.
+#
+# Split $dir by hand rather than call dirname and basename: drop every
+# trailing slash first, or one would hide a symlink from test -L, then
+# the parent is up to the last slash and the name is the part after it;
+# a name with no slash has "." as its parent.
+dir=${dir%"${dir##*[!/]}"}
+test -n "$dir" || dir=/
+if test "$dir" = "${dir%/*}"; then
+	dirparent=.
+else
+	dirparent=${dir%/*}
+	test -n "$dirparent" || dirparent=/
+fi
+"$MKDIR" -p -- "$dirparent" || die 4 "Fatal: could not create $dirparent."
+if test "$EUID" = 0; then
+	if ! resolved_parent=$("$READLINK" -f -- "$dirparent"); then
+		die 5 "Fatal: cannot resolve $dirparent."
+	fi
+	dirparent=$resolved_parent
+	validate_path "Directory" "$dirparent"
+	dir="${dirparent%/}/${dir##*/}"
+fi
+
 if test -d "$dir" ; then
 	test -L "$dir" && die 5 "Fatal: directory $dir is a symlink"
 
-	dir_owner=$(stat -Lc '%u' "$dir" 2>/dev/null) || die 5 "Fatal: cannot stat $dir"
+	# No stat -L: the entry itself must be root's, as in a sticky parent
+	# its owner could still replace it (a symlink fails the mode check).
+	dir_owner=$("$STAT" -c '%u' "$dir" 2>/dev/null) || die 5 "Fatal: cannot stat $dir"
 	test "$dir_owner" = "0" || die 5 "Fatal: directory $dir is not owned by root"
 
-	dir_perms=$(stat -Lc '%a' "$dir" 2>/dev/null) || die 5 "Fatal: cannot stat $dir"
+	dir_perms=$("$STAT" -c '%a' "$dir" 2>/dev/null) || die 5 "Fatal: cannot stat $dir"
 	test $((8#$dir_perms & 8#022)) -eq 0 || die 5 "Fatal: directory $dir is writable by group or others"
 
 	# Check if directory is accessible and empty
@@ -204,7 +233,9 @@ if test -d "$dir" ; then
 	fi
 else
 	test -e "$dir" && die 3 "Fatal: $dir already exists."
-	"$MKDIR" -p "$dir" || die 4 "Fatal: could not create $dir."
+	# The parent exists already: no -p, so that mkdir fails when somebody
+	# else has created $dir in the meantime.
+	"$MKDIR" "$dir" || die 4 "Fatal: could not create $dir."
 fi
 
 log="$dir/lvmdump.log"
@@ -479,15 +510,15 @@ fi
 
 if test -z "$userdir"; then
 	lvm_dump="$dirbase.tgz"
-	myecho "Creating report tarball in $HOME/$lvm_dump..."
+	myecho "Creating report tarball in $dirparent/$lvm_dump..."
 fi
 
 warnings
 
 if test -z "$userdir"; then
-	cd "$HOME" || exit 1
+	cd "$dirparent" || exit 1
 	test -e "$lvm_dump" &&
-		die 3 "Fatal: tarball $HOME/$lvm_dump already exists."
+		die 3 "Fatal: tarball $dirparent/$lvm_dump already exists."
 	# Do not redirect tar stderr to $log, as writing to a file inside the
 	# directory being archived causes tar to report "file changed as we read it"
 	# and exit with an error, leading to the tarball being deleted.

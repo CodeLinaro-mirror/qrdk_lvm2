@@ -111,6 +111,10 @@ Dump into a directory instead of a tarball
 By default, lvmdump will produce a single compressed tarball containing
 all the information. Using this option, it can be instructed to only
 produce the raw dump tree, rooted in \fIdirectory\fP.
+When run as root, \fIdirectory\fP must not be located below a directory
+that another user owns or may write to (sticky directories
+like \fI/tmp\fP are accepted); the same applies to the home directory
+where the tarball is created.
 .
 .TP
 .B -h
