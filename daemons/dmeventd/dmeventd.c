@@ -2383,22 +2383,28 @@ static int _client_write(struct dm_event_fifos *fifos,
 	}
 
 	size = 2 * sizeof(uint32_t) + data_size;
-	header = malloc(size);
 
-	if (!header) {
+	/*
+	 * The buffer holds the header words followed by a byte payload.
+	 * Allocate it as bytes and derive the typed header pointer, so the
+	 * allocation size need not be a multiple of the word size.
+	 */
+	buf = malloc(size);
+
+	if (!buf) {
 		/* Reply with ENOMEM message */
 		header = temp;
 		size = sizeof(temp);
 		header[0] = htonl(-ENOMEM);
 		header[1] = 0;
+		buf = (char *) header;
 	} else {
+		header = (uint32_t *) buf;
 		header[0] = htonl(cmd);
 		header[1] = htonl(data_size);
 		if (data_size)
 			memcpy(header + 2, data, data_size);
 	}
-
-	buf = (char *)header;
 
 	while (bytes < size) {
 		/* Watch client write FIFO to be ready for output. */
