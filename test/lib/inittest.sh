@@ -224,8 +224,9 @@ if [[ "$(id -u)" -eq 0 && -n "${abs_top_builddir-}" ]]; then
 	LVM_TEST_BINDIR="$TESTDIR/bin"
 	mkdir "$LVM_TEST_BINDIR"
 	for f in "$TESTOLDPWD"/lib/lvm-wrapper "$TESTOLDPWD"/lib/dm-wrapper \
-		 "$TESTOLDPWD"/lib/lvm_vdo_wrapper "$TESTOLDPWD"/lib/fsadm \
-		 "$TESTOLDPWD"/lib/lvresize_fs_helper "$TESTOLDPWD"/lib/lvm_import_vdo; do
+		 "$TESTOLDPWD"/lib/lvm_vdo_wrapper "$TESTOLDPWD"/lib/blkdeactivate \
+		 "$TESTOLDPWD"/lib/fsadm "$TESTOLDPWD"/lib/lvresize_fs_helper \
+		 "$TESTOLDPWD"/lib/lvm_import_vdo; do
 		[[ -f "$f" ]] || continue
 		install -m 0755 -o root -g root "$f" "$LVM_TEST_BINDIR/${f##*/}"
 	done
