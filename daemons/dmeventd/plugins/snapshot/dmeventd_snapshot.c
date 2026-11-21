@@ -20,6 +20,7 @@
 
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
+#include <mntent.h>
 #include <stdarg.h>
 #include <pthread.h>
 
@@ -115,44 +116,49 @@ out:
 static void _umount(const char *device, int major, int minor)
 {
 	FILE *mounts;
-	char buffer[4096];
-	char *words[3];
+	struct mntent mebuf;
+	char *buffer;
 	struct stat st;
-	const char procmounts[] = "/proc/mounts";
 
-	if (!(mounts = fopen(procmounts, "r"))) {
-		log_sys_error("fopen", procmounts);
-		log_error("Not umounting %s.", device);
+	/* Line buffer for getmntent_r(), one mount table entry at a time.
+	 * It comes from the heap: dmeventd runs a thread per monitored
+	 * device on a stack of THREAD_STACK_SIZE. */
+	if (!(buffer = malloc(MOUNTS_LINE_MAX))) {
+		log_error("Failed to allocate the mount table line buffer.");
 		return;
 	}
 
-	while (!feof(mounts)) {
-		/* read a line of /proc/mounts */
-		if (!fgets(buffer, sizeof(buffer), mounts))
-			break; /* eof, likely */
+	if (!(mounts = setmntent(PROC_MOUNTS, "r"))) {
+		log_error("Not umounting %s: cannot read %s: %s.", device,
+			  PROC_MOUNTS, strerror(errno));
+		free(buffer);
+		return;
+	}
 
-		/* words[0] is the device path and words[1] is the mount point */
-		if (dm_split_words(buffer, 3, 0, words) < 2)
-			continue;
-
+	/* getmntent_r() decodes the octal escapes of the mount table, so a
+	 * mount point holding a blank reaches umount as a usable path and
+	 * not as the escaped form, which umount cannot match.  The entry
+	 * goes to mebuf and the strings to the line buffer, both owned by
+	 * this call and not shared between the threads. */
+	while (getmntent_r(mounts, &mebuf, buffer, MOUNTS_LINE_MAX)) {
 		/* find the major/minor of the device */
-		if (stat(words[0], &st))
+		if (stat(mebuf.mnt_fsname, &st))
 			continue; /* can't stat, skip this one */
 
 		if (S_ISBLK(st.st_mode) &&
 		    (int) major(st.st_rdev) == major &&
 		    (int) minor(st.st_rdev) == minor) {
-			const char *umount_argv[] = { UMOUNT_COMMAND, "-fl", words[1], NULL };
+			const char *umount_argv[] = { UMOUNT_COMMAND, "-fl", mebuf.mnt_dir, NULL };
 
-			log_error("Unmounting invalid snapshot %s at mount point %s.", device, words[1]);
+			log_error("Unmounting invalid snapshot %s at mount point %s.", device, mebuf.mnt_dir);
 			if (!_run(umount_argv))
 				log_error("Failed to umount snapshot %s at mount point %s: %s.",
-					  device, words[1], strerror(errno));
+					  device, mebuf.mnt_dir, strerror(errno));
 		}
 	}
 
-	if (fclose(mounts))
-		log_sys_error("close", procmounts);
+	endmntent(mounts);
+	free(buffer);
 }
 
 /* Kernel-reported Invalid, Overflow, or unusable zero-sized status: nothing
