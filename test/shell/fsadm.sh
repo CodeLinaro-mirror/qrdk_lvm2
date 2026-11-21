@@ -43,15 +43,21 @@ vg_lv2=$vg/${lv1}bar
 dev_vg_lv="$DM_DEV_DIR/$vg_lv"
 dev_vg_lv2="$DM_DEV_DIR/$vg_lv2"
 mount_dir="mnt"
-mount_space_dir="mnt space dir"
+# The space before the digit makes the mount table write this name as
+# "mnt\040space\0401dir", which a single printf %b decode would mangle.
+mount_space_dir="mnt space 1dir"
+# A trailing newline is written "\012", which a $(...) decode strips.
+mount_nl_dir=mntnl$'\n'
 
 test ! -d "$mount_dir" && mkdir "$mount_dir"
 test ! -d "$mount_space_dir" && mkdir "$mount_space_dir"
+test ! -d "$mount_nl_dir" && mkdir "$mount_nl_dir"
 
 cleanup_mounted_and_teardown()
 {
 	umount "$mount_dir" 2>/dev/null || true
 	umount "$mount_space_dir" 2>/dev/null || true
+	umount "$mount_nl_dir" 2>/dev/null || true
 	aux teardown
 }
 
@@ -226,6 +232,17 @@ if check_missing ext2; then
 	umount "$mount_dir"
 	fscheck_ext3
 
+	# A mount point ending in a newline is written "\012": a $(...)
+	# decode strips that byte, and the unmount that the shrink runs first
+	# would target a path that does not exist.
+	mount "$dev_vg_lv" "$mount_nl_dir"
+	df --output=size "$mount_nl_dir" | tee dfnl1
+	fsadm -y --lvresize resize $vg_lv 20M
+	df --output=size "$mount_nl_dir" | tee dfnl2
+	not diff dfnl1 dfnl2
+	umount "$mount_nl_dir"
+	fscheck_ext3
+
 	# Filesystem mounted on more mount points stays mounted after
 	# unmounting one of them - no offline fsck and resize
 	mount "$dev_vg_lv" "$mount_dir"
@@ -237,8 +254,17 @@ if check_missing ext2; then
 	# The resize was refused, so the filesystem must be unchanged.
 	df --output=size "$mount_dir" | tee df2
 	diff df1 df2
-	umount "$mount_space_dir"
+	# The bind mount still holds the filesystem, and its name has a space
+	# right before a digit, so the mount table writes it as
+	# "mnt\040space\0401dir": a single printf '%b' decode takes "\0401"
+	# for one escape and eats the digit, and the unmount that the shrink
+	# runs first would target a path that does not exist.
 	umount "$mount_dir"
+	df --output=size "$mount_space_dir" | tee dfesc1
+	fsadm -y --lvresize resize $vg_lv 10M
+	df --output=size "$mount_space_dir" | tee dfesc2
+	not diff dfesc1 dfesc2
+	umount "$mount_space_dir"
 	fscheck_ext3
 
 	lvresize --fs ignore -y -L20M $vg_lv
