@@ -511,6 +511,38 @@ check_valid_mounted_device() {
 	validate_mounted_major_minor "$MOUNTEDMAJORMINOR"
 }
 
+# Decode the 3 digit octal escapes (\040 etc.) used in /proc mount tables.
+# The result is stored in the variable named by the first argument rather
+# than printed: $(...) would strip a trailing newline from a path that ends
+# with one.  The "." appended inside the substitution protects that newline
+# and eval keeps this dash compatible.  The kernel always writes exactly
+# three digits, but printf %b reads "\0" plus up to three more, so it takes
+# one digit too many whenever an escape is followed by a digit 0-7: a mount
+# point named "mnt 1dir" is written "mnt\0401dir", and one printf turns
+# "\0401" into octal 401, the single byte 0x01, giving "mnt\001dir" - a path
+# that does not exist, so the mounted filesystem looks unmounted.  Padding
+# every backslash to the full "\0ooo" form makes printf consume only the
+# kernel's digits and leaves the "1" alone.  Every backslash here starts an
+# escape, because the kernel escapes a backslash too (\134), and the source
+# field also escapes a "#" (\043).  scripts/lvresize_fs_helper.sh carries
+# the same decoder for the offline resize path; the two scripts are
+# installed on their own.
+decode_mount_field_into() {
+	local val src=$2 res=
+
+	# Reject anything but a plain variable name before it reaches eval.
+	case "$1" in
+	  *[!A-Za-z0-9_]*|"") error "Invalid variable name \"$1\"." ;;
+	esac
+
+	while test "${src#*\\}" != "$src"; do
+		res="$res${src%%\\*}\\0"
+		src=${src#*\\}
+	done
+	val=$(printf '%b' "$res$src"; printf .)
+	eval "$1=\${val%.}"
+}
+
 # Sets: MOUNTED
 detect_mounted_with_proc_self_mountinfo() {
 	local MOUNTDEV
@@ -530,19 +562,19 @@ detect_mounted_with_proc_self_mountinfo() {
 			head -1 2>/dev/null || true)
 	fi
 
-	# Field 5 is the mount point; printf %b decodes \040 etc.
+	# Field 5 is the mount point
 	# shellcheck disable=SC2016 # awk field refs, not shell vars
 	MOUNTED=$("$AWK" 'NR==1 { print $5; exit }' <<-EOF
 		$RAW
 	EOF
 	)
-	MOUNTED=$(printf '%b' "$MOUNTED")
+	decode_mount_field_into MOUNTED "$MOUNTED"
 
 	test -n "$MOUNTED" || return 1
 
 	# extract 2nd field after ' - ' separator as mounted device
 	MOUNTDEV=$(printf '%s\n' "${RAW##* - }" | cut -d ' ' -f 2)
-	MOUNTDEV=$(printf '%b' "$MOUNTDEV")
+	decode_mount_field_into MOUNTDEV "$MOUNTDEV"
 	check_valid_mounted_device "$MOUNTDEV"
 }
 
@@ -562,12 +594,12 @@ detect_mounted_with_proc_mounts() {
 		'$1 == vol || $1 == rvol {print; exit}' "$PROCMOUNTS") ||
 		error "Cannot read mount information from \"$PROCMOUNTS\"."
 
-	# cut device name prefix and trim everything past mountpoint
-	# printf translates \040 to spaces
 	# /proc/mounts format: device mountpoint fstype options ...
-	MOUNTDEV=$(printf '%b' "${MOUNTED%% *}")
+	# take the device and then the mount point; both are escaped, so
+	# decode each one
+	decode_mount_field_into MOUNTDEV "${MOUNTED%% *}"
 	MOUNTED=${MOUNTED#* }
-	MOUNTED=$(printf '%b' "${MOUNTED%% *}")
+	decode_mount_field_into MOUNTED "${MOUNTED%% *}"
 
 	# Strategy 2: fall back to mount command output
 	if test -z "$MOUNTED"; then
@@ -591,9 +623,9 @@ detect_mounted_with_proc_mounts() {
 	# check every mount point against MAJOR:MINOR
 	if device_is_open "$MAJORMINOR"; then
 		while read -r i; do
-			MOUNTDEV=$(printf '%b' "${i%% *}")
+			decode_mount_field_into MOUNTDEV "${i%% *}"
 			MOUNTED=${i#* }
-			MOUNTED=$(printf '%b' "${MOUNTED%% *}")
+			decode_mount_field_into MOUNTED "${MOUNTED%% *}"
 			STATOUT=$("$STAT" --format "%d" "$MOUNTED" 2>/dev/null) || continue
 			if test "$(decode_major_minor "$STATOUT")" = "$MAJORMINOR"; then
 				check_valid_mounted_device "$MOUNTDEV"
