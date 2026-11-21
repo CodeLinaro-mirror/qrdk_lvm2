@@ -1,5 +1,11 @@
 Version 2.03.45 - 
 ==================
+  Fail a PR takeover that cannot reach every PV of the VG.
+  Match a btrfs mount by the device, not by the uuid read from the LV.
+  Report an unknown xfs size when the filesystem is in use but not visible.
+  Decode /proc mount table octal escapes one at a time in fsadm detection.
+  Refuse an offline resize of a filesystem mounted in another namespace.
+  Fix an offline resize leaving the filesystem unmounted when it fails early.
   Fix vgreduce --removemissing to remove a partial pmspare LV.
   Refuse a RAID conversion, reshape or split if the array changed.
   Fix automatic repair of a RAID array with incomplete dm-raid health.
