@@ -23,7 +23,11 @@ aux lvmconf "activation/snapshot_autoextend_percent = 0" \
 
 aux prepare_dmeventd
 aux prepare_vg 2
-mntdir="${PREFIX}mnt"
+# The blank before the digit makes the mount table write the name as
+# "${PREFIX}mnt\040space\0401", which dmeventd must decode before it
+# passes the mount point to umount.
+mntdir="${PREFIX}mnt space 1"
+mntdir_esc="${PREFIX}mnt\\040space\\0401"
 
 lvcreate -aey -L8 -n base $vg
 mkfs.ext2 "$DM_DEV_DIR/$vg/base"
@@ -37,7 +41,7 @@ mount -o errors=remount-ro "$DM_DEV_DIR/mapper/$vg-snap" "$mntdir"
 
 test "$(dmsetup info -c --noheadings -o open $vg-snap)" -eq 1
 
-grep "$mntdir" /proc/mounts
+grep -F "$mntdir_esc" /proc/mounts
 
 # overfill 4M snapshot (with metadata)
 not dd if=/dev/zero of="$mntdir/file" bs=1M count=4 conv=fdatasync
@@ -51,6 +55,6 @@ for i in {1..100}; do
 	test "$(dmsetup info -c --noheadings -o open $vg-snap)" -eq 0 && break
 done
 
-not grep "$mntdir" /proc/mounts
+not grep -F "$mntdir_esc" /proc/mounts
 
 vgremove -f $vg
