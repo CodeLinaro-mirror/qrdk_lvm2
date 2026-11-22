@@ -205,23 +205,25 @@ is_top_level_device() {
 
 # lsblk and findmnt raw output (\xHH encoded blanks, backslashes and
 # non-printable characters) must be decoded before the path is used.
-unhex_escape() {
-	local str=$1 out='' hex
+# The decoded path is stored in the variable named by the first argument
+# rather than printed: $(...) would strip a trailing newline from the path.
+unhex_escape_into() {
+	local src=$2 res='' byte
 
-	while [[ "$str" == *'\x'* ]]; do
-		out+=${str%%\\x*}
-		str=${str#*\\x}
-		hex=${str:0:2}
-		if [[ "$hex" == [0-9a-fA-F][0-9a-fA-F] ]]; then
-			printf -v hex '%b' "\\x$hex"
-			out+=$hex
-			str=${str:2}
+	while [[ "$src" == *'\x'* ]]; do
+		res+=${src%%\\x*}
+		src=${src#*\\x}
+		byte=${src:0:2}
+		if [[ "$byte" == [0-9a-fA-F][0-9a-fA-F] ]]; then
+			printf -v byte '%b' "\\x$byte"
+			res+=$byte
+			src=${src:2}
 		else
-			out+='\x'
+			res+='\x'
 		fi
 	done
 
-	printf '%s' "$out$str"
+	printf -v "$1" '%s' "$res$src"
 }
 
 # A failed umount does not tell whether the device is still mounted and
@@ -243,7 +245,8 @@ device_or_mount_is_mounted() {
 		# tried is taken as proof; anything else falls through to
 		# the device check below.
 		while read -r target; do
-			test "$(unhex_escape "$target")" = "$mnt" && return 0
+			unhex_escape_into target "$target"
+			test "$target" = "$mnt" && return 0
 		done <<< "$("${FINDMNT[@]}" "$DEV_DIR/$kname" 2>&8)"
 	fi
 
@@ -291,11 +294,11 @@ device_umount() {
 	test "$devtype" != "lvm" && test "${kname:0:3}" != "dm-" &&
 		test "${kname:0:2}" != "md" && return 0
 
-	mnt=$(unhex_escape "$mnt")
+	unhex_escape_into mnt "$mnt"
 
 	if test "$UMOUNT_ONE_BY_ONE" -eq 1; then
 		while read -r mnt; do
-			mnt=$(unhex_escape "$mnt")
+			unhex_escape_into mnt "$mnt"
 			device_umount_one || failures=1
 		done <<< "$("${FINDMNT[@]}" "$DEV_DIR/$kname" 2>&8)"
 		return "$failures"
@@ -446,7 +449,7 @@ deactivate_lvm() {
 			test -b "$lv_path" || continue
 			if devices=$("${LSBLK[@]}" --nodeps "$lv_path"); then
 				read -r _ lv_kname _ lv_mnt <<< "$devices"
-				lv_mnt=$(unhex_escape "$lv_mnt")
+				unhex_escape_into lv_mnt "$lv_mnt"
 				# A mounted LV in this VG may not be in MOUNTED_DEVICE_LIST
 				# when only another LV in the VG was given on the command line.
 				if test -n "$lv_mnt" ||
