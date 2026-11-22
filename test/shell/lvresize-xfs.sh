@@ -97,8 +97,10 @@ lvextend -y --fs resize -L+10M $vg/$lv | tee out
 grep "mount options for xfs: uquota,gquota,pquota" out # must preserve the mount options!
 
 # lvextend, xfs, active, not mounted, quotas not defined, --fs resize
-mount "$DM_DEV_DIR/$vg/$lv" "$mount_dir"
-umount "$mount_dir"
+# XFS records quota accounting in the superblock and, with metadir, a
+# plain mount keeps it, so the filesystem mounted above still has quotas.
+# Make a fresh filesystem that never had any.
+mkfs.xfs -f "$DM_DEV_DIR/$vg/$lv"
 lvextend -y --fs resize -L+10M $vg/$lv | tee out
 not grep "mount options for xfs" out # mount options not needed
 
