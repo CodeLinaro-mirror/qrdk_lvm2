@@ -16,6 +16,7 @@
 #include "lib/misc/lib.h"
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
+#include <mntent.h>
 #include <pthread.h>
 
 #define process_event snapshot_test_process_event
@@ -63,23 +64,44 @@ static int _pthread_kill(pthread_t thread, int sig)
 	_signals++;
 	return 0;
 }
+/*
+ * The plugin reads the mount table with setmntent()/getmntent_r(), so the
+ * mock serves a fixed entry list instead of a stream: a stat failure, a
+ * regular file, an unrelated device and the snapshot itself.  The fields
+ * are mnt_fsname and mnt_dir (the two the plugin reads), then type,
+ * options, frequency and pass number.
+ */
+static struct mntent _mount_entries[] = {
+	{ (char *) "/missing",  (char *) "/skip",       NULL, NULL, 0, 0 },
+	{ (char *) "/regular",  (char *) "/skip",       NULL, NULL, 0, 0 },
+	{ (char *) "/other",    (char *) "/skip",       NULL, NULL, 0, 0 },
+	{ (char *) "/snapshot", (char *) "/test-mount", NULL, NULL, 0, 0 },
+};
+static unsigned _mount_entry;
+
 static FILE *_mounts_open(const char *path, const char *mode)
 {
-	FILE *f;
-
-	T_ASSERT(!strcmp(path, "/proc/mounts"));
+	T_ASSERT(!strcmp(path, PROC_MOUNTS));
 	T_ASSERT(!strcmp(mode, "r"));
 	_mount_reads++;
-	if (!_mount_result)
+	_mount_entry = 0;
+	/* Opaque non-NULL handle; getmntent_r() is mocked too. */
+	return _mount_result ? (FILE *) _mount_entries : NULL;
+}
+static struct mntent *_mounts_get(FILE *stream, struct mntent *entry,
+				  char *buffer, int buffer_size)
+{
+	T_ASSERT(stream == (FILE *) _mount_entries);
+	T_ASSERT(buffer && buffer_size > 0);
+	if (_mount_entry >= DM_ARRAY_SIZE(_mount_entries))
 		return NULL;
-	/* coverity[secure_temp] don't care */
-	f = tmpfile();
-	T_ASSERT(f);
-	fputs("malformed\n/missing /skip ext4 rw 0 0\n"
-	      "/regular /skip ext4 rw 0 0\n/other /skip ext4 rw 0 0\n"
-	      "/snapshot /test-mount ext4 rw 0 0\n", f);
-	rewind(f);
-	return f;
+	*entry = _mount_entries[_mount_entry++];
+	return entry;
+}
+static int _mounts_close(FILE *stream)
+{
+	T_ASSERT(stream == (FILE *) _mount_entries);
+	return 1;
 }
 static int _mount_stat(const char *path, struct stat *st)
 {
@@ -108,7 +130,9 @@ static pid_t _waitpid(pid_t pid, int *status, int options)
 #define dm_task_get_info _task_info
 #define dm_get_next_target _next_target
 #define pthread_kill _pthread_kill
-#define fopen _mounts_open
+#define setmntent _mounts_open
+#define getmntent_r _mounts_get
+#define endmntent _mounts_close
 #define stat(path, st) _mount_stat(path, st)
 #define fork _fork
 #define waitpid _waitpid
