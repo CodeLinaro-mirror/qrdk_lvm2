@@ -7362,7 +7362,7 @@ int lv_resize(struct cmd_context *cmd, struct logical_volume *lv,
 			goto out;
 		}
 		/* FS utils will fail if LVs were renamed while mounted. */
-		if (fs_mount_state_is_misnamed(cmd, lv_top, lv_path, fstype))
+		if (!fs_check_mount_names(cmd, lv_top, lv_path, fstype))
 			goto_out;
 	}
 

@@ -16,11 +16,24 @@
 #ifndef LVM_GLOBALS_H
 #define LVM_GLOBALS_H
 
+#include <limits.h>
 #include <stdint.h>
 
 #define VERBOSE_BASE_LEVEL _LOG_WARN
 #define SECURITY_LEVEL 0
 #define PV_MIN_SIZE_KB 512
+
+/* The mount table of this process; /etc/mtab may be a stale copy. */
+#define PROC_MOUNTS	"/proc/self/mounts"
+
+/*
+ * Longest mount table line read: the source and the mount point, each
+ * printed with up to four characters per byte, then the filesystem type
+ * and the options.  A line cut inside the options is harmless; one cut
+ * inside a path is not.  dmeventd runs lvm code on small thread stacks,
+ * so the callers keep this buffer on the heap.
+ */
+#define MOUNTS_LINE_MAX	(8 * PATH_MAX + 64)
 
 enum dev_ext_e;
 

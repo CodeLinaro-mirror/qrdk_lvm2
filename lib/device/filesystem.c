@@ -24,6 +24,7 @@
 
 #include <dirent.h>
 #include <mntent.h>
+#include <stdlib.h>
 #include <sys/ioctl.h>
 #include <linux/types.h>
 #include <linux/fs.h>
@@ -109,11 +110,26 @@ int lv_crypt_is_active(struct cmd_context *cmd, char *lv_path)
 	return _get_crypt_path(st_lv.st_rdev, lv_path, crypt_path);
 }
 
+/*
+ * A mount table entry lvm can compare: of the given filesystem type, with
+ * both the source and the mount point given as absolute paths.  A source
+ * that is not a path (e.g. "tmpfs" or "proc") names no device.
+ */
+static int _mnt_entry_is_comparable(const struct mntent *me, const char *fstype)
+{
+	if (strcmp(me->mnt_type, fstype))
+		return 0;
+	if (me->mnt_dir[0] != '/' || me->mnt_fsname[0] != '/')
+		return 0;
+	return 1;
+}
+
 static int _fs_get_mnt(struct fs_info *fsi, dev_t devt)
 {
 	struct stat stme;
 	FILE *fme = NULL;
-	struct mntent *me;
+	struct mntent me;
+	char *line;
 	/*
 	 * st_dev of mnt_dir in btrfs is an anonymous device number,
 	 * use mnt_fsname and st_rdev instead.
@@ -122,38 +138,41 @@ static int _fs_get_mnt(struct fs_info *fsi, dev_t devt)
 
 	/*
 	 * Note: used swap devices are not considered as mount points,
-	 * hence they're not listed in /etc/mtab, we'd need to read the
-	 * /proc/swaps instead. We don't need it at this moment though,
+	 * hence they're not listed in /proc/self/mounts, we'd need to read
+	 * the /proc/swaps instead. We don't need it at this moment though,
 	 * but if we do once, read the /proc/swaps here if fsi->fstype == "swap".
 	 */
-	if (!(fme = setmntent("/etc/mtab", "r")))
-		return_0;
+	if (!(line = malloc(MOUNTS_LINE_MAX))) {
+		log_error("Failed to allocate the mount table line buffer.");
+		return 0;
+	}
 
-	while ((me = getmntent(fme))) {
-		const char *stat_path = is_btrfs ? me->mnt_fsname : me->mnt_dir;
+	if (!(fme = setmntent(PROC_MOUNTS, "r"))) {
+		log_error("Cannot read %s: %s.", PROC_MOUNTS, strerror(errno));
+		free(line);
+		return 0;
+	}
 
-		if (strcmp(me->mnt_type, fsi->fstype))
-			continue;
-		if (!me->mnt_dir || me->mnt_dir[0] != '/')
-			continue;
-		if (!me->mnt_fsname || me->mnt_fsname[0] != '/')
-			continue;
+	while (getmntent_r(fme, &me, line, MOUNTS_LINE_MAX)) {
+		const char *stat_path = is_btrfs ? me.mnt_fsname : me.mnt_dir;
 
+		if (!_mnt_entry_is_comparable(&me, fsi->fstype))
+			continue;
 		if (stat(stat_path, &stme) < 0) {
-			log_sys_error("stat", stat_path);
+			log_sys_debug("stat", stat_path);
 			continue;
 		}
-
 		if ((is_btrfs ? stme.st_rdev : stme.st_dev) != devt)
 			continue;
 
 		fsi->mounted = 1;
 
-		log_debug("fs_get_info %s is mounted \"%s\"", fsi->fs_dev_path, me->mnt_dir);
-		dm_strncpy(fsi->mount_dir, me->mnt_dir, sizeof(fsi->mount_dir));
+		log_debug("fs_get_info %s is mounted \"%s\"", fsi->fs_dev_path, me.mnt_dir);
+		dm_strncpy(fsi->mount_dir, me.mnt_dir, sizeof(fsi->mount_dir));
 		break; /* found mount */
 	}
 	endmntent(fme);
+	free(line);
 
 	return 1;
 }
@@ -390,158 +409,78 @@ int fs_get_info(struct cmd_context *cmd, struct logical_volume *lv, struct fs_in
 	return ret;
 }
 
-int fs_mount_state_is_misnamed(struct cmd_context *cmd, struct logical_volume *lv, char *lv_path, char *fstype)
+/*
+ * Check that the mount table still names this LV's device the way lvm does.
+ * A rename of a mounted LV leaves the old name in the table, and a table
+ * that cannot be read or understood leaves no name at all, so both must
+ * stop the resize instead of letting it run blind.
+ *
+ * Returns 0 if the check cannot be made or an entry names the device
+ * differently, 1 if every entry of the device names it as lvm does.
+ */
+int fs_check_mount_names(struct cmd_context *cmd, struct logical_volume *lv, char *lv_path, char *fstype)
 {
-	FILE *fp;
-	char proc_line[PATH_MAX];
-	char proc_fstype[FSTYPE_MAX + 1];
-	char proc_devpath[PATH_MAX + 1];
-	char proc_mntpath[PATH_MAX + 1];
-	char mtab_mntpath[PATH_MAX] = { 0 };
-	char dm_devpath[PATH_MAX];
-	char dm_devpath_resolved[PATH_MAX];
-	char proc_devpath_resolved[PATH_MAX];
-	char tmp_path[PATH_MAX];
+	/* One block for the mount table line and the paths compared with it. */
+	struct mount_table_paths {
+		char dm_devpath[PATH_MAX];
+		char dm_devpath_resolved[PATH_MAX];
+		char source_resolved[PATH_MAX];
+		char line[MOUNTS_LINE_MAX];
+	} *paths;
+	FILE *mounts;
+	struct mntent me;
 	char *dm_name;
-	struct stat st_lv;
-	struct stat stme;
-	FILE *fme = NULL;
-	struct mntent *me;
-	int renamed = 0;
-	int dev_match, dir_match;
+	struct stat st_lv, st_mount;
+	int r = 0;
 
 	if (stat(lv_path, &st_lv) < 0) {
 		log_error("Failed to get LV path %s", lv_path);
 		return 0;
 	}
 
-	/*
-	 * If LVs have been renamed while their file systems were mounted, then
-	 * inconsistencies appear in the device path and mount point info
-	 * provided by getmntent and /proc/mounts.  If there's any
-	 * inconsistency or duplication of info for the LV name or the mount
-	 * point, then give up and don't try fs resize which is likely to fail
-	 * due to kernel problems where mounts reference old device names
-	 * causing fs resizing tools to fail.
-	 */
-
-	if (!(fme = setmntent("/etc/mtab", "r")))
-		return_0;
-
-	while ((me = getmntent(fme))) {
-		if (strcmp(me->mnt_type, fstype))
-			continue;
-		if (!me->mnt_dir || me->mnt_dir[0] != '/')
-			continue;
-		if (!me->mnt_fsname || me->mnt_fsname[0] != '/')
-			continue;
-		if (stat(me->mnt_dir, &stme) < 0)
-			continue;
-		if (stme.st_dev != st_lv.st_rdev)
-			continue;
-		if (!_dm_strncpy(mtab_mntpath, me->mnt_dir, sizeof(mtab_mntpath)))
-			continue; /* Ignore too long unsupported paths */
-		break;
-	}
-	endmntent(fme);
-
-	if (mtab_mntpath[0])
-		log_debug("%s mtab mntpath %s", display_lvname(lv), mtab_mntpath);
-
-	/*
-	 * In mtab dir path, replace each ascii space character with the
-	 * four characters \040 which is how /proc/mounts represents spaces.
-	 * The mnt dir from /etc/mtab and /proc/mounts are compared below.
-	 */
-	if (strchr(mtab_mntpath, ' ')) {
-		unsigned i, j = 0;
-		memcpy(tmp_path, mtab_mntpath, sizeof(tmp_path));
-		memset(mtab_mntpath, 0, sizeof(mtab_mntpath));
-		for (i = 0; i < sizeof(tmp_path) && tmp_path[i]; i++) {
-			if (tmp_path[i] == ' ') {
-				if (j + 4 >= sizeof(mtab_mntpath))
-					break;
-				mtab_mntpath[j++] = '\\';
-				mtab_mntpath[j++] = '0';
-				mtab_mntpath[j++] = '4';
-				mtab_mntpath[j++] = '0';
-				continue;
-			}
-			if (j + 1 >= sizeof(mtab_mntpath))
-				break;
-			mtab_mntpath[j++] = tmp_path[i];
-		}
-	}
-
 	if (!(dm_name = dm_build_dm_name(cmd->mem, lv->vg->name, lv->name, NULL)))
 		return_0;
 
-	if ((dm_snprintf(dm_devpath, sizeof(dm_devpath), "%s/%s", dm_dir(), dm_name) < 0))
-		return_0;
-
-	if (!(fp = fopen("/proc/mounts", "r")))
-		return_0;
-
-	while (fgets(proc_line, sizeof(proc_line), fp)) {
-		if (proc_line[0] != '/')
-			continue;
-		if (sscanf(proc_line, "%"
-			   DM_TO_STRING(PATH_MAX) "s %"
-			   DM_TO_STRING(PATH_MAX) "s %"
-			   DM_TO_STRING(FSTYPE_MAX) "s", proc_devpath, proc_mntpath, proc_fstype) != 3)
-			continue;
-		if (strcmp(fstype, proc_fstype))
-			continue;
-
-		/*
-		 * When an LV is mounted on two dirs, it appears in /proc/mounts twice as
-		 * /dev/mapper/vg-lvol0 on /foo type xfs ...
-		 * /dev/mapper/vg-lvol0 on /bar type xfs ...
-		 * All entries match dm_devpath, one entry matches mntpath,
-		 * and other entries don't match mntpath.
-		 *
-		 * When an LV is mounted on one dir, and is renamed from lvol0 to lvol1,
-		 * it appears in /proc/mounts once as
-		 * /dev/mapper/vg-lvol0 on /foo type xfs ...
-		 */
-		dir_match = !strcmp(mtab_mntpath, proc_mntpath);
-
-		/*
-		 * Resolve symlinks before comparing device paths. In test environments,
-		 * dm_devpath may be a symlink (e.g., /dev/shm/LVMTEST/dev/mapper/vg-lv
-		 * -> /dev/mapper/vg-lv), while proc_devpath is the resolved real path.
-		 * Compare resolved paths to avoid false positives for rename detection.
-		 */
-		if (realpath(dm_devpath, dm_devpath_resolved) &&
-		    realpath(proc_devpath, proc_devpath_resolved))
-			dev_match = !strcmp(dm_devpath_resolved, proc_devpath_resolved);
-		else
-			dev_match = !strcmp(dm_devpath, proc_devpath);
-
-		if (!dir_match && !dev_match)
-			continue;
-
-		if (dev_match && !dir_match) {
-			log_debug("LV %s mounted at %s also mounted at %s.",
-				  dm_devpath, mtab_mntpath, proc_mntpath);
-			continue;
-		}
-
-		if (!dev_match && dir_match) {
-			log_error("LV %s mounted at %s may have been renamed (from %s).",
-				  dm_devpath, proc_mntpath, proc_devpath);
-			renamed = 1;
-		}
+	if (!(paths = malloc(sizeof(*paths)))) {
+		log_error("Failed to allocate the mount table buffers.");
+		return 0;
 	}
 
-	if (fclose(fp))
-		stack;
+	if (dm_snprintf(paths->dm_devpath, sizeof(paths->dm_devpath), "%s/%s", dm_dir(), dm_name) < 0)
+		goto_out;
 
-	if (renamed) {
-		log_error("File system resizing not supported: fs utilities do not support renamed devices.");
-		return 1;
+	if (!(mounts = setmntent(PROC_MOUNTS, "r"))) {
+		log_error("Cannot read %s: %s.", PROC_MOUNTS, strerror(errno));
+		goto out;
 	}
-	return 0;
+
+	/* The mount source can retain the old name after an LV rename. */
+	while (getmntent_r(mounts, &me, paths->line, sizeof(paths->line))) {
+		if (!_mnt_entry_is_comparable(&me, fstype))
+			continue;
+		if (!strcmp(me.mnt_fsname, paths->dm_devpath))
+			continue;
+		if (stat(me.mnt_dir, &st_mount) < 0 || st_mount.st_dev != st_lv.st_rdev)
+			continue;
+
+		/* A symlink to the current device path is not a rename. */
+		if (realpath(paths->dm_devpath, paths->dm_devpath_resolved) &&
+		    realpath(me.mnt_fsname, paths->source_resolved) &&
+		    !strcmp(paths->dm_devpath_resolved, paths->source_resolved))
+			continue;
+
+		log_error("Cannot resize file system on %s: mount at %s still names %s.",
+			  paths->dm_devpath, me.mnt_dir, me.mnt_fsname);
+		goto end;
+	}
+	r = 1; /* Not renamed */
+
+end:
+	endmntent(mounts);
+out:
+	free(paths);
+
+	return r;
 }
 
 #define FS_CMD_MAX_ARGS 16

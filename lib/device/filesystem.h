@@ -55,7 +55,7 @@ int fs_extend_script(struct cmd_context *cmd, struct logical_volume *lv, struct 
 int fs_reduce_script(struct cmd_context *cmd, struct logical_volume *lv, struct fs_info *fsi, char *fsmode);
 int crypt_resize_script(struct cmd_context *cmd, struct logical_volume *lv, struct fs_info *fsi);
 
-int fs_mount_state_is_misnamed(struct cmd_context *cmd, struct logical_volume *lv, char *lv_path, char *fstype);
+int fs_check_mount_names(struct cmd_context *cmd, struct logical_volume *lv, char *lv_path, char *fstype);
 int lv_crypt_is_active(struct cmd_context *cmd, char *lv_path);
 
 /* filesystem_xfs.c */
