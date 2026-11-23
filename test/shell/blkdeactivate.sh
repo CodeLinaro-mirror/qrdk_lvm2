@@ -18,6 +18,8 @@ test_description='Exercise blkdeactivate'
 # test needs the staged copy made by lib/inittest when run as root.
 test -x "${LVM_TEST_BINDIR-}/blkdeactivate" || skip
 aux have_fs ext4 || skip
+# The script enumerates devices with /bin/lsblk.
+test -x /bin/lsblk || skip "lsblk is missing"
 
 # The blank before the digit makes lsblk write the path as
 # "mnt\x20space\x201" and the mount table as "mnt\040space\0401", so this
