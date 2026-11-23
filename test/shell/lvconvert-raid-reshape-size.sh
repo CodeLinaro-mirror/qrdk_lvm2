@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Copyright (C) 2024,2025 Red Hat, Inc. All rights reserved.
+# Copyright (C) 2024-2026 Red Hat, Inc. All rights reserved.
 #
 # This copyrighted material is made available to anyone wishing to use,
 # modify, copy, or redistribute it subject to the terms and conditions
@@ -26,18 +26,32 @@
 # Sampling the held size
 # ----------------------
 #
-# lvconvert is started in the background and the LV is polled every 50 ms
-# until the size moves: 'dmsetup status' reports the sync action, 'blockdev'
-# the size.  Only a sample with 'reshape' reported both before and after the
-# size read counts, and the size then has to be the pre-reshape one.  The
-# polling does not stop when the command returns: on raid4/5/6 md starts the
-# reshape only then, and on raid10 it can still be running.
+# lvconvert is started in the background and the LV is polled every 50 ms:
+# 'dmsetup status' reports the sync action, 'blockdev' the size.  Only a
+# sample with 'reshape' reported both before and after the size read counts,
+# and the size then has to be the pre-reshape one.  The polling does not stop
+# when the command returns: on raid4/5/6 md starts the reshape only then, and
+# on raid10 it can still be running.
 #
-# Samples reported as 'frozen' are skipped.  dm-raid freezes the sync thread
-# in raid_ctr() until resume, and while the device is suspended dm core
-# already exposes the size of the new table, until raid_preresume()
-# restores the size of the running array on resume - so the size read there
-# says nothing about the reshape.
+# A size read is only evidence about the running array while the LV is
+# resumed.  dm core applies the size of the table being loaded in __bind(),
+# with the LV still suspended and before the target's preresume() runs, so a
+# suspended LV reports the size of a table that is not running - 'idle'
+# while the table is not swapped in yet, 'frozen' until raid_resume() after
+# the swap.  raid_preresume() then puts back the size of the running array,
+# so the resumed LV keeps the pre-reshape size until the reshape ended, and
+# only then reports the grown one.
+#
+# Such a window is not only a nuisance for a test: a reader of the size -
+# udev's blkid, a resize helper - sees it too, and a bind that fails later
+# is rolled back the same way, leaving a reader with a size the device never
+# takes.  Whether that should stay visible is worth a device-mapper
+# discussion.
+#
+# The size and the status cannot be read in one go, so a sample tells the
+# two cases apart by the device count of the table that answered it: only
+# the table with the added stripes reports the new count, and only that
+# table is the live one.
 #
 # Slowing the reshape down with dm-delay
 # --------------------------------------
@@ -132,11 +146,9 @@ pvsz=0
 . lib/inittest --skip-with-lvmpolld
 
 test "${LVM_VALGRIND:-0}" -eq 0 || skip "Timing is too slow with valgrind."
-
-aux kernel_at_least 6 9 0 || skip
-
 test "$(aux total_mem)" -gt 1048576 || skip "Not enough RAM for this test"
 
+aux kernel_at_least 6 9 0 || skip
 aux have_fs ext4 || skip
 
 test "$SKIP_RESIZE" -eq 1 ||
@@ -274,22 +286,27 @@ function _check_size
 # transient _raid_status_read_stable() in raid_manip.c waits it out).  The
 # second reading is reused as the first one of the next poll.
 #
-# A poll reported 'frozen' is skipped, see the header: the size exposed then
-# is the one of the reloaded table, not of the running array.  Polling ends
-# when the size moves, which the kernel does only when the reshape finished.
+# A grown size is the end of the reshape only once the table with the added
+# stripes is live - the header says why a reload exposes its size first.
 #
 # Returns 0 when the held size is confirmed, 1 when it violates the
-# contract, 2 when the size moved before a running reshape could be sampled
-# with the size still held, and 3 when the reshape still runs at the timeout
-# without such a sample.
+# contract, 2 when the reshape ended before a running one could be sampled
+# with the size still held, 3 when the reshape still runs at the timeout
+# without such a sample, and 4 when a sample carried no device count or saw
+# a reshape on a table that is not the one with the added stripes.
 function _check_size_hold
 {
 	local vg=$1
 	local lv=$2
 	local old_size=$3
+	local new_dev_count=$4
 	local lv_size
 	local action
 	local action2
+	local dev_count
+	local status
+	local grown
+	local live
 	local i
 
 	action=$(get dm_status_raid "$vg/$lv" action)
@@ -297,17 +314,31 @@ function _check_size_hold
 	for (( i = 0; i < POLL_COUNT; i++ ))
 	do
 		lv_size=$(blockdev --getsz "$DM_DEV_DIR/$vg/$lv")
-		action2=$(get dm_status_raid "$vg/$lv" action)
+		status=$(get dm_status_raid "$vg/$lv" action dev_count)
+		read -r action2 dev_count <<< "$status"
+		# Every poll tells the live table by this count, so a status
+		# without one can decide nothing in any poll below.
+		[ -n "$dev_count" ] || return 4
 
 		if [ "$action" = reshape ] && [ "$action2" = reshape ]; then
+			# A reshape under the old table would answer nothing either.
+			[ "$dev_count" = "$new_dev_count" ] || return 4
 			# Reshape running: the size has to still be @old_size
 			[ "$lv_size" -eq "$old_size" ] && return 0
 			return 1
 		fi
 
-		# Not reshaping and not suspended: a moved size means it finished
-		if [ "$action" != frozen ] && [ "$action2" != frozen ]; then
-			[ "$lv_size" -eq "$old_size" ] || return 2
+		grown=0
+		[ "$lv_size" -ne "$old_size" ] && grown=1
+		live=0
+		[ "$dev_count" = "$new_dev_count" ] && live=1
+
+		# The reshape ended once nothing reports it any more, the size grew
+		# and the live table is the one with the added stripes.  A reload
+		# exposes its size before its table is live, so that is no end.
+		if [ "$grown" = 1 ] && [ "$live" = 1 ] &&
+		   [ "$action" = idle ] && [ "$action2" = idle ]; then
+			return 2
 		fi
 
 		action=$action2
@@ -334,15 +365,21 @@ function _lvconvert_size_held
 	local lv=$4
 	local old_size=$5
 	shift 5
+	local new_dev_count
 	local pid
 	local rc=0
+
+	# The table with the added stripes reports this device count in the
+	# status; _check_size_hold() tells the reshape end by it and requires
+	# it once the reshape is seen.
+	new_dev_count=$(_total_stripes "$raid_type" "$data_stripes")
 
 	_reshape_layout "$raid_type" "$data_stripes" $vg $lv "$@" &
 	pid=$!
 
 	# '|| rc=$?' and not a bare call: the test shell runs with 'set -e', so
 	# a nonzero return would abort the run before the command is waited for
-	_check_size_hold "$vg" "$lv" "$old_size" || rc=$?
+	_check_size_hold "$vg" "$lv" "$old_size" "$new_dev_count" || rc=$?
 
 	# The delay has done its job once the held size has been looked for, so
 	# reset it whatever the sampling found.  It is what keeps the reshape
@@ -360,6 +397,7 @@ function _lvconvert_size_held
 	1)	die "LV size should be small" ;;
 	2)	die "reshape of $vg/$lv finished before its size could be sampled" ;;
 	3)	die "reshape of $vg/$lv still ran at the timeout without a size sample" ;;
+	4)	die "status of $vg/$lv reported an unexpected device count" ;;
 	*)	die "unexpected result $rc from _check_size_hold" ;;
 	esac
 }
