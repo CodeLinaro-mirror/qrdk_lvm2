@@ -32,6 +32,12 @@ mkdir -p "$mount_dir" "$mount_dir_2"
 
 lvcreate -L 30M -n $lv1 $vg
 mkfs.ext4 "$DM_DEV_DIR/$vg/$lv1"
+# The resize helper this test is about only exists in the new fs handling:
+# it needs a build with libblkid and a libblkid that reports FSLASTBLOCK,
+# otherwise LVM leaves only the fsadm path, which takes no --fsmode.
+test "1" = "$(lvm lvmconfig --typeconfig default --valuesonly allocation/use_blkid_wiping)" &&
+	blkid -p "$DM_DEV_DIR/$vg/$lv1" | grep -q FSLASTBLOCK ||
+	skip "the new fs handling (--fsmode) is unavailable"
 
 # The block count proves the filesystem was not resized; without
 # dumpe2fs the other checks still run.
