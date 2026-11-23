@@ -27,6 +27,7 @@ node1 "lvmconfig --type default global/persistent_reservations | grep -q 'persis
 # A global PR key has generation 0: 0x100000000000XXXX (XXXX=host_id).
 # Use a foreign host_id (9) that no node uses.
 FOREIGN_KEY=0x1000000000000009
+KEY1=0x1000000000000001
 
 #
 # establish global mode 2 with a shared VG using PR
@@ -66,6 +67,12 @@ node2 lvmpersist read-keys --device $dev2 | grep -q "keys: none"
 #
 node2 lvmpersist start --ourkey $FOREIGN_KEY --prtype WE --device $dev2
 node2 lvmpersist check-key --key $FOREIGN_KEY --device $dev2
+
+# a claim with the foreign key registered fails with exit status 2 and
+# does not leave the local key registered
+node1 "lvmpersist start --ourkey $KEY1 --claim --access ex --device $dev2; test \$? -eq 2"
+node1 not lvmpersist check-key --key $KEY1 --device $dev2
+node1 lvmpersist check-key --key $FOREIGN_KEY --device $dev2
 
 # pvcreate must fail, not use the dev
 node1 not pvcreate -y $dev2

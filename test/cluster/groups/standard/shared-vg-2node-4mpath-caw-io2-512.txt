@@ -2,6 +2,7 @@ config shared-sanlock-2node-4mpath-caw-io2-512.conf
 run shell/shared-vg-blocked-operations.sh
 run shell/shared-vg-cache-writecache.sh
 run shell/shared-vg-contention-skipvg.sh
+run shell/shared-vg-dev-args-claim.sh
 run shell/shared-vg-exclusive-activation.sh
 run shell/shared-vg-exclusive-modification.sh
 run shell/shared-vg-independent.sh

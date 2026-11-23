@@ -7,6 +7,7 @@ run shell/shared-vg-lock-recovery-persist-timeout.sh
 run shell/shared-vg-blocked-operations.sh
 run shell/shared-vg-cache-writecache.sh
 run shell/shared-vg-contention-skipvg.sh
+run shell/shared-vg-dev-args-claim.sh
 run shell/shared-vg-exclusive-activation.sh
 run shell/shared-vg-exclusive-modification.sh
 run shell/shared-vg-independent.sh
