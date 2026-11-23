@@ -123,11 +123,13 @@ VG PR operations (change device PR state):
 .P
 .B lvmpersist start
 .BI --ourkey \ KEY
+.RB [ \-\-claim ]
 .I DEST
 .P
 "start" registers the local key and reserves devices.  If a different key
 from the same host is still registered, it will be replaced with the specified key.
 When --access or --prtype is not specified, access "ex" is used.
+With --claim, start requires that the local key is the only registered key.
 .P
 .B lvmpersist stop
 .BI --ourkey \ KEY
@@ -195,6 +197,12 @@ Use a PR type for exclusive or shared device access.
 .br
 Use the specified reservation type (alternative to --access.)
 .TP
+.B --claim
+.br
+With start: after registering the local key, verify that no key from
+another host is registered before reserving.  On conflict, unregister
+the local key and exit with status 2.
+.TP
 .B --ptpl
 .br
 Enable persist through power loss during start (register.)
@@ -222,6 +230,18 @@ also provided with --vg, then the VG name is simply used in log messages
 to identify the set of devices as a whole.  When lvmpersist is run by
 higher level LVM commands, each device is specified with --device, and the
 VG name is specified with --vg.
+.P
+.SS Exit status
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Error.
+.TP
+.B 2
+start --claim found a key registered by another host (the local key
+has been unregistered.)
 .P
 .SS VG metadata commands
 .P
@@ -344,6 +364,13 @@ A failed or interrupted PR start may leave PR started on only some devices.
 For a VG requiring PR, ordinary LVM metadata writes and LV activation require
 PR to be started on all its devices.
 .P
+An exception is start --claim, which LVM commands use to claim unused
+devices: on a claim conflict (another host's key is registered) or a
+reserve failure, the local key is unregistered from all devices so that
+a failed claim does not block other hosts.  A failure during key
+registration itself may still leave partial registrations in place,
+which the calling LVM command removes (lvmpersist stop.)
+.P
 With vgchange --setpersist y --persist start, successful PR start is
 followed by a VG metadata update.  If that update fails, the command
 attempts to stop PR.
@@ -434,6 +461,54 @@ generation number, in which case the lockstart command will update the key
 with the correct value (the generation number is officially determined
 during lockstart.)
 .P
+.SS Start Claim
+The --claim option allows PR to be used for mutual exclusion on multipath
+devices.  On multipath devices, --access ex translates to PR type WEAR
+which does not provide mutual exclusion among hosts.  Using --claim,
+after start registers the local key, lvmpersist checks the registered keys
+before reserving: if a key from another host is registered on any device,
+the local key is unregistered and the command fails with exit status 2.
+.P
+Registering the local key is the linearization point of the claim:
+a competing host either sees the local key in its own check and fails,
+or this command sees the other host's key and fails.  This provides
+mutual exclusion between hosts claiming unused devices without relying
+on the reservation type.
+.P
+.SS Host PR policy
+.P
+The lvm.conf setting global/persistent_reservations configures how PR is
+used by lvm commands on the host.
+.TP
+.B persistent_reservations = ["auto"]
+.br
+This is generally an opt-in mode, in which PR will be enabled
+and used when the user requests it via a command line option.
+When lvmlockd is enabled, it may use PR automatically for global
+device protection (the lvmlockd_global global_mode_auto setting.)
+When lvmlockd is disabled, PR remains useful to protect VGs and
+command device args, see --setpersist, --persist, and --pr options.
+.TP
+.B persistent_reservations = ["full"]
+.br
+Enable and use PR whenever devices support it. Users do not need to
+explicitly request PR via a command line option.
+This setting is recommended to maximally protect devices when using
+shared storage.  When lvmlockd is enabled, it will use PR instead of
+the global lock when possible (see the lvmlockd_global setting.)
+With or without lvmlockd, new VGs will have PR enabled, and command
+device args are protected when possible, e.g. pvcreate, pvremove,
+vgcreate/vgextend device args.
+.TP
+.B persistent_reservations = ["none"]
+.br
+Never use PR.  Commands that would start or enable PR fail with an error.
+With use_lvmlockd=1, lvmlockd uses global_mode_1 only.
+.P
+A pr_key or host_id (see Local Settings above) must be set to use PR,
+and the same policy value should be used on all hosts sharing the same
+devices.
+.P
 .SS vgcreate
 .P
 PR features can be enabled when creating a new VG:
@@ -446,10 +521,21 @@ For local VGs,
 .B --persist start
 can be included to also start PR on the new VG.
 .P
+.B vgcreate --pr
+is a shortcut for
+.B --setpersist y --persist start:
+the command takes PR on the devices it uses, and the VG is created
+with PR enabled and started.  (The --pr option cannot be combined
+with --setpersist or --persist.)
+.P
 Creating new shared VGs with --setpersist works differently.
 PR is always started for a new shared VG, even without --persist start.
-First, an exclusive PR (typically WE mode) is acquired for the new VG
-devices.  The devices are then initialized, and the new VG metadata is
+First, the new VG devices are claimed with PR: the local key is
+registered, any other host's key is verified to be absent, and an
+exclusive PR is acquired (typically WE mode; dm-multipath devices use
+WEAR since a WE reservation only permits the single path holding the
+reservation to write.)
+The devices are then initialized, and the new VG metadata is
 written.  The exclusive PR is then removed, and a shared PR (typically
 WEAR mode) is acquired for normal sharing of the VG.  Finally, the VG
 lockspace is started.
