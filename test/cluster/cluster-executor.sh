@@ -2513,6 +2513,7 @@ export -f cluster_translate_devs
 export -f cluster_node_exec
 export -f cluster_all_exec
 export -f cluster_nodes_exec
+export -f cluster_nodes_exec_per_node
 export -f cluster_setup_test_vars
 export -f cluster_setup_device_vars
 export -f cluster_discover_devices_on_node
