@@ -16,8 +16,10 @@ usage() {
 	cat <<-EOF
 	  ${SCRIPTNAME}: use persistent reservations on devices in an LVM VG.
 
-	  ${SCRIPTNAME} start --ourkey KEY DEST
+	  ${SCRIPTNAME} start --ourkey KEY [--claim] DEST
 	      Register key and reserve device(s).
+	      With --claim, fail (exit 2) if any key other than ours is
+	      registered, after unregistering our key.
 
 	  ${SCRIPTNAME} start --ourkey KEY --removekey REMKEY DEST
 	      Register key and reserve device(s), replacing reservation holder by preempt-abort.
@@ -55,6 +57,10 @@ usage() {
 	                           Translates to a specific PRTYPE for each device as appropriate
 	                           (usually WE for ex and WEAR for sh.)
 	      --prtype PRTYPE      Use only a specific PRTYPE, an alternative to --access.
+	      --claim              With start: after registering our key, verify
+	                           that no key from another host is registered
+	                           before reserving.  On conflict, unregister
+	                           our key and exit 2.
 	      --ptpl               Enable persist through power loss when starting.
 	      --debug              Enable shell debugging.
 
@@ -66,6 +72,12 @@ usage() {
 	      --vg VGNAME --device PATH ...
 	                           One or more devices to operate on, and a VG name
 	                           to use as an identifier for the set of devices.
+
+	  Exit status:
+	      0                    success
+	      1                    error
+	      2                    start --claim found a key registered by
+	                           another host (our key was unregistered)
 
 	  PRTYPE: persistent reservation type (use abbreviation with --prtype).
 	      WE:   Write Exclusive
@@ -953,6 +965,39 @@ do_start() {
 	# to avoid the LIO deadlock (same issue fixed in do_takeover).
 	settle_udev
 
+	# With --claim, verify that no key from another host is registered
+	# before reserving.  Registering our key is the linearization point
+	# of the claim: a competing host either sees our key in its check
+	# (and backs off), or we see its key here (and back off).  This
+	# provides mutual exclusion between PR-aware hosts without relying
+	# on the reservation type, which is required for multipath devices
+	# using WEAR for --access ex.
+
+	if [[ $DO_CLAIM -eq 1 ]]; then
+		foreign=0
+		for dev in "${DEVICES[@]}"; do
+			if ! get_key_list "$dev"; then
+				logmsg "start $GROUP failed to read keys from $dev."
+				do_unregister_all || logmsg "start $GROUP failed to unregister our key."
+				exit 1
+			fi
+			for k in "${KEYS[@]}"; do
+				if [[ "${k,,}" != "$OURKEY" ]]; then
+					logmsg "start $GROUP conflict on $dev: key $k is registered by another host."
+					foreign=1
+				fi
+			done
+		done
+		if [[ "$foreign" -ne 0 ]]; then
+			# Roll back our registrations so that we do not block other hosts.
+			if ! do_unregister_all; then
+				logmsg "start $GROUP failed to unregister our key after claim conflict."
+			fi
+			logmsg "start $GROUP failed: device(s) are claimed by another host."
+			exit 2
+		fi
+	fi
+
 	# Reserve devices
 
 	for dev in "${DEVICES[@]}"; do
@@ -988,6 +1033,10 @@ do_start() {
 					continue
 				fi
 			fi
+			# A failed claim must not leave our key behind.
+			if [[ $DO_CLAIM -eq 1 ]]; then
+				do_unregister_all || logmsg "start $GROUP failed to unregister our key."
+			fi
 			logmsg "start $GROUP failed to reserve $dev."
 			exit 1
 		fi
@@ -997,14 +1046,15 @@ do_start() {
 	exit 0
 }
 
-do_stop() {
-	err=0
+# Unregister our key from all devices and verify that it is gone.
+# Returns non-zero if any unregister or verification fails.
+# Used by do_stop, and by do_start --claim to roll back a failed claim.
+# Unregistering a key that is not registered is not an error (the
+# verification only requires that the key is absent afterwards).
 
-	require_opt OURKEY ourkey
-
-	# Removing reservation is not needed, we just remove our registration key.
-	# The reservation will go away when the last key is removed.
-	# sg_persist --out --no-inquiry --release --param-rk=${OURKEY} --prout-type=$SCSI_PRTYPE
+do_unregister_all() {
+	local err=0
+	local rc
 
 	for dev in "${DEVICES[@]}"; do
 		# Remove our registration key, we will no longer be able to write
@@ -1021,15 +1071,25 @@ do_stop() {
 		key_is_on_device "$dev" "$OURKEY"
 		rc=$?
 		if [ "$rc" -eq 0 ]; then
-			logmsg "stop $GROUP failed to unregister our key $OURKEY from $dev."
+			logmsg "failed to unregister our key $OURKEY from $dev."
 			err=1
 		elif [ "$rc" -eq 2 ]; then
-			logmsg "stop $GROUP failed to verify our key $OURKEY was unregistered from $dev."
+			logmsg "failed to verify our key $OURKEY was unregistered from $dev."
 			err=1
 		fi
 	done
 
-	if [ "$err" -ne 0 ]; then
+	return "$err"
+}
+
+do_stop() {
+	require_opt OURKEY ourkey
+
+	# Removing reservation is not needed, we just remove our registration key.
+	# The reservation will go away when the last key is removed.
+	# sg_persist --out --no-inquiry --release --param-rk=${OURKEY} --prout-type=$SCSI_PRTYPE
+
+	if ! do_unregister_all; then
 		errorexit "stop $GROUP failed."
 	fi
 
@@ -1382,6 +1442,7 @@ DO_CHECKKEY=0
 DO_READKEYS=0
 DO_READRESERVATION=0
 DO_READ=0
+DO_CLAIM=0
 
 # Option values are set from command-line options below.  Initialize them
 # so variables of the same name in the caller's environment are not used.
@@ -1441,7 +1502,7 @@ fi
 
 GETOPT="getopt"
 
-OPTIONS=$("$GETOPT" -o h -l help,ourkey:,removekey:,key:,prtype:,access:,ptpl,debug,device:,vg: -n "${SCRIPTNAME}" -- "$@") ||
+OPTIONS=$("$GETOPT" -o h -l help,claim,ourkey:,removekey:,key:,prtype:,access:,ptpl,debug,device:,vg: -n "${SCRIPTNAME}" -- "$@") ||
 	errorexit "invalid option."
 eval set -- "$OPTIONS"
 
@@ -1465,6 +1526,9 @@ do
 		;;
 	--prtype)
 		PRTYPE_ARG=$2; shift
+		;;
+	--claim)
+		DO_CLAIM=1
 		;;
 	--device)
 		LAST_DEVICE=$2
@@ -1509,6 +1573,14 @@ fi
 
 if [[ -n "$PRTYPE_ARG" && -n "$ACCESS" ]]; then
 	errorexit "Set --prtype or --access, not both."
+fi
+
+if [[ "$DO_CLAIM" -eq 1 && "$DO_START" -eq 0 ]]; then
+	errorexit "Invalid option: --claim is only valid with start."
+fi
+
+if [[ "$DO_CLAIM" -eq 1 && -n "$REMKEY" ]]; then
+	errorexit "Set --claim or --removekey, not both."
 fi
 
 if [[ "$DO_CHECKKEY" -eq 1 ]]; then
