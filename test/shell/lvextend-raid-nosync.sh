@@ -184,6 +184,7 @@ lvremove -ff $vg/$lv2
 # target before 1.15.0 may not synchronize an extended set, so it is told to.
 segtypes="raid5"
 aux have_raid4 && segtypes="raid4 $segtypes"
+
 for r in $segtypes; do
 	lvcreate --type $r -i 3 -L 12M -n $lv1 $vg "$dev1" "$dev2" "$dev3" "$dev4"
 	aux wait_for_sync $vg $lv1
@@ -248,7 +249,11 @@ for r in $segtypes; do
 	check lv_attr_bit type $vg/$lv1 "R"
 	check raid_action $vg $lv1 idle
 	aux wait_for_sync $vg $lv1
-	if [ "$r" = raid5 ]; then
+	# A dm-raid 1.3.5 target finishes a rebuilt RAID5 leg with a 4 KiB read
+	# that starts inside every component and ends past it: the block layer
+	# rejects the read, md disables every leg, and the array never reports
+	# in-sync.  dm-raid 1.3.6 finishes the same rebuild.
+	if [ "$r" = raid5 ] && aux have_raid 1 3 6; then
 		# An inherited nosync must not interrupt a real image rebuild.
 		aux delay_dev "$dev5" 0 20 "$(get first_extent_sector "$dev5"):"
 		lvconvert -y --replace "$dev2" $vg/$lv1 "$dev5"
