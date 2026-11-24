@@ -721,6 +721,33 @@ static int read_lockspace_info(char *path, uint32_t host_id, int *sector_size, i
 	return 0;
 }
 
+/* Write the gl2 lease, which is at a fixed offset (GL2_LOCK_BEGIN) in the
+   lvmlock lv.  It does not exist in a VG with lock_args minor 0 (the area
+   is unused); the callers write it only for minor >= 1. */
+
+static int _write_gl2_lease(char *ls_name, char *path, int align_size, uint32_t rs_flags,
+			    uint32_t write_rs_flags, const char *caller)
+{
+	struct sanlk_resourced rd;
+	int rv;
+
+	memset(&rd, 0, sizeof(rd));
+	strcpy_name_len(rd.rs.lockspace_name, ls_name, SANLK_NAME_LEN);
+	strcpy_name_len(rd.rs.name, R_NAME_GL2, SANLK_NAME_LEN);
+	memcpy(rd.rs.disks[0].path, path, SANLK_PATH_LEN);
+	rd.rs.disks[0].offset = (uint64_t)align_size * GL2_LOCK_BEGIN;
+	rd.rs.num_disks = 1;
+	rd.rs.flags = rs_flags;
+
+	rv = sanlock_write_resource(&rd.rs, 0, 0, write_rs_flags);
+	if (rv < 0) {
+		log_error("S %s %s write_resource gl2 error %d %s", ls_name, caller, rv, path);
+		return rv;
+	}
+
+	return 0;
+}
+
 /*
  * vgcreate
  *
@@ -946,15 +973,9 @@ int lm_init_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_ar
 		return rv;
 	}
 
-	strcpy_name_len(rd.rs.name, R_NAME_GL2, SANLK_NAME_LEN);
-	rd.rs.disks[0].offset = align_size * GL2_LOCK_BEGIN;
-
-	rv = sanlock_write_resource(&rd.rs, 0, 0, write_rs_flags);
-	if (rv < 0) {
-		log_error("S %s init_vg_san write_resource gl2 error %d %s",
-			  ls_name, rv, rd.rs.disks[0].path);
+	rv = _write_gl2_lease(ss.name, disk.path, align_size, rs_flags, write_rs_flags, "init_vg_san");
+	if (rv < 0)
 		return rv;
-	}
 
 	memcpy(rd.rs.lockspace_name, ss.name, SANLK_NAME_LEN);
 	strcpy_name_len(rd.rs.name, R_NAME_VG, SANLK_NAME_LEN);
@@ -1346,7 +1367,7 @@ int lm_rename_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_
 	if (minor) {
 		memset(&rd, 0, sizeof(rd));
 		memcpy(rd.rs.disks[0].path, disk.path, SANLK_PATH_LEN);
-		rd.rs.disks[0].offset = align_size * GL2_LOCK_BEGIN;
+		rd.rs.disks[0].offset = (uint64_t)align_size * GL2_LOCK_BEGIN;
 		rd.rs.num_disks = 1;
 
 		rv = sanlock_read_resource(&rd.rs, 0);
@@ -1356,14 +1377,12 @@ int lm_rename_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_
 			return rv;
 		}
 
-		memcpy(rd.rs.lockspace_name, ss.name, SANLK_NAME_LEN);
+		/* rewrite the gl2 lease with the new lockspace name, keeping
+		   the lease flags that were just read from disk */
 
-		rv = sanlock_write_resource(&rd.rs, 0, 0, write_rs_flags);
-		if (rv < 0) {
-			log_error("S %s rename_vg_san write_resource gl2 error %d %s",
-				  ls_name, rv, rd.rs.disks[0].path);
+		rv = _write_gl2_lease(ss.name, disk.path, align_size, rd.rs.flags, write_rs_flags, "rename_vg_san");
+		if (rv < 0)
 			return rv;
-		}
 	}
 
 	/*
@@ -3089,19 +3108,9 @@ int lm_setglobalmode_vg_sanlock(char *ls_name, char *vg_name, struct action *act
 	/* gl2 does not exist in a VG with lock_args minor 0, the area is unused. */
 
 	if (!minor) {
-		memset(&rd, 0, sizeof(rd));
-		strcpy_name_len(rd.rs.lockspace_name, ls_name, SANLK_NAME_LEN);
-		strcpy_name_len(rd.rs.name, R_NAME_GL2, SANLK_NAME_LEN);
-		memcpy(rd.rs.disks[0].path, disk_path, SANLK_PATH_LEN);
-		rd.rs.disks[0].offset = (uint64_t)align_size * GL2_LOCK_BEGIN;
-		rd.rs.num_disks = 1;
-		rd.rs.flags = rs_size_flags;
-
-		rv = sanlock_write_resource(&rd.rs, 0, 0, write_rs_flags);
-		if (rv < 0) {
-			log_error("S %s setglobalmode write_resource gl2 error %d %s", ls_name, rv, disk_path);
+		rv = _write_gl2_lease(ls_name, disk_path, align_size, rs_size_flags, write_rs_flags, "setglobalmode");
+		if (rv < 0)
 			return rv;
-		}
 	}
 
 	/* read the current gl name; leave rs.name empty, it is what we're reading */
@@ -3251,7 +3260,6 @@ int lm_setlockargs_supported_sanlock(struct lockspace *ls, struct action *act)
 int lm_setlockargs_vg_sanlock(char *ls_name, char *vg_name, struct action *act)
 {
 	struct sanlk_lockspace ss = {0};
-	struct sanlk_resourced rd = {0};
 	char lock_lv_name[MAX_ARGS+1] = {0};
 	char disk_path[SANLK_PATH_LEN] = {0};
 	uint32_t ss_size_flags = 0;
@@ -3348,20 +3356,9 @@ int lm_setlockargs_vg_sanlock(char *ls_name, char *vg_name, struct action *act)
 
 		write_rs_flags = using_caw ? SANLK_WRITE_USE_CAW : SANLK_WRITE_NO_CAW;
 
-		memset(&rd, 0, sizeof(rd));
-		strcpy_name_len(rd.rs.lockspace_name, ls_name, SANLK_NAME_LEN);
-		strcpy_name_len(rd.rs.name, R_NAME_GL2, SANLK_NAME_LEN);
-		memcpy(rd.rs.disks[0].path, disk_path, SANLK_PATH_LEN);
-		rd.rs.disks[0].offset = (uint64_t)align_size * GL2_LOCK_BEGIN;
-		rd.rs.num_disks = 1;
-		rd.rs.flags = rs_size_flags;
-
-		rv = sanlock_write_resource(&rd.rs, 0, 0, write_rs_flags);
-		if (rv < 0) {
-			log_error("S %s setlockargs write_resource gl2 error %d %s",
-				  ls_name, rv, rd.rs.disks[0].path);
+		rv = _write_gl2_lease(ls_name, disk_path, align_size, rs_size_flags, write_rs_flags, "setlockargs");
+		if (rv < 0)
 			return rv;
-		}
 	}
 
 	update_info_file(vg_name, no_timeout, no_watchdog);
