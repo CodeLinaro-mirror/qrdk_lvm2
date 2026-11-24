@@ -16,6 +16,116 @@
 #include "tools.h"
 #include "lib/device/persist.h"
 
+/*
+ * Usually, setpersist (writing PR settings in VG metadata)
+ * is separate from persist start (starting PR on devices).
+ * Both steps can be optionally combined in one command with:
+ * --setpersist y --persist start.  So,
+ *
+ * . vgcreate --setpersist y                   does not start PR
+ * . vgcreate --persist start                  does start PR
+ * . vgcreate --setpersist y --persist start   does start PR
+ * . vgcreate --pr                             does start PR
+ *
+ * --pr is a shortcut for --setpersist y --persist start (and
+ * cannot be combined with either option.)
+ *
+ * A special case which does not follow this pattern is creating
+ * a shared VG, where PR is started even without --persist start
+ * when setpersist is enabled:
+ *
+ * . vgcreate --shared --setpersist y          does start PR
+ *
+ * This case is different because creating a shared VG includes
+ * automatically starting the VG lockspace.  The proper sequence
+ * of using a shared VG is first starting PR, then starting the
+ * lockspace.  So, to maintain this proper sequence, the vgcreate
+ * needs to include an automatic PR start prior to the automatic
+ * lock start.
+ *
+ * Creating a shared VG without setpersist, but PR start is
+ * currently disallowed, because it's not clear if this
+ * combination would ever be useful.
+ *
+ * . vgcreate --shared --persist start         disallowed
+ */
+
+static int vgcreate_persist_params_from_args(struct cmd_context *cmd, struct pvcreate_params *pp)
+{
+	int shared_vg = arg_is_set(cmd, shared_ARG);
+	int pr_policy;
+	int setpersist_on;
+
+	if (arg_is_set(cmd, setpersist_ARG) &&
+	    !setpersist_arg_flags(arg_str_value(cmd, setpersist_ARG, NULL), &pp->setpersist_flags))
+		return_0;
+
+	if ((pr_policy = persist_policy_get(cmd)) < 0)
+		return 0;
+
+	/*
+	 * --pr is a shortcut for --setpersist y --persist start: the
+	 * command takes a PR on the devs it uses, and the VG is
+	 * created with PR enabled and started.
+	 */
+	if (arg_is_set(cmd, pr_ARG))
+		pp->setpersist_flags |= SETPR_Y;
+
+	/*
+	 * PR is not permitted with policy none.
+	 * (--setpersist n is allowed to clear PR settings)
+	 */
+	if (pr_policy == PR_POLICY_NONE) {
+		if (pp->setpersist_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART | SETPR_PTPL)) {
+			log_error("Persistent reservations are disabled in lvm config (persistent_reservations=none).");
+			return 0;
+		}
+		if (arg_is_set(cmd, persist_ARG)) {
+			log_error("Persistent reservations are disabled in lvm config (persistent_reservations=none).");
+			return 0;
+		}
+	}
+
+	/*
+	 * With PR policy set to "full", a new VG automatically has PR enabled
+	 * (assuming the devices all support PR), without the user needing to
+	 * include an explicit '--setpersist y' on the command line.
+	 * (Unless the user explicitly says no with --setpersist n.)
+	 */
+	if (!arg_is_set(cmd, setpersist_ARG) && !arg_is_set(cmd, pr_ARG) && (pr_policy == PR_POLICY_FULL)) {
+		pp->setpersist_flags = SETPR_Y;
+		pp->setpersist_from_full = 1;
+	}
+
+	setpersist_on = (pp->setpersist_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART)) ? 1 : 0;
+
+	/*
+	 * "start" is the only permitted option for --persist in vgcreate,
+	 * and --pr is a shortcut that implies --persist start.
+	 */
+	pp->start_pr = arg_is_set(cmd, persist_ARG) || arg_is_set(cmd, pr_ARG);
+
+	if (!shared_vg && arg_is_set(cmd, locktype_ARG)) {
+		int lock_type_num = get_lock_type_from_string(arg_str_value(cmd, locktype_ARG, NULL));
+		if (lock_type_num == LOCK_TYPE_SANLOCK || lock_type_num == LOCK_TYPE_DLM)
+			shared_vg = 1;
+	}
+
+	if (!setpersist_on && shared_vg && pp->start_pr) {
+		log_error("A shared VG should include --setpersist y|require to use PR.");
+		return 0;
+	}
+
+	/*
+	 * Automatic PR start for shared VGs because lockstart is automatic in vgcreate,
+	 * and PR start happens before lockstart.
+	 */
+	if (setpersist_on && shared_vg)
+		pp->start_pr = 1;
+
+	return 1;
+}
+
 int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 {
 	struct pvcreate_params pp;
@@ -40,6 +150,9 @@ int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 	pvcreate_params_set_defaults(&pp);
 
 	if (!pvcreate_params_from_args(cmd, &pp))
+		return EINVALID_CMD_LINE;
+
+	if (!vgcreate_persist_params_from_args(cmd, &pp))
 		return EINVALID_CMD_LINE;
 
 	pp.force = PROMPT;        /* vgcreate cannot be forced (-ff) to use a PV that is in a VG. */
