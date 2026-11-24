@@ -98,6 +98,21 @@ def _is_testsuite_pv(pv_name):
 			pv_name[:-1].endswith(g_prefix + "pv")
 
 
+# Position of the device open count in lv_attr.
+LV_ATTR_OPEN_IDX = 5
+
+
+# The daemon refreshes its state asynchronously, so two samples of a property
+# taken at different times can differ while a live value moves.  The open
+# count in lv_attr is such a value: udev's blkid can hold a freshly activated
+# LV open for a moment.  Return the value in the form that may be compared
+# across samples.
+def _comparable_property(prop_name, value):
+	if prop_name != 'Attr':
+		return value
+	return value[:LV_ATTR_OPEN_IDX] + '-' + value[LV_ATTR_OPEN_IDX + 1:]
+
+
 def is_nested_pv(pv_name):
 	return pv_name.count('/') == 3 and not _is_testsuite_pv(pv_name)
 
@@ -972,7 +987,11 @@ class TestDbusService(unittest.TestCase):
 
 		ri.update()
 		for prop_name in ri.get_property_names():
-			self.assertEqual(ri.get_property_value(prop_name), getattr(ri, prop_name))
+			now = ri.get_property_value(prop_name)
+			cached = getattr(ri, prop_name)
+			self.assertEqual(
+				_comparable_property(prop_name, now),
+				_comparable_property(prop_name, cached))
 
 	def test_lv_create_job(self):
 		lv_name = lv_n()
