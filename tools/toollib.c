@@ -97,8 +97,10 @@ static int _dev_args_list_create(struct cmd_context *cmd, int argc, char **argv,
 				return 0;
 			}
 			log_error("No device found for %s.", name);
-		} else if (_device_arg_find_dev(devs, dev))
+		} else if ((da = _device_arg_find_dev(devs, dev))) {
+			log_warn("Device %s is the same device as %s, using it once.", name, da->name);
 			continue;
+		}
 
 		if (!(da = dm_pool_zalloc(cmd->mem, sizeof(*da))))
 			return_0;

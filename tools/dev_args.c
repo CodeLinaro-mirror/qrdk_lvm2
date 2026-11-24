@@ -462,7 +462,7 @@ int dev_args_wipe_and_zero(struct cmd_context *cmd, struct dm_list *devs)
 		if (zero) {
 			log_verbose("Zeroing start of device %s.", da->name);
 
-			if (!dev_write_zeros(da->dev, 0, 2048)) {
+			if (!dev_write_zeros(da->dev, 0, LABEL_SCAN_SIZE)) {
 				log_error("%s not wiped: aborting.", da->name);
 				da->failed = 1;
 				ret = 0;
@@ -1382,11 +1382,14 @@ int dev_args_pv_orphans_read(struct cmd_context *cmd, struct dm_list *devs, stru
 	int found;
 	int ret = 1;
 
+	found = 0;
 	dm_list_iterate_items(da, devs) {
-		if (!da->failed && da->skip_write && da->is_orphan_pv)
+		if (!da->failed && da->skip_write && da->is_orphan_pv) {
+			found = 1;
 			break;
+		}
 	}
-	if (&da->list == devs)
+	if (!found)
 		return 1;
 
 	log_debug("Using existing orphan PVs in %s.", FMT_TEXT_ORPHAN_VG_NAME);
