@@ -1115,6 +1115,10 @@ static const char *op_str(int x)
 		return "setlockargs_before";
 	case LD_OP_SETLOCKARGS_FINAL:
 		return "setlockargs_final";
+	case LD_OP_SETGLOBALMODE_BEFORE:
+		return "setglobalmode_before";
+	case LD_OP_SETGLOBALMODE_FINAL:
+		return "setglobalmode_final";
 	default:
 		return "op_unknown";
 	};
@@ -3274,10 +3278,9 @@ static void *lockspace_thread_main(void *arg_in)
 				continue;
 			}
 
-			if (act->op == LD_OP_SETLOCKARGS_BEFORE && act->rt == LD_RT_VG) {
+			if ((act->op == LD_OP_SETLOCKARGS_BEFORE || act->op == LD_OP_SETGLOBALMODE_BEFORE) && act->rt == LD_RT_VG) {
 				/* check if sanlock version supports the new args */
-				if (act->global_mode != GM1 && act->global_mode != GM2 &&
-				    !lm_setlockargs_supported_sanlock(ls, act)) {
+				if (act->op == LD_OP_SETLOCKARGS_BEFORE && !lm_setlockargs_supported_sanlock(ls, act)) {
 					list_del(&act->list);
 					act->result = -EPROTONOSUPPORT;
 					add_client_result(act);
@@ -3303,7 +3306,7 @@ static void *lockspace_thread_main(void *arg_in)
 					 * main loop allows vgremove to fail and be rerun
 					 * after the ls is stopped on other hosts.
 					 */
-					log_error("S %s setlockargs_before hosts %d", ls->name, rv);
+					log_error("S %s %s hosts %d", ls->name, op_str(act->op), rv);
 					list_del(&act->list);
 					act->result = (rv < 0) ? rv : -EBUSY;
 					if (hosts_unknown)
@@ -3315,7 +3318,7 @@ static void *lockspace_thread_main(void *arg_in)
 				/* return success, allow the change */
 				/* list_del act and add_client_result done after rem_lockspace */
 
-				/* the lockspace needs to be stopped for setlockargs_final */
+				/* the lockspace needs to be stopped for the final request */
 				ls->thread_work = 0;
 				ls->thread_stop = 1;
 				break;
@@ -3621,7 +3624,7 @@ out_act:
 			act->result = 0;
 		else if (act->op == LD_OP_RENAME_BEFORE)
 			act->result = 0;
-		else if (act->op == LD_OP_SETLOCKARGS_BEFORE)
+		else if (act->op == LD_OP_SETLOCKARGS_BEFORE || act->op == LD_OP_SETGLOBALMODE_BEFORE)
 			act->result = 0;
 		else
 			act->result = -ENOLS;
@@ -4431,9 +4434,12 @@ static int work_setlockargs_vg_final(struct action *act)
 			return -EAGAIN;
 		}
 
-		/* FIXME: separate setglobalmode from setlockargs */
-
-		if (act->global_mode == GM1 || act->global_mode == GM2)
+		/*
+		 * setglobalmode changes the global mode of the VG (the GL
+		 * leases) and keeps the existing lock_args; setlockargs
+		 * changes the lock_args (the user flags.)
+		 */
+		if (act->op == LD_OP_SETGLOBALMODE_FINAL)
 			rv = lm_setglobalmode_vg_sanlock(ls_name, act->vg_name, act);
 		else
 			rv = lm_setlockargs_vg_sanlock(ls_name, act->vg_name, act);
@@ -4775,8 +4781,8 @@ static void *worker_thread_main(void *arg_in)
 			act->result = work_rename_vg(act);
 			add_client_result(act);
 
-		} else if ((act->op == LD_OP_SETLOCKARGS_FINAL) && (act->rt == LD_RT_VG)) {
-			log_debug("work setlockargs_vg_final %s", act->vg_name);
+		} else if (((act->op == LD_OP_SETLOCKARGS_FINAL) || (act->op == LD_OP_SETGLOBALMODE_FINAL)) && (act->rt == LD_RT_VG)) {
+			log_debug("work %s %s", op_str(act->op), act->vg_name);
 			act->result = work_setlockargs_vg_final(act);
 			add_client_result(act);
 
@@ -5096,9 +5102,10 @@ static int client_send_result(struct client *cl, struct action *act)
 	if (act->flags & LD_AF_GL_ENABLED)
 		strcat(result_flags, "GL_ENABLED,");
 
-	if (act->op == LD_OP_INIT || act->op == LD_OP_SETLOCKARGS_FINAL) {
+	if (act->op == LD_OP_INIT || act->op == LD_OP_SETLOCKARGS_FINAL || act->op == LD_OP_SETGLOBALMODE_FINAL) {
 		/*
-		 * init and setlockargs send lock_args back to the client.
+		 * init, setlockargs and setglobalmode send lock_args back
+		 * to the client.
 		 */
 		const char *vg_args = "none";
 		const char *lv_args = "none";
@@ -5663,6 +5670,16 @@ static int str_to_op_rt(const char *req_name, int *op, int *rt)
 	}
 	if (!strcmp(req_name, "setlockargs_vg_final")) {
 		*op = LD_OP_SETLOCKARGS_FINAL;
+		*rt = LD_RT_VG;
+		return 0;
+	}
+	if (!strcmp(req_name, "setglobalmode_vg_before")) {
+		*op = LD_OP_SETGLOBALMODE_BEFORE;
+		*rt = LD_RT_VG;
+		return 0;
+	}
+	if (!strcmp(req_name, "setglobalmode_vg_final")) {
+		*op = LD_OP_SETGLOBALMODE_FINAL;
 		*rt = LD_RT_VG;
 		return 0;
 	}
@@ -6400,9 +6417,6 @@ static void client_recv_action(struct client *cl)
 
 	act->global_mode = daemon_request_int(req, "global_mode", -1);
 
-	str = daemon_request_str(req, "global_type", NULL);
-	act->global_type = str ? str_to_lm(str) : -1;
-
 	str = daemon_request_str(req, "global_vgname", NULL);
 	if (str && strcmp(str, "none"))
 		dm_strncpy(act->global_vgname, str, sizeof(act->global_vgname));
@@ -6506,6 +6520,7 @@ skip_pvs_path:
 	case LD_OP_RUNNING_LM:
 	case LD_OP_REFRESH_LV:
 	case LD_OP_SETLOCKARGS_FINAL:
+	case LD_OP_SETGLOBALMODE_FINAL:
 		add_work_action(act);
 		rv = 0;
 		break;
@@ -6521,6 +6536,7 @@ skip_pvs_path:
 	case LD_OP_DROP_VG:
 	case LD_OP_BUSY:
 	case LD_OP_SETLOCKARGS_BEFORE:
+	case LD_OP_SETGLOBALMODE_BEFORE:
 	case LD_OP_SET_REMOTE_LV_LOCK:
 		rv = add_lock_action(act);
 		break;

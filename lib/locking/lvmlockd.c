@@ -5122,6 +5122,11 @@ void lockd_lockopt_get_flags(const char *str, uint32_t *flags, int *retries, int
  *   that are not specifically reflected in the lock_args (currently
  *   global mode and global lock.)
  *
+ * The two commands use distinct lvmlockd requests: setlockargs sends
+ * setlockargs_vg_before/final and locksettings sends
+ * setglobalmode_vg_before/final (lvmlockd dispatches on the request
+ * name, not on the presence of a global mode.)
+ *
  * Change the lock_args, and lock settings (e.g. global mode) of a sanlock VG
  * while no other host is using it.  For --setlockargs, set_args holds the new
  * user flags.  For --locksettings, global_mode is 1 or 2 and set_args is
@@ -5148,6 +5153,8 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 	const char *reply_str;
 	const char *vg_lock_args = NULL;
 	const char *setcmd = set_args ? "setlockargs" : "locksettings";
+	const char *req_before = set_args ? "setlockargs_vg_before" : "setglobalmode_vg_before";
+	const char *req_final = set_args ? "setlockargs_vg_final" : "setglobalmode_vg_final";
 	uint32_t result_flags;
 	int result;
 	int ret;
@@ -5193,9 +5200,9 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 	 * the lockspace.
 	 */
 
-	log_debug("lockd %s %s send setlockargs_vg_before", setcmd, vg->name);
+	log_debug("lockd %s %s send %s", setcmd, vg->name, req_before);
 
-	reply = _lockd_send("setlockargs_vg_before",
+	reply = _lockd_send(req_before,
 				"pid = " FMTd64, (int64_t) getpid(),
 				"vg_name = %s", vg->name,
 				"vg_lock_type = %s", vg->lock_type,
@@ -5205,7 +5212,7 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 				"opts = %s", opts,
 				NULL);
 
-	if (!_lockd_result(cmd, "setlockargs_vg_before", reply, &result, &result_flags, NULL, NULL)) {
+	if (!_lockd_result(cmd, req_before, reply, &result, &result_flags, NULL, NULL)) {
 		ret = 0;
 		goto out;
 	}
@@ -5263,9 +5270,9 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 	 */
 
  retry_final:
-	log_debug("lockd %s %s send setlockargs_vg_final", setcmd, vg->name);
+	log_debug("lockd %s %s send %s", setcmd, vg->name, req_final);
 
-	reply = _lockd_send("setlockargs_vg_final",
+	reply = _lockd_send(req_final,
 				"pid = " FMTd64, (int64_t) getpid(),
 				"vg_name = %s", vg->name,
 				"vg_lock_type = %s", vg->lock_type,
@@ -5275,7 +5282,7 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 				"opts = %s", opts,
 				NULL);
 
-	if (!_lockd_result(cmd, "setlockargs_vg_final", reply, &result, &result_flags, NULL, NULL)) {
+	if (!_lockd_result(cmd, req_final, reply, &result, &result_flags, NULL, NULL)) {
 		ret = 0;
 		goto out;
 	}
@@ -5287,13 +5294,13 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 	}
 
 	if (result < 0) {
-		log_error("VG %s setlockargs failed: result %d", vg->name, result);
+		log_error("VG %s %s failed: result %d", vg->name, setcmd, result);
 		ret = 0;
 		goto out;
 	}
 
 	if (!(reply_str = daemon_reply_str(reply, "vg_lock_args", NULL))) {
-		log_error("VG %s setlockargs failed: result %d new lock_args not returned", vg->name, result);
+		log_error("VG %s %s failed: result %d new lock_args not returned", vg->name, setcmd, result);
 		ret = 0;
 		goto out;
 	}

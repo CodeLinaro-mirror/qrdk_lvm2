@@ -67,6 +67,8 @@ enum {
 	LD_OP_FENCE_RESULT,
 	LD_OP_SETLOCKARGS_BEFORE,
 	LD_OP_SETLOCKARGS_FINAL,
+	LD_OP_SETGLOBALMODE_BEFORE,
+	LD_OP_SETGLOBALMODE_FINAL,
 	LD_OP_SET_REMOTE_LV_LOCK, /* test-only: simulate remote node holding LV lock */
 	LD_OP_GET_START_RESULT,
 };
@@ -199,7 +201,6 @@ struct action {
 	int lm_rv;			/* return value from lm_ function */
 	int align_mb;
 	int global_mode;
-	int global_type;
 	unsigned int force_fence_retry : 1;
 	char *path;
 	char vg_uuid[64];
