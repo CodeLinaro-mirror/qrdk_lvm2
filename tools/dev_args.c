@@ -68,6 +68,11 @@
  * PR used for 1 needs to be transitioned to 2 ("handed off" from
  * global usage for 1 to VG usage for 2.)  The PR key and mode for
  * 1 and 2 can differ, and can require updating in the hand off.
+ *
+ * The dev_args functions/primitives in this file are intended
+ * to be used in common sequences among the commands listed above.
+ * The similar patterns, with minor differences, are intended and
+ * not something to be factored out.
  */
 
 /*
