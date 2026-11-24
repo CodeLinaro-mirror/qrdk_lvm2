@@ -172,7 +172,6 @@ void fin_locking(struct cmd_context *cmd)
 	 * in which case these flags would not be cleared.
 	 */
 	cmd->lockf_global_ex = 0;
-	cmd->lockd_global_ex = 0;
 	memset(&cmd->global_devs, 0, sizeof(cmd->global_devs));
 
 	_locking.fin_locking();

@@ -194,7 +194,6 @@ struct cmd_context {
 	unsigned lockd_vg_default_sh:1;
 	unsigned lockd_vg_enforce_sh:1;
 	unsigned lockd_lv_sh_for_ex:1;
-	unsigned lockd_global_ex:1;		/* set while global lock held ex (lockd) */
 	unsigned lockf_global_ex:1;		/* set while global lock held ex (flock) */
 	struct global_devs_lock global_devs;	/* see lock_global_devs() */
 	unsigned nolocking:1;

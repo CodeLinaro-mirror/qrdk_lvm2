@@ -939,9 +939,6 @@ static int _lockd_request_gl(struct cmd_context *cmd,
 	*result = 0;
 	*result_flags = 0;
 
-	if (!strcmp(mode, "na"))
-		return 1;
-
 	if (!_use_lvmlockd)
 		return 0;
 	if (!_lvmlockd_connected)
@@ -2494,12 +2491,6 @@ static int _lockd_global(struct cmd_context *cmd, const char *def_mode,
 		opts = opt_buf;
 	}
 
-	if (!strcmp(mode, "sh") && cmd->lockd_global_ex)
-		return 1;
-
-	if (!strcmp(mode, "un") && cmd->lockd_global_ex)
-		cmd->lockd_global_ex = 0;
-
 	if (cmd->lockd_gl_disable) {
 		log_debug("lockd global disabled %s", def_mode ?: "");
 		if (def_mode && !strcmp(def_mode, "ex"))
@@ -2516,12 +2507,6 @@ static int _lockd_global(struct cmd_context *cmd, const char *def_mode,
 		/* We don't care if an unlock fails. */
 		if (!strcmp(mode, "un"))
 			return 1;
-
-		/* We can continue reading if a shared lock fails. */
-		if (!strcmp(mode, "sh")) {
-			log_warn("Reading without shared global lock.");
-			goto allow;
-		}
 
 		log_error("Global lock failed: check that lvmlockd is running.");
 		return 0;
@@ -2591,110 +2576,33 @@ static int _lockd_global(struct cmd_context *cmd, const char *def_mode,
 		/*
 		 * If an ex global lock fails, then the command fails.
 		 */
-		if (strcmp(mode, "sh")) {
-			if (result == -ESTARTING)
-				log_error("Global lock failed: lockspace is starting");
-			else if (result == -ENOLS)
-				log_error("Global lock failed: check that global lockspace is started");
-			else if (result == -EGMMIX)
-				log_error("Global lock failed: global mode conflicts with the mode in use by lvmlockd");
-			else if (result == -ELOCKIO)
-				log_error("Global lock failed: storage errors for sanlock leases");
-			else if (result == -EIOTIMEOUT)
-				log_error("Global lock failed: io timeout");
-			else if (result == -ELOCKREPAIR)
-				log_error("Global lock failed: sanlock lease needs repair");
-			else if (result == -ELMERR)
-				log_error("Global lock failed: lock manager error");
-			else if (result == -EVGKILLED)
-				log_error("Global lock failed: storage failed for sanlock leases");
-			else if (result == -EORPHAN)
-				log_error("Global lock failed: orphan lock needs to be adopted");
-			else if (result == -EADOPT_NONE)
-				log_error("Global lock failed: adopt found no orphan");
-			else if (result == -EADOPT_RETRY)
-				log_error("Global lock failed: adopt found other mode");
-			else if (result == -EAGAIN)
-				log_error("Global lock failed: held by other host%s", _owner_str(&owner));
-			else
-				log_error("Global lock failed: error %d", result);
+		if (result == -ESTARTING)
+			log_error("Global lock failed: lockspace is starting");
+		else if (result == -ENOLS)
+			log_error("Global lock failed: check that global lockspace is started");
+		else if (result == -EGMMIX)
+			log_error("Global lock failed: global mode conflicts with the mode in use by lvmlockd");
+		else if (result == -ELOCKIO)
+			log_error("Global lock failed: storage errors for sanlock leases");
+		else if (result == -EIOTIMEOUT)
+			log_error("Global lock failed: io timeout");
+		else if (result == -ELOCKREPAIR)
+			log_error("Global lock failed: sanlock lease needs repair");
+		else if (result == -ELMERR)
+			log_error("Global lock failed: lock manager error");
+		else if (result == -EVGKILLED)
+			log_error("Global lock failed: storage failed for sanlock leases");
+		else if (result == -EORPHAN)
+			log_error("Global lock failed: orphan lock needs to be adopted");
+		else if (result == -EADOPT_NONE)
+			log_error("Global lock failed: adopt found no orphan");
+		else if (result == -EADOPT_RETRY)
+			log_error("Global lock failed: adopt found other mode");
+		else if (result == -EAGAIN)
+			log_error("Global lock failed: held by other host%s", _owner_str(&owner));
+		else
+			log_error("Global lock failed: error %d", result);
 
-			return 0;
-		}
-
-		/*
-		 * If a sh global lock fails, then the command can continue
-		 * reading without it, but force a global cache validation,
-		 * and print a warning.
-		 */
-
-		if (result == -ESTARTING) {
-			log_warn("Skipping global lock: lockspace is starting");
-			goto allow;
-		}
-
-		if (result == -EGMMIX) {
-			log_warn("Skipping global lock: global mode conflicts with the mode in use by lvmlockd");
-			goto allow;
-		}
-
-		if (result == -ELOCKIO || result == -EVGKILLED) {
-			log_warn("Skipping global lock: storage %s for sanlock leases",
-				  result == -ELOCKIO ? "errors" : "failed");
-			goto allow;
-		}
-
-		if (result == -EIOTIMEOUT) {
-			log_warn("Skipping global lock: io timeout");
-			goto allow;
-		}
-
-		if (result == -ELOCKREPAIR) {
-			log_warn("Skipping global lock: sanlock lease needs repair");
-			goto allow;
-		}
-
-		if ((result_flags & LD_RF_NO_GL_LS) && (result_flags & LD_RF_WARN_GL_REMOVED)) {
-			log_warn("Skipping global lock: VG with global lock was removed");
-			goto allow;
-		}
-
-		if (result == -EORPHAN) {
-			log_warn("Skipping global lock: orphan lock needs to be adopted");
-			goto allow;
-		}
-
-		if (result == -EADOPT_NONE) {
-			log_warn("Skipping global lock: adopt found no orphan");
-			goto allow;
-		}
-
-		if (result == -EADOPT_RETRY) {
-			log_warn("Skipping global lock: adopt found other mode");
-			goto allow;
-		}
-
-		if (result == -ELMERR) {
-			log_warn("Skipping global lock: lock manager error");
-			goto allow;
-		}
-
-		if (result == -EAGAIN) {
-			log_warn("Skipping global lock: held by other host%s", _owner_str(&owner));
-			goto allow;
-		}
-
-		if ((result_flags & LD_RF_NO_GL_LS) || (result_flags & LD_RF_NO_LOCKSPACES)) {
-			log_debug("Skipping global lock: lockspace not found or started");
-			goto allow;
-		}
-
-		/*
-		 * This is for completeness.  If we reach here, then
-		 * a specific check for the error should be added above
-		 * with a more helpful message.
-		 */
-		log_error("Global lock failed: error %d", result);
 		return 0;
 	}
 
@@ -2712,14 +2620,6 @@ static int _lockd_global(struct cmd_context *cmd, const char *def_mode,
 	}
 
  allow:
-
-	/*
-	 * This is done to prevent converting an explicitly acquired
-	 * ex lock to sh in process_each.
-	 */
-	if (!strcmp(mode, "ex"))
-		cmd->lockd_global_ex = 1;
-
 	return 1;
 }
 
