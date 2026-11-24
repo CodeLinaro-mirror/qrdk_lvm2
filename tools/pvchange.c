@@ -21,7 +21,6 @@ struct pvchange_params {
 	unsigned vg_members_only:1;
 	unsigned scan_done:1;	/* lvmcache_label_scan was done, process_each_pv can skip it */
 	unsigned skip_orphans:1;
-	unsigned global_lock_done:1;
 	unsigned done;
 	unsigned total;
 };
@@ -32,7 +31,6 @@ static int _pvchange_lock_global(struct cmd_context *cmd, int argc, char **argv,
 	if (!lock_global_devs_is_enabled(cmd)) {
 		if (!lockf_global(cmd, "ex"))
 			return 0;
-		params->global_lock_done = 1;
 		clear_hint_file(cmd);
 		return 1;
 	}
@@ -49,8 +47,6 @@ static int _pvchange_lock_global(struct cmd_context *cmd, int argc, char **argv,
 	/* The global flock must precede clear_hint_file()'s hints lock. */
 	if (!lockf_global(cmd, "ex"))
 		return 0;
-
-	params->global_lock_done = 1;
 
 	clear_hint_file(cmd);
 
@@ -357,8 +353,7 @@ int pvchange(struct cmd_context *cmd, int argc, char **argv)
 				params.total - params.done, (params.total - params.done) == 1 ? "" : "s");
 
 out:
-	if (params.global_lock_done)
-		unlock_global_dev_args(cmd, &params.devs);
+	unlock_global_dev_args(cmd, &params.devs);
 	destroy_processing_handle(cmd, handle);
 	return ret;
 }
