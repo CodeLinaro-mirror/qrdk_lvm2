@@ -82,6 +82,9 @@ struct vgcreate_lockd_params {
 #define LOCKD_GLOBAL_MODE_1	1
 #define LOCKD_GLOBAL_MODE_2	2
 
+/* Sentinel for a lockd request that carries no global mode (e.g. gl unlock). */
+#define LOCKD_GLOBAL_MODE_NONE	(-1)
+
 #define LOCKD_GLOBAL_LOCK_NONE	0
 #define LOCKD_GLOBAL_LOCK_ENABLE	1
 #define LOCKD_GLOBAL_LOCK_DISABLE	2

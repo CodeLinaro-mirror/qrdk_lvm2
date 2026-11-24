@@ -805,6 +805,11 @@ static void _lockd_retrieve_lv_pv_list(struct volume_group *vg,
  * When this function returns 1 (success), result/lockd_flags may
  * have been obtained from lvmlockd.  This lvmlockd result may
  * indicate a locking failure.
+ *
+ * A request with no vg_name/lv_name is a global lock request, which
+ * includes the global mode and the name of the VG holding the global
+ * lock, from the command's scan.  An unlock request carries no mode
+ * (LOCKD_GLOBAL_MODE_NONE.)
  */
 
 static int _lockd_request(struct cmd_context *cmd,
@@ -817,6 +822,8 @@ static int _lockd_request(struct cmd_context *cmd,
 		          const char *lv_lock_args,
 		          const char *mode,
 		          const char *opts,
+		          int global_mode,
+		          const char *global_vgname,
 			  const struct lvmlockd_pvs *lock_pvs,
 		          int *result,
 		          uint32_t *result_flags,
@@ -887,6 +894,11 @@ static int _lockd_request(struct cmd_context *cmd,
 		*/
 
 	} else {
+		/*
+		 * No vg_name/lv_name: a global lock request.  Always send
+		 * the global fields; LOCKD_GLOBAL_MODE_NONE and "none"
+		 * mean "no value" (the daemon treats them as absent.)
+		 */
 		reply = _lockd_send_with_pvs(req_name,
 					lock_pvs,
 					"cmd = %s", cmd_name,
@@ -894,6 +906,8 @@ static int _lockd_request(struct cmd_context *cmd,
 					"mode = %s", mode,
 					"opts = %s", opts ?: "none",
 					"vg_lock_type = %s", vg_lock_type ?: "none",
+					"global_mode = " FMTd64, (int64_t) global_mode,
+					"global_vgname = %s", (global_vgname && global_vgname[0]) ? global_vgname : "none",
 					NULL);
 
 		if (!_lockd_result(cmd, req_name, reply, result, result_flags, owner, our_generation))
@@ -915,68 +929,6 @@ static int _lockd_request(struct cmd_context *cmd,
 
 	daemon_reply_destroy(reply);
 	return 0;
-}
-
-/*
- * A global lock request includes the global mode and the name of the VG
- * holding the global lock, from the command's scan.  An unlock request does
- * not include them.
- */
-
-static int _lockd_request_gl(struct cmd_context *cmd,
-			     const char *mode,
-			     const char *opts,
-			     int global_mode,
-			     const char *global_vgname,
-			     int *result,
-			     uint32_t *result_flags,
-			     struct owner *owner)
-{
-	const char *cmd_name = get_cmd_name();
-	daemon_reply reply;
-	int pid = getpid();
-
-	*result = 0;
-	*result_flags = 0;
-
-	if (!_use_lvmlockd)
-		return 0;
-	if (!_lvmlockd_connected)
-		return 0;
-
-	if (!cmd_name || !cmd_name[0])
-		cmd_name = "none";
-
-	if (global_mode > 0) {
-		reply = _lockd_send("lock_gl",
-				"cmd = %s", cmd_name,
-				"pid = " FMTd64, (int64_t) pid,
-				"mode = %s", mode,
-				"opts = %s", opts ?: "none",
-				"vg_lock_type = %s", "none",
-				"global_mode = " FMTd64, (int64_t) global_mode,
-				"global_vgname = %s", (global_vgname && global_vgname[0]) ? global_vgname : "none",
-				NULL);
-	} else {
-		reply = _lockd_send("lock_gl",
-				"cmd = %s", cmd_name,
-				"pid = " FMTd64, (int64_t) pid,
-				"mode = %s", mode,
-				"opts = %s", opts ?: "none",
-				"vg_lock_type = %s", "none",
-				NULL);
-	}
-
-	if (!_lockd_result(cmd, "lock_gl", reply, result, result_flags, owner, NULL)) {
-		log_error("lvmlockd lock_gl %s failed no result", mode);
-		daemon_reply_destroy(reply);
-		return 0;
-	}
-
-	log_debug("lockd lock_gl %s result %d %x", mode, *result, *result_flags);
-
-	daemon_reply_destroy(reply);
-	return 1;
 }
 
 /*
@@ -2436,7 +2388,7 @@ int lockd_get_start_result(struct cmd_context *cmd, const char *vg_name, int *re
 /*
  * A lock request must include the global mode (and the name of the VG holding
  * the global lock when known), which the command gets from its label scan.
- * An unlock request does not need them (global_mode -1.)
+ * An unlock request does not need them (global_mode LOCKD_GLOBAL_MODE_NONE.)
  */
 
 static int _lockd_global(struct cmd_context *cmd, const char *def_mode,
@@ -2500,8 +2452,10 @@ static int _lockd_global(struct cmd_context *cmd, const char *def_mode,
  req:
 	log_debug("lockd global %s", mode);
 
-	if (!_lockd_request_gl(cmd, mode, opts, global_mode, global_vgname,
-			       &result, &result_flags, &owner)) {
+	if (!_lockd_request(cmd, "lock_gl",
+			      NULL, NULL, NULL, NULL, NULL, NULL, mode, opts,
+			      global_mode, global_vgname,
+			      NULL, &result, &result_flags, &owner, NULL)) {
 		/* No result from lvmlockd, it is probably not running. */
 
 		/* We don't care if an unlock fails. */
@@ -2710,7 +2664,7 @@ int lockd_global_devices_unlock(struct cmd_context *cmd, struct dm_list *devs,
 	if (used_pr)
 		return persist_global_devices_release(cmd, devs);
 	if (used_gl)
-		return _lockd_global(cmd, "un", -1, NULL);
+		return _lockd_global(cmd, "un", LOCKD_GLOBAL_MODE_NONE, NULL);
 	return 1;
 }
 
@@ -2934,6 +2888,7 @@ int lockd_vg(struct cmd_context *cmd, const char *vg_name, const char *def_mode,
 
 	if (!_lockd_request(cmd, "lock_vg",
 			      vg_name, NULL, NULL, NULL, NULL, NULL, mode, opts,
+			      LOCKD_GLOBAL_MODE_NONE, NULL,
 			      NULL, &result, &result_flags, &owner, &our_generation)) {
 		/*
 		 * No result from lvmlockd, it is probably not running.
@@ -3469,6 +3424,7 @@ int lockd_lv_name(struct cmd_context *cmd, struct volume_group *vg,
 		if (!_lockd_request(cmd, "lock_lv",
 				       vg->name, vg->lock_type, vg->lock_args,
 				       lv_name, lv_uuid, lock_args, mode, opts,
+				       LOCKD_GLOBAL_MODE_NONE, NULL,
 				       &lock_pvs, &result, &result_flags, NULL, NULL)) {
 			_lockd_free_pv_list(&lock_pvs);
 			/* No result from lvmlockd, it is probably not running. */
@@ -3480,6 +3436,7 @@ int lockd_lv_name(struct cmd_context *cmd, struct volume_group *vg,
 		if (!_lockd_request(cmd, "lock_lv",
 				       vg->name, vg->lock_type, vg->lock_args,
 				       lv_name, lv_uuid, lock_args, mode, opts,
+				       LOCKD_GLOBAL_MODE_NONE, NULL,
 				       NULL, &result, &result_flags, &owner, &our_generation)) {
 			/* No result from lvmlockd, it is probably not running. */
 			log_error("Locking failed for LV %s/%s", vg->name, lv_name);
