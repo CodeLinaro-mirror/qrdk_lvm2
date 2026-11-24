@@ -550,8 +550,10 @@ int dev_args_update_devices_file(struct cmd_context *cmd, struct dm_list *devs,
 		}
 	}
 
-	if (!device_ids_write(cmd))
-		stack;
+	if (!device_ids_write(cmd)) {
+		log_error("Failed to update the devices file.");
+		ret = 0;
+	}
 
 	return ret;
 }

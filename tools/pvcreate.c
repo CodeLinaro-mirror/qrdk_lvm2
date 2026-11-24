@@ -217,8 +217,8 @@ int pvcreate(struct cmd_context *cmd, int argc, char **argv)
 	dev_args_pv_setup_and_zero(cmd, &devs, &pp.pva, &pp.pvs);
 	dev_args_pv_write(cmd, &devs, &pp.pvs);
 
-	/* Add devs to the devices file. */
-	dev_args_update_devices_file(cmd, &devs, &pp.pvs, 0);
+	if (!dev_args_update_devices_file(cmd, &devs, &pp.pvs, 0))
+		goto out;
 
 	if (!dev_args_any_failed(&devs))
 		ret = ECMD_PROCESSED;

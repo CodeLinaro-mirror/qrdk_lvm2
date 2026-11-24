@@ -112,7 +112,8 @@ int pvremove(struct cmd_context *cmd, int argc, char **argv)
 	}
 
 	/* Clear the erased PVID from the device entry. */
-	dev_args_update_devices_file(cmd, &devs, NULL, 1);
+	if (!dev_args_update_devices_file(cmd, &devs, NULL, 1))
+		goto out;
 
 	if (!dev_args_any_failed(&devs))
 		ret = ECMD_PROCESSED;
