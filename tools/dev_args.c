@@ -1384,7 +1384,7 @@ static int _dev_args_check_pr(struct cmd_context *cmd, struct dm_list *devs)
 			continue;
 
 		if (!dev_allow_pr(cmd, da->dev)) {
-			log_error("Persistent reservation not supported for device type %s", dev_name(da->dev));
+			log_error("Persistent reservation not supported for device %s.", dev_name(da->dev));
 			return 0;
 		}
 	}
