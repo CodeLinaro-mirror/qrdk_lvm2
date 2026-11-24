@@ -1596,7 +1596,8 @@ int pvcreate_user_prompt(struct cmd_context *cmd, struct dm_list *devs, int *rep
 
 int vgcreate_user_prompt(struct cmd_context *cmd, struct dm_list *devs, int *repeat)
 {
-	return _create_user_prompt(cmd, devs, arg_force_value(cmd), repeat);
+	/* vgcreate cannot be forced. */
+	return _create_user_prompt(cmd, devs, PROMPT, repeat);
 }
 
 /*
