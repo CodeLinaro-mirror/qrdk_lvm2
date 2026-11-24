@@ -61,12 +61,7 @@ test_pvmove_resume() {
 
 	aux enable_dev "$dev3" "$dev4"
 
-	for i in {100..0} ; do
-		lvs -ao name $vg $vg1 | grep "\[pvmove" || break
-		sleep .1
-	done
-	# wait for 10 secs at max
-	test $i -eq 0 && die "Pvmove is too slow or does not progress."
+	aux wait_pvmove_gone $vg $vg1
 
 	aux kill_tagged_processes
 

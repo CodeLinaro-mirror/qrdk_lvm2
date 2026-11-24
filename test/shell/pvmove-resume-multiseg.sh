@@ -65,11 +65,7 @@ test_pvmove_resume() {
 	# bg polling as parameter
 	$1 2
 
-	for i in {100..0} ; do # wait for 10 secs at max
-		get lv_field $vg name -a | grep -E "^\[?pvmove" || break
-		sleep .1
-	done
-	test $i -gt 0 || die "Pvmove is too slow or does not progress."
+	aux wait_pvmove_gone $vg
 
 	aux kill_tagged_processes
 

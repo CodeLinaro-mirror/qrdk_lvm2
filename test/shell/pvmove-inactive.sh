@@ -134,11 +134,7 @@ grep "\[pvmove" out
 # Wait for pvmove to complete.
 # pvmove -i0 is NOT used here because with lvmpolld it would loop forever
 # waiting on an already-registered poll operation managed by lvmpolld.
-for i in {50..0} ; do
-	lvs -ao name $vg | grep "\[pvmove" || break
-	sleep .1
-done
-test "$i" -ne 0 || die "pvmove did not complete in time"
+aux wait_pvmove_gone $vg
 
 # lv2 must have moved to dev5 and stayed active; lv1 inactive on dev1
 check active $vg $lv2

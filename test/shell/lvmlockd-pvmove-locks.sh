@@ -282,8 +282,7 @@ lvmlockctl --info | tee out
 grep "LK LV ex $pvmove0_uuid" out
 
 # Wait for pvmove to complete normally (poll daemon handles it).
-i=60; while get lv_field $vg/pvmove0 lv_name -a 2>/dev/null && [ "$i" -gt 0 ] ; do sleep .5; i=$((i-1)); done
-test "$i" -ne 0 || die "pvmove did not complete in time"
+aux wait_lv_gone $vg/pvmove0
 
 # pvmove0 lock space must be freed after clean completion
 lvmlockctl --info | tee out

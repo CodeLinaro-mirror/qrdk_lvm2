@@ -2387,6 +2387,36 @@ wait_pvmove_lv_started_in_vg() {
 	die "Waiting for pvmove in $vg to start timed out"
 }
 
+# Deadline for wait_lv_gone() and wait_pvmove_gone(), in seconds.  The callers
+# used to carry their own 5, 10 and 30 second budgets, which was history, not
+# a measurement; one value keeps the waits comparable.  Ten seconds is ample
+# for the operations these callers wait on, and a test that needs longer is
+# waiting on something that is not progressing.  Override it to shorten the
+# wait while debugging a test.
+LVM_TEST_WAIT_LV_GONE_SECS=${LVM_TEST_WAIT_LV_GONE_SECS:-10}
+
+# Wait until "lvs -a --noheadings" with the given arguments reports no LV, or
+# die past LVM_TEST_WAIT_LV_GONE_SECS.  A single <vg/lv> argument waits for
+# that LV, an lvs selection waits for every LV it matches.  Poll the metadata
+# (lvs), not the dm device: the LV is removed last, after its device, and
+# waiting out that window is what the callers need.  For the <vg/lv> form the
+# caller has to make sure the LV exists first, otherwise "gone" is true on the
+# first sample.
+wait_lv_gone() {
+	local deadline=$(( SECONDS + LVM_TEST_WAIT_LV_GONE_SECS ))
+
+	while [ -n "$(lvs -a --noheadings "$@" 2>/dev/null)" ]; do
+		[ "$SECONDS" -lt "$deadline" ] ||
+			die "LV still exists after ${LVM_TEST_WAIT_LV_GONE_SECS}s: $*"
+		sleep .1
+	done
+}
+
+# Wait until no pvmove[0-9]+ LV is left in the metadata of the given VGs.
+wait_pvmove_gone() {
+	wait_lv_gone -S 'name=~"^pvmove[0-9]+$"' "$@"
+}
+
 # Holds device open with sleep which automatically expires after given timeout
 # Prints  PID of running holding sleep process in background
 hold_device_open() {

@@ -63,12 +63,7 @@ vgchange -an $vg1
 pvscan --cache -aay "$dev1"
 
 check active $vg1 $lv1
-i=100
-while ! check lv_not_exists "$vg1/$(snap_lv_name_ "$lv1")"; do
-	test $i -lt 0 && fail "Background polling failed to remove merged snapshot LV"
-	sleep .1
-	i=$((i-1))
-done
+aux wait_lv_gone "$vg1/$(snap_lv_name_ "$lv1")"
 
 # TODO: add similar simple tests for other interrupted/unfinished polling operation
 
