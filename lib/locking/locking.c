@@ -493,9 +493,15 @@ int unlock_global_devs(struct cmd_context *cmd, struct dm_list *devs)
 
 	memset(&cmd->global_devs, 0, sizeof(cmd->global_devs));
 
-	if (held == GLOBAL_DEVS_PR && !handed_off &&
-	    !lockd_global_devices_unlock(cmd, devs, 0, 1))
-		ret = 0;
+	if (held == GLOBAL_DEVS_PR && !handed_off) {
+		if (lvmlockd_use()) {
+			if (!lockd_global_devices_unlock(cmd, devs, 0, 1))
+				ret = 0;
+		} else {
+			if (!persist_global_devices_release(cmd, devs))
+				ret = 0;
+		}
+	}
 
 	if (held == GLOBAL_DEVS_GL &&
 	    !lockd_global_devices_unlock(cmd, devs, 1, 0))
