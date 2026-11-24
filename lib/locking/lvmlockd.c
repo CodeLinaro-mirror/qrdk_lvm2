@@ -1955,7 +1955,7 @@ void lockd_free_vg_final(struct cmd_context *cmd, struct volume_group *vg)
  * A shared VG without a global mode tag was created by an older lvm: GM1.
  */
 
-static int _lockd_vg_global_info(struct volume_group *vg, int *global_mode, const char **global_vgname)
+static void _lockd_vg_global_info(struct volume_group *vg, int *global_mode, const char **global_vgname)
 {
 	struct logical_volume *lv = vg->sanlock_lv;
 
@@ -1963,15 +1963,13 @@ static int _lockd_vg_global_info(struct volume_group *vg, int *global_mode, cons
 	*global_vgname = NULL;
 
 	if (!lv)
-		return 1;
+		return;
 
 	if (str_list_match_item(&lv->tags, LOCKD_GLOBAL_MODE_2_TAG))
 		*global_mode = LOCKD_GLOBAL_MODE_2;
 
 	if (_lockd_vg_has_global_lock_tag(vg))
 		*global_vgname = vg->name;
-
-	return 1;
 }
 
 int lockd_start_vg(struct cmd_context *cmd, struct volume_group *vg, int *exists)
@@ -5160,6 +5158,7 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 	uint32_t result_flags;
 	int result;
 	int ret;
+	int reply_valid = 0;
 
 	/*
 	 * Check if other PR keys are registered, which would
@@ -5183,14 +5182,16 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 			if (!dev_find_key(cmd, dev, 0, 0, NULL, 0, NULL, 1, &found_key_count, &found_keys)) {
 				/* Shouldn't happen if persist_is_started already passed. */
 				log_error("No PR key found on %s.", dev_name(dev));
-				return 0;
+				ret = 0;
+				goto out;
 			}
 			if (found_keys)
 				dm_pool_free(cmd->mem, found_keys);
 			if (found_key_count != 1) {
 				log_error("Found %d PR keys on %s, stop PR and lockspace on other hosts.", found_key_count, dev_name(dev));
 				log_error("(See vgchange --lockstop --persist stop.)");
-				return 0;
+				ret = 0;
+				goto out;
 			}
 		}
 	}
@@ -5213,6 +5214,7 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 				"global_mode = " FMTd64, (int64_t) global_mode,
 				"opts = %s", opts,
 				NULL);
+	reply_valid = 1;
 
 	if (!_lockd_result(cmd, req_before, reply, &result, &result_flags, NULL, NULL)) {
 		ret = 0;
@@ -5241,6 +5243,7 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 	}
 
 	daemon_reply_destroy(reply);
+	reply_valid = 0;
 
 	/*
 	 * When the VG has the ability to use PR, change the
@@ -5259,7 +5262,8 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 		if (!persist_upgrade_ex(cmd, vg, our_key_held)) {
 			log_error("Failed to upgrade to exclusive PR.");
 			log_error("Restart PR and locking to retry setlockargs.");
-			return 0;
+			ret = 0;
+			goto out;
 		}
 	}
 
@@ -5283,6 +5287,7 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 				"global_mode = " FMTd64, (int64_t) global_mode,
 				"opts = %s", opts,
 				NULL);
+	reply_valid = 1;
 
 	if (!_lockd_result(cmd, req_final, reply, &result, &result_flags, NULL, NULL)) {
 		ret = 0;
@@ -5291,6 +5296,7 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 
 	if (result == -EAGAIN) {
 		daemon_reply_destroy(reply);
+		reply_valid = 0;
 		sleep(1);
 		goto retry_final;
 	}
@@ -5322,7 +5328,8 @@ static int _lockd_set_general(struct cmd_context *cmd, struct volume_group *vg,
 	ret = 1;
 
 out:
-	daemon_reply_destroy(reply);
+	if (reply_valid)
+		daemon_reply_destroy(reply);
 	return ret;
 }
 
