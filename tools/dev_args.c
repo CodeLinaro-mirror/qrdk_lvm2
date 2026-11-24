@@ -753,6 +753,9 @@ int pvcreate_params_from_args(struct cmd_context *cmd, struct pvcreate_params *p
  * (DEV_LABEL_PVHDR is set by every read of the label.)  It is used in an
  * unknown VG if the PV_EXT_USED flag was seen by the last label read
  * (DEV_LABEL_PVHDR_VGUSED) or by label_scan (lvmcache).
+ *
+ * (The is_<state> return values are used in favor of a state enum for
+ * improved code legibility.)
  */
 static int _dev_get_pv_usage(struct device *dev, const char **vgname,
 			     int *is_not_pv, int *is_orphan_pv, int *is_vg_pv,
