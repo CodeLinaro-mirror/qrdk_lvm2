@@ -219,7 +219,7 @@ static int _vgextend_single(struct cmd_context *cmd, const char *vg_name,
 	 * in persist_vgextend_update) are kept by the VG, and should
 	 * not be released in persist_vgextend_end.
 	 */
-	cmd->global_devs.begin_pr = 0;
+	persist_global_devs_hand_off(cmd);
 
 	log_print_unless_silent("Volume group \"%s\" successfully extended", vg_name);
 	ret = ECMD_PROCESSED;

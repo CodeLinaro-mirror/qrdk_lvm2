@@ -87,6 +87,7 @@ int persist_clear(struct cmd_context *cmd, struct volume_group *vg);
 int persist_vgextend_begin(struct cmd_context *cmd, struct volume_group *vg, struct dm_list *devs);
 int persist_vgextend_update(struct cmd_context *cmd, struct volume_group *vg, struct dm_list *devs);
 int persist_vgextend_end(struct cmd_context *cmd, struct dm_list *devs);
+void persist_global_devs_hand_off(struct cmd_context *cmd);
 
 int persist_global_devices_supported(struct cmd_context *cmd, struct dm_list *devs,
 				     int *any_supported);

@@ -2804,6 +2804,18 @@ int persist_vgcreate_end(struct cmd_context *cmd, struct dm_list *devs)
 }
 
 /*
+ * The PR key that persist_vgcreate/vgextend_begin registered has become the
+ * VG's PR (the VG is written and will keep it), so persist_vgcreate/vgextend_end
+ * should not stop it.  The global PR from lock_global_devs is not affected:
+ * when that is held and not handed off separately, unlock_global_devs still
+ * releases it.
+ */
+void persist_global_devs_hand_off(struct cmd_context *cmd)
+{
+	cmd->global_devs.begin_pr = 0;
+}
+
+/*
  * At the start of creating a VG that will use PR, before writing anything, PR
  * is started on the devices with an ex access PR, either by
  * persist_vgcreate_begin(), or by lock_global_devs() (which holds a WE PR with
@@ -2846,10 +2858,9 @@ int persist_vgcreate_update(struct cmd_context *cmd, struct volume_group *vg,
 
 	/*
 	 * A local VG keeps the PR in place that was started from persist_vgcreate_begin.
-	 * Setting begin_pr=0 tells persist_vgcreate_end to not release it.
 	 */
 	if (!vg_is_shared(vg) && (cmd->global_devs.held != GLOBAL_DEVS_PR)) {
-		cmd->global_devs.begin_pr = 0;
+		persist_global_devs_hand_off(cmd);
 		return 1;
 	}
 
@@ -3176,7 +3187,7 @@ int persist_vgextend_update(struct cmd_context *cmd, struct volume_group *vg,
 	/* Start again with a new key/mode. */
 	if (persist_vgextend_begin(cmd, vg, devs)) {
 		/* The PR on the new devs is the VG's PR now; it is not released on unlock. */
-		cmd->global_devs.begin_pr = 0;
+		persist_global_devs_hand_off(cmd);
 		return 1;
 	}
 
