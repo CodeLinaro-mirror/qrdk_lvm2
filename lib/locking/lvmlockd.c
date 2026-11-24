@@ -2582,15 +2582,15 @@ static int _lockd_global(struct cmd_context *cmd, const char *def_mode,
  */
 
 int lockd_global_devices_lock(struct cmd_context *cmd, struct dm_list *devs,
-			      int bootstrap, int *used_gl, int *used_pr)
+			      int bootstrap, enum global_devs_held *held)
 {
 	const char *global_type = NULL;
 	char gl_vgname[NAME_LEN + 1] = { 0 };
+	int used_pr = 0;
 	int global_mode;
 	int config_mode;
 
-	*used_gl = 0;
-	*used_pr = 0;
+	*held = GLOBAL_DEVS_NONE;
 
 	if (!_use_lvmlockd)
 		return 1;
@@ -2632,7 +2632,7 @@ int lockd_global_devices_lock(struct cmd_context *cmd, struct dm_list *devs,
 			return 0;
 		if (!_lockd_global(cmd, "ex", global_mode, gl_vgname))
 			return 0;
-		*used_gl = 1;
+		*held = GLOBAL_DEVS_GL;
 		return 1;
 	}
 
@@ -2640,17 +2640,19 @@ int lockd_global_devices_lock(struct cmd_context *cmd, struct dm_list *devs,
 	 * GM2: use PR, and if that's not supported fall back to GL2.
 	 */
 	if (global_mode == LOCKD_GLOBAL_MODE_2) {
-		if (!persist_global_devices_lock(cmd, devs, used_pr))
+		if (!persist_global_devices_lock(cmd, devs, &used_pr))
 			return 0;
-		if (*used_pr)
+		if (used_pr) {
+			*held = GLOBAL_DEVS_PR;
 			return 1;
+		}
 		if (bootstrap)
 			return 1;
 		if (!_lockd_get_global_lock_vgname(global_mode, global_type, gl_vgname, sizeof(gl_vgname)))
 			return 0;
 		if (!_lockd_global(cmd, "ex", global_mode, gl_vgname))
 			return 0;
-		*used_gl = 2;
+		*held = GLOBAL_DEVS_GL;
 		return 1;
 	}
 
@@ -2659,11 +2661,11 @@ int lockd_global_devices_lock(struct cmd_context *cmd, struct dm_list *devs,
 }
 
 int lockd_global_devices_unlock(struct cmd_context *cmd, struct dm_list *devs,
-				int used_gl, int used_pr)
+				enum global_devs_held held)
 {
-	if (used_pr)
+	if (held == GLOBAL_DEVS_PR)
 		return persist_global_devices_release(cmd, devs);
-	if (used_gl)
+	if (held == GLOBAL_DEVS_GL)
 		return _lockd_global(cmd, "un", LOCKD_GLOBAL_MODE_NONE, NULL);
 	return 1;
 }

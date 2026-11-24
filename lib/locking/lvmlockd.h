@@ -27,6 +27,16 @@ struct vgcreate_lockd_params {
 	int bootstrap;		/* no shared VGs exist, the new VG bootstraps the global mode */
 };
 
+/*
+ * Protection held by lock_global_devs() on the devices a command is
+ * about to claim, until unlock_global_devs().
+ */
+enum global_devs_held {
+	GLOBAL_DEVS_NONE = 0,
+	GLOBAL_DEVS_GL,		/* global lock held ex */
+	GLOBAL_DEVS_PR,		/* PR held on the devices */
+};
+
 #define LOCKD_SANLOCK_LV_NAME "lvmlock"
 
 /* lockd_lv flags */
@@ -120,9 +130,9 @@ int lockd_get_scan_global_mode(int *global_mode, const char **global_type);
 int lockd_get_bootstrap_global_mode(struct cmd_context *cmd, const char *lock_type,
 				    int *global_mode);
 int lockd_global_devices_lock(struct cmd_context *cmd, struct dm_list *devs,
-			     int bootstrap, int *used_gl, int *used_pr);
+			     int bootstrap, enum global_devs_held *held);
 int lockd_global_devices_unlock(struct cmd_context *cmd, struct dm_list *devs,
-			       int used_gl, int used_pr);
+			       enum global_devs_held held);
 int lockd_vgcreate_begin(struct cmd_context *cmd, const char *lock_type,
 			 struct vgcreate_lockd_params *params);
 
@@ -265,15 +275,14 @@ static inline int lockd_get_bootstrap_global_mode(struct cmd_context *cmd, const
 }
 
 static inline int lockd_global_devices_lock(struct cmd_context *cmd, struct dm_list *devs,
-					   int bootstrap, int *used_gl, int *used_pr)
+					   int bootstrap, enum global_devs_held *held)
 {
-	*used_gl = 0;
-	*used_pr = 0;
+	*held = GLOBAL_DEVS_NONE;
 	return 1;
 }
 
 static inline int lockd_global_devices_unlock(struct cmd_context *cmd, struct dm_list *devs,
-					     int used_gl, int used_pr)
+					     enum global_devs_held held)
 {
 	return 1;
 }

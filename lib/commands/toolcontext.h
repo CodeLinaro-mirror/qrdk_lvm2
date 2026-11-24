@@ -19,6 +19,7 @@
 #include "lib/device/dev-cache.h"
 #include "lib/device/dev-type.h"
 #include "lib/device/persist.h"
+#include "lib/locking/lvmlockd.h"
 #include "lib/commands/cmd_enum.h"
 #include "lib/log/lvm-logging.h"
 #include "lib/misc/lvm-string.h"
@@ -83,14 +84,9 @@ struct cmd_report {
 
 /*
  * Protection held by lock_global_devs() on the devices a command is
- * about to claim, until unlock_global_devs().
+ * about to claim, until unlock_global_devs().  (enum global_devs_held
+ * is defined in lib/locking/lvmlockd.h.)
  */
-enum global_devs_held {
-	GLOBAL_DEVS_NONE = 0,
-	GLOBAL_DEVS_GL,		/* global lock held ex */
-	GLOBAL_DEVS_PR,		/* PR held on the devices */
-};
-
 struct global_devs_lock {
 	enum global_devs_held held;
 	unsigned bootstrap:1;	/* vgcreate: no global lock exists yet, don't take GL */

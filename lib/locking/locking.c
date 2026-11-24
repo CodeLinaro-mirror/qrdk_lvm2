@@ -441,7 +441,8 @@ int lock_global_devs_is_enabled(struct cmd_context *cmd)
 
 int lock_global_devs(struct cmd_context *cmd, struct dm_list *devs)
 {
-	int used_gl = 0, used_pr = 0;
+	enum global_devs_held held = GLOBAL_DEVS_NONE;
+	int used_pr = 0;
 	int ret;
 
 	if (!cmd->lockf_global_ex && !lockf_global(cmd, "ex"))
@@ -460,19 +461,20 @@ int lock_global_devs(struct cmd_context *cmd, struct dm_list *devs)
 		 * or acquire the Global Lock (GL) from lvmlockd.
 		 * PR or GL depends on the Global Mode which is configured or detected.
 		 */
-		ret = lockd_global_devices_lock(cmd, devs, cmd->global_devs.bootstrap, &used_gl, &used_pr);
+		ret = lockd_global_devices_lock(cmd, devs, cmd->global_devs.bootstrap, &held);
 	} else {
 		/*
 		 * Without lvmlockd, take PR on devs (when they all support PR.)
 		 */
 		ret = persist_global_devices_lock(cmd, devs, &used_pr);
+		if (used_pr)
+			held = GLOBAL_DEVS_PR;
 	}
 
 	if (!ret)
 		return 0;
 
-	cmd->global_devs.held = used_pr ? GLOBAL_DEVS_PR :
-				used_gl ? GLOBAL_DEVS_GL : GLOBAL_DEVS_NONE;
+	cmd->global_devs.held = held;
 	cmd->global_devs.handed_off = 0;
 
 	return 1;
@@ -494,7 +496,7 @@ int unlock_global_devs(struct cmd_context *cmd, struct dm_list *devs)
 
 	if (held == GLOBAL_DEVS_PR && !handed_off) {
 		if (lvmlockd_use()) {
-			if (!lockd_global_devices_unlock(cmd, devs, 0, 1))
+			if (!lockd_global_devices_unlock(cmd, devs, GLOBAL_DEVS_PR))
 				ret = 0;
 		} else {
 			if (!persist_global_devices_release(cmd, devs))
@@ -503,7 +505,7 @@ int unlock_global_devs(struct cmd_context *cmd, struct dm_list *devs)
 	}
 
 	if (held == GLOBAL_DEVS_GL &&
-	    !lockd_global_devices_unlock(cmd, devs, 1, 0))
+	    !lockd_global_devices_unlock(cmd, devs, GLOBAL_DEVS_GL))
 		ret = 0;
 
 	if (cmd->lockf_global_ex && !lockf_global(cmd, "un"))
