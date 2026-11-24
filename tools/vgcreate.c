@@ -138,7 +138,8 @@ int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 	const char *tag;
 	char *vg_name;
 	struct arg_value_group_list *current_group;
-	int ret_unlock;
+	enum global_devs_held held;
+	int vg_name_locked = 0;
 	int repeat = 0;
 	int ok;
 	int ret = ECMD_FAILED;
@@ -180,6 +181,7 @@ int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 		log_error("Can't get lock for %s.", vp_new.vg_name);
 		goto out;
 	}
+	vg_name_locked = 1;
 
 	if (!lvmcache_label_scan(cmd))
 		goto_out;
@@ -354,6 +356,7 @@ int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 	}
 
 	unlock_vg(cmd, vg, vp_new.vg_name);
+	vg_name_locked = 0;
 
 	log_print_unless_silent("Volume group \"%s\" successfully created%s%s",
 				vg->name,
@@ -364,10 +367,10 @@ int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 		goto_out;
 
 	/* PR is not released if it was handed off to the VG (in update) */
-	ret_unlock = unlock_global_dev_args(cmd, &devs);
+	held = cmd->global_devs.held;
 
-	if (!ret_unlock) {
-		log_error("Error releasing %s.", pp.start_pr ? "device PR" : "global lock");
+	if (!unlock_global_dev_args(cmd, &devs)) {
+		log_error("Error releasing %s.", (held == GLOBAL_DEVS_PR) ? "device PR" : "global lock");
 		goto out2;
 	}
 
@@ -397,6 +400,8 @@ int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 out:
 	cmd->use_full_md_check = 0;
 	cmd->filter_deviceid_skip = 0;
+	if (vg_name_locked)
+		unlock_vg(cmd, NULL, vp_new.vg_name);
 	persist_vgcreate_end(cmd, &pr_devs);
 	unlock_global_dev_args(cmd, &devs);
 out2:
