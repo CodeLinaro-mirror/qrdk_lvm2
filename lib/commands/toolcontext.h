@@ -89,6 +89,7 @@ struct cmd_report {
  */
 struct global_devs_lock {
 	enum global_devs_held held;
+	unsigned locked:1;	/* lock_global_devs() succeeded, unlock_global_devs() is required */
 	unsigned bootstrap:1;	/* vgcreate: no global lock exists yet, don't take GL */
 	int mode;		/* vgcreate: global mode selected from the scan or config */
 	unsigned handed_off:1;	/* persist_vg*_update stopped or replaced the PR, don't release it */

@@ -437,6 +437,11 @@ int lock_global_devs_is_enabled(struct cmd_context *cmd)
  * A user sets persistent_reservations=full to enable PR when
  * they know that their devices are on shared storage, and they
  * are not using lvmlockd because they are not using shared VGs.
+ *
+ * A command calls lock_global_devs once (once its device args are
+ * known), and unlock_global_devs releases what was acquired.
+ * Calling lock_global_devs a second time without an intervening
+ * unlock_global_devs is a programming error.
  */
 
 int lock_global_devs(struct cmd_context *cmd, struct dm_list *devs)
@@ -444,6 +449,11 @@ int lock_global_devs(struct cmd_context *cmd, struct dm_list *devs)
 	enum global_devs_held held = GLOBAL_DEVS_NONE;
 	int used_pr = 0;
 	int ret;
+
+	if (cmd->global_devs.locked) {
+		log_error(INTERNAL_ERROR "lock_global_devs called again before unlock_global_devs.");
+		return 0;
+	}
 
 	if (!cmd->lockf_global_ex && !lockf_global(cmd, "ex"))
 		return 0;
@@ -476,6 +486,7 @@ int lock_global_devs(struct cmd_context *cmd, struct dm_list *devs)
 
 	cmd->global_devs.held = held;
 	cmd->global_devs.handed_off = 0;
+	cmd->global_devs.locked = 1;
 
 	return 1;
 }
