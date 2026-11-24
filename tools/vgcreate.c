@@ -138,7 +138,6 @@ int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 	const char *tag;
 	char *vg_name;
 	struct arg_value_group_list *current_group;
-	enum global_devs_held held;
 	int vg_name_locked = 0;
 	int repeat = 0;
 	int ok;
@@ -367,12 +366,8 @@ int vgcreate(struct cmd_context *cmd, int argc, char **argv)
 		goto_out;
 
 	/* PR is not released if it was handed off to the VG (in update) */
-	held = cmd->global_devs.held;
-
-	if (!unlock_global_dev_args(cmd, &devs)) {
-		log_error("Error releasing %s.", (held == GLOBAL_DEVS_PR) ? "device PR" : "global lock");
+	if (!unlock_global_dev_args(cmd, &devs))
 		goto out2;
-	}
 
 	/*
 	 * Start the VG lockspace because it will likely be used right away.

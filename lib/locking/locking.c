@@ -507,20 +507,28 @@ int unlock_global_devs(struct cmd_context *cmd, struct dm_list *devs)
 
 	if (held == GLOBAL_DEVS_PR && !handed_off) {
 		if (lvmlockd_use()) {
-			if (!lockd_global_devices_unlock(cmd, devs, GLOBAL_DEVS_PR))
+			if (!lockd_global_devices_unlock(cmd, devs, GLOBAL_DEVS_PR)) {
+				log_error("Error releasing device PR.");
 				ret = 0;
+			}
 		} else {
-			if (!persist_global_devices_release(cmd, devs))
+			if (!persist_global_devices_release(cmd, devs)) {
+				log_error("Error releasing device PR.");
 				ret = 0;
+			}
 		}
 	}
 
 	if (held == GLOBAL_DEVS_GL &&
-	    !lockd_global_devices_unlock(cmd, devs, GLOBAL_DEVS_GL))
+	    !lockd_global_devices_unlock(cmd, devs, GLOBAL_DEVS_GL)) {
+		log_error("Error releasing global lock.");
 		ret = 0;
+	}
 
-	if (cmd->lockf_global_ex && !lockf_global(cmd, "un"))
+	if (cmd->lockf_global_ex && !lockf_global(cmd, "un")) {
+		log_error("Error releasing global flock.");
 		ret = 0;
+	}
 
 	return ret;
 }
