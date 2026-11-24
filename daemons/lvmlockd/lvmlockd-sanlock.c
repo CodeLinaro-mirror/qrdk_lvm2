@@ -798,8 +798,7 @@ int lm_init_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_ar
 	log_debug("S %s init_vg_san path %s align %d", ls_name, disk.path, opt_align_mb);
 
 	if (daemon_test) {
-		if (!daemon_global_name[0])
-			dm_strncpy(daemon_global_name, ls_name, sizeof(daemon_global_name));
+		daemon_global_set_name_if_unset(ls_name);
 		rv = dm_snprintf(vg_args, MAX_ARGS+1, "%s:%s", VG_LOCK_ARGS_V1, lock_lv_name);
 		if (rv < 0)
 			log_debug("init_vg_san vg_args may be too long %d %s", rv, vg_args);
@@ -920,10 +919,18 @@ int lm_init_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_ar
 		gl_name = R_NAME_GL;
 	else if (flags & LD_AF_DISABLE)
 		gl_name = R_NAME_GL_DISABLED;
-	else if (daemon_global_type != LD_LM_SANLOCK || daemon_global_name[0] || !lockspaces_empty())
-		gl_name = R_NAME_GL_DISABLED;
-	else
-		gl_name = R_NAME_GL;
+	else {
+		int gl_type;
+		char gl_lsname[MAX_NAME+1];
+
+		/* Copy before calling lockspaces_empty(), which takes lockspaces_mutex. */
+		daemon_global_get(NULL, &gl_type, gl_lsname);
+
+		if (gl_type != LD_LM_SANLOCK || gl_lsname[0] || !lockspaces_empty())
+			gl_name = R_NAME_GL_DISABLED;
+		else
+			gl_name = R_NAME_GL;
+	}
 
 	memcpy(rd.rs.lockspace_name, ss.name, SANLK_NAME_LEN);
 	strcpy_name_len(rd.rs.name, gl_name, SANLK_NAME_LEN);
@@ -1025,7 +1032,7 @@ int lm_init_vg_sanlock(char *ls_name, char *vg_name, uint32_t flags, char *vg_ar
 	}
 
 	if (!strcmp(gl_name, R_NAME_GL))
-		dm_strncpy(daemon_global_name, ls_name, sizeof(daemon_global_name));
+		daemon_global_set_name(ls_name);
 
 	log_debug("S %s init_vg_san done vg_args %s", ls_name, vg_args);
 
@@ -1574,10 +1581,9 @@ out:
 	ls->sanlock_gl_enabled = enable;
 
 	if (enable)
-		dm_strncpy(daemon_global_name, ls->name, sizeof(daemon_global_name));
-
-	if (!enable && !strcmp(daemon_global_name, ls->name))
-		memset(daemon_global_name, 0, sizeof(daemon_global_name));
+		daemon_global_set_name(ls->name);
+	else
+		daemon_global_clear_name(ls->name);
 
 	return 0;
 }
@@ -1882,10 +1888,8 @@ int lm_prepare_lockspace_sanlock(struct lockspace *ls, uint64_t *prev_generation
 	memcpy(lms->ss.host_id_disk.path, disk_path, SANLK_PATH_LEN-1);
 
 	if (daemon_test) {
-		if (!daemon_global_name[0]) {
-			dm_strncpy(daemon_global_name, lsname, sizeof(daemon_global_name));
+		if (daemon_global_set_name_if_unset(lsname))
 			log_debug("S %s prepare_lockspace_san use global lock", lsname);
-		}
 		lms->align_size = ONE_MB;
 		lms->sector_size = 512;
 		goto out;
@@ -2039,16 +2043,21 @@ int lm_prepare_lockspace_sanlock(struct lockspace *ls, uint64_t *prev_generation
 	ls->sanlock_gl_enabled = gl_found;
 
 	if (gl_found) {
-		if (daemon_global_type != LD_LM_SANLOCK) {
+		int gl_type;
+		char gl_lsname[MAX_NAME+1];
+
+		daemon_global_get(NULL, &gl_type, gl_lsname);
+
+		if (gl_type != LD_LM_SANLOCK) {
 			log_error("S %s prepare_lockspace_san global type is %d", lsname,
-				  daemon_global_type);
-		} else if (daemon_global_name[0] && strcmp(daemon_global_name, lsname)) {
+				  gl_type);
+		} else if (gl_lsname[0] && strcmp(gl_lsname, lsname)) {
 			log_error("S %s prepare_lockspace_san multiple sanlock global locks current %s",
-				  lsname, daemon_global_name);
+				  lsname, gl_lsname);
 		} else {
-			dm_strncpy(daemon_global_name, lsname, sizeof(daemon_global_name));
+			daemon_global_set_name(lsname);
 			log_debug("S %s prepare_lockspace_san use global lock %s",
-				  lsname, daemon_global_name);
+				  lsname, lsname);
 		}
 	}
 
@@ -2203,8 +2212,7 @@ out:
 
 	/* FIXME: should we only clear daemon_global_name when doing free_vg? */
 
-	if (!strcmp(ls->name, daemon_global_name))
-		memset(daemon_global_name, 0, sizeof(daemon_global_name));
+	daemon_global_clear_name(ls->name);
 
 	return 0;
 }
@@ -2536,8 +2544,7 @@ int lm_lock_sanlock(struct lockspace *ls, struct resource *r, int ld_mode,
 			if (!lm_gl_is_enabled(ls)) {
 				log_error("%s:%s lock_san gl has been disabled",
 					  ls->name, r->name);
-				if (!strcmp(daemon_global_name, ls->name))
-					memset(daemon_global_name, 0, sizeof(daemon_global_name));
+				daemon_global_clear_name(ls->name);
 				return -EUNATCH;
 			}
 		}
@@ -2986,7 +2993,7 @@ int lm_is_running_sanlock(void)
 	int rv;
 
 	if (daemon_test)
-		return daemon_global_type == LD_LM_SANLOCK;
+		return daemon_global_get_type() == LD_LM_SANLOCK;
 
 	rv = sanlock_version(0, &daemon_version, &daemon_proto);
 	if (rv < 0)

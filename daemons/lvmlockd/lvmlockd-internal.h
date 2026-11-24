@@ -397,6 +397,14 @@ static inline int list_empty(const struct list_head *head)
  * and idm, daemon_global_name is set with the type and is permanent.  For
  * sanlock, it is the lockspace containing the enabled global lock and can
  * change when the global lock is moved.
+ *
+ * The global mode/type/name are not dynamic: they change only on rare
+ * transitions (first gl request or lockspace start after a restart, gl
+ * enable/disable/move, reset when the last lockspace is freed.)  They are
+ * nonetheless read and written by the main, client, worker and lockspace
+ * threads, so every access must use the daemon_global_* helpers below,
+ * which serialize on daemon_global_mutex (a leaf mutex: it is always the
+ * innermost lock held; nothing else may be locked while holding it.)
  */
 
 EXTERN int daemon_global_type;
@@ -415,6 +423,22 @@ EXTERN int sanlock_io_timeout;
 #define GM2 2
 
 EXTERN int daemon_global_mode;
+
+/*
+ * Copy the global mode/type/name together (under daemon_global_mutex, so
+ * the values are consistent with each other); a NULL argument is not
+ * copied.  Set one or more of the values; a negative mode or lm_type,
+ * or a NULL ls_name, leaves the current value unchanged.  The remaining
+ * helpers are convenience forms for common single-value accesses.
+ */
+void daemon_global_get(int *mode, int *lm_type, char *ls_name);
+void daemon_global_set(int mode, int lm_type, const char *ls_name);
+int daemon_global_get_type(void);
+int daemon_global_set_type(int lm_type);
+void daemon_global_set_name(const char *ls_name);
+void daemon_global_clear_name(const char *ls_name);
+int daemon_global_set_name_if_unset(const char *ls_name);
+int daemon_global_name_is(const char *ls_name);
 
 /*
  * This flag is set to 1 if we see multiple vgs with the global

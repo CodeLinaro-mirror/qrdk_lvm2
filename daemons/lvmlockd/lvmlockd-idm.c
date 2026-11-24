@@ -828,7 +828,7 @@ int lm_is_running_idm(void)
 	int sock, rv;
 
 	if (daemon_test)
-		return daemon_global_type == LD_LM_IDM;
+		return daemon_global_get_type() == LD_LM_IDM;
 
 	rv = ilm_connect(&sock);
 	if (rv < 0) {
