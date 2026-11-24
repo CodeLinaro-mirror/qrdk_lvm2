@@ -42,7 +42,8 @@
 
 static int str_to_mode(const char *str);
 static const char *lm_str(int x);
-static int daemon_global_update_gl(struct action *act);
+static int daemon_global_check(struct action *act);
+static void daemon_global_save(struct action *act, struct lockspace *ls);
 static void daemon_global_update_start(struct action *act);
 static void daemon_global_reset(void);
 
@@ -5321,15 +5322,19 @@ static int add_lock_action(struct action *act)
 	memset(ls_name, 0, sizeof(ls_name));
 
 	if (act->rt == LD_RT_GL) {
-		int rv = daemon_global_update_gl(act);
+		int rv = daemon_global_check(act);
 		if (rv < 0)
 			return rv;
 	}
 
 	daemon_global_get(NULL, &gl_type, gl_name);
 
+	/*
+	 * GM2 uses the gl in a specific VG; the gl lockspace must be known
+	 * from the daemon's remembered name or named by this request.
+	 */
 	if (act->op == LD_OP_LOCK && act->rt == LD_RT_GL &&
-	    act->global_mode == GM2 && !gl_name[0])
+	    act->global_mode == GM2 && !gl_name[0] && !act->global_vgname[0])
 		return -ENOLS;
 
 	/*
@@ -5365,7 +5370,18 @@ static int add_lock_action(struct action *act)
 						  op_str(act->op), mode_str(act->mode), lm_str(gl_type));
 				}
 			}
-			dm_strncpy(ls_name, gl_name, sizeof(ls_name));
+
+			/*
+			 * Route to the remembered GL lockspace.  A request that
+			 * names the VG holding the GL provides the lockspace when
+			 * the daemon does not know it yet (the name is saved only
+			 * once the request is queued, by daemon_global_save.)
+			 */
+			if (gl_name[0]) {
+				dm_strncpy(ls_name, gl_name, sizeof(ls_name));
+			} else if (act->global_vgname[0]) {
+				vg_ls_name(act->global_vgname, ls_name);
+			}
 		}
 	} else {
 		/* VG lock is requested */
@@ -5471,6 +5487,11 @@ static int add_lock_action(struct action *act)
 	ls->thread_work = 1;
 	pthread_cond_signal(&ls->cond);
 	pthread_mutex_unlock(&ls->mutex);
+
+	/* The GL request has succeeded this far, save global mode/name from it. */
+	if (act->rt == LD_RT_GL)
+		daemon_global_save(act, ls);
+
 	pthread_mutex_unlock(&lockspaces_mutex);
 
 	/* lockspace_thread_main / res_process take it from here */
@@ -5687,9 +5708,15 @@ static void daemon_global_reset(void)
  * finds the resource that was locked) and enable/disable (which apply to a
  * specific lockspace).  A request with a GM that conflicts with the GM in
  * use while lockspaces exist is refused.
+ *
+ * This only validates the request; the global mode/name are saved by
+ * daemon_global_save() once the request is queued to the gl lockspace.
+ * Saving them here, before the lockspace is found, would leave a failed
+ * request's GM behind (e.g. -ENOLS when the gl lockspace does not exist),
+ * causing false -EGMMIX rejections for later requests with the correct GM.
  */
 
-static int daemon_global_update_gl(struct action *act)
+static int daemon_global_check(struct action *act)
 {
 	char ls_name[MAX_NAME+1] = { 0 };
 	int unlock = (act->op == LD_OP_LOCK && act->mode == LD_LK_UN);
@@ -5714,8 +5741,6 @@ static int daemon_global_update_gl(struct action *act)
 	/*
 	 * Copy the mode before calling lockspaces_empty(), which takes
 	 * lockspaces_mutex: daemon_global_mutex must not be held across it.
-	 * (The check-then-set is not atomic; that is inherent to the design,
-	 * see daemon_global_update_start.)
 	 */
 	daemon_global_get(&cur_mode, NULL, NULL);
 
@@ -5725,9 +5750,28 @@ static int daemon_global_update_gl(struct action *act)
 		return -EGMMIX;
 	}
 
-	daemon_global_set(act->global_mode, -1, ls_name[0] ? ls_name : NULL);
-
 	return 0;
+}
+
+/*
+ * Save the global mode/name from a GL request that is being queued to the
+ * lockspace holding the GL.  The name is the lockspace the request was
+ * queued to, which is where the GL is used from.  (For dlm/idm this is
+ * the same "lvm_global" name that daemon_global_set_type saves.)
+ */
+
+static void daemon_global_save(struct action *act, struct lockspace *ls)
+{
+	int unlock = (act->op == LD_OP_LOCK && act->mode == LD_LK_UN);
+
+	/* Unlock finds the resource that was locked, enable/disable use a specific lockspace. */
+	if (act->op != LD_OP_LOCK || unlock)
+		return;
+
+	if (act->global_mode != GM1 && act->global_mode != GM2)
+		return;
+
+	daemon_global_set(act->global_mode, -1, ls->name);
 }
 
 /*
@@ -5745,10 +5789,7 @@ static void daemon_global_update_start(struct action *act)
 	if (act->global_mode != GM1 && act->global_mode != GM2)
 		return;
 
-	/*
-	 * As in daemon_global_update_gl: copy the mode before calling
-	 * lockspaces_empty(), which takes lockspaces_mutex.
-	 */
+	/* Copy mode before lockspaces_empty() which takes lockspaces_mutex. */
 	daemon_global_get(&cur_mode, NULL, NULL);
 
 	if (cur_mode != GM0 && cur_mode != act->global_mode && !lockspaces_empty()) {
