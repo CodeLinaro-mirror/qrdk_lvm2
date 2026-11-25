@@ -1590,48 +1590,78 @@ int persist_key_update(struct cmd_context *cmd, struct volume_group *vg, uint32_
 	return 1;
 }
 
-int persist_read(struct cmd_context *cmd, struct volume_group *vg)
+/*
+ * Run lvmpersist <sub_cmd> with --ourkey <key> when key is set, the fixed
+ * options in the NULL-terminated opts, --ptpl when ptpl is set, and
+ * --device <name> for each dev.
+ * Returns the exec_cmd result; *status is the lvmpersist exit status.
+ */
+static int _run_lvmpersist(struct cmd_context *cmd, const char *sub_cmd,
+			   const char *key, const char **opts, int ptpl,
+			   struct dm_list *devs, int *status)
 {
-	struct pv_list *pvl;
-	struct device *dev;
+	struct device_list *devl;
 	const char *devname;
 	const char **argv;
+	int num_opts = 0;
+	int dev_count = 0;
 	int args = 0;
-	int pv_count = 0;
+	int i;
+
+	while (opts && opts[num_opts])
+		num_opts++;
+
+	dm_list_iterate_items(devl, devs) {
+		if (dm_list_empty(&devl->dev->aliases))
+			continue;
+		dev_count++;
+	}
+
+	/* prog sub_cmd [--ourkey key] opts [--ptpl] --device pairs NULL */
+	if (!(argv = dm_pool_alloc(cmd->mem, (3 + (key ? 2 : 0) + num_opts + (ptpl ? 1 : 0) + dev_count * 2) * sizeof(char *))))
+		return_0;
+
+	argv[args++] = LVMPERSIST_PATH;
+	argv[args++] = sub_cmd;
+
+	if (key) {
+		argv[args++] = "--ourkey";
+		argv[args++] = key;
+	}
+
+	for (i = 0; i < num_opts; i++)
+		argv[args++] = opts[i];
+
+	if (ptpl)
+		argv[args++] = "--ptpl";
+
+	dm_list_iterate_items(devl, devs) {
+		if (dm_list_empty(&devl->dev->aliases))
+			continue;
+		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
+			return_0;
+		argv[args++] = "--device";
+		argv[args++] = devname;
+	}
+
+	argv[args] = NULL;
+
+	return exec_cmd(cmd, argv, status, 1);
+}
+
+int persist_read(struct cmd_context *cmd, struct volume_group *vg)
+{
+	const char *opts[3] = { "--vg", vg->name, NULL };
+	DM_LIST_INIT(devs);
 	int status;
 
-	dm_list_iterate_items(pvl, &vg->pvs) {
-		if (!(dev = pvl->pv->dev))
-			continue;
-		if (dm_list_empty(&dev->aliases))
-			continue;
-		pv_count++;
-	}
-	if (!pv_count)
+	if (!pv_list_to_dev_list(cmd->mem, &vg->pvs, &devs))
 		return_0;
 
-	if (!(argv = dm_pool_alloc(cmd->mem, (5 + pv_count*2) * sizeof(char *))))
+	if (!dm_list_size(&devs))
 		return_0;
 
-	argv[0] = LVMPERSIST_PATH;
-	argv[++args] = "read";
-	argv[++args] = "--vg";
-	argv[++args] = vg->name;
-
-	dm_list_iterate_items(pvl, &vg->pvs) {
-		if (!(dev = pvl->pv->dev))
-			continue;
-		if (dm_list_empty(&dev->aliases))
-			continue;
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(dev))))
-			return_0;
-		argv[++args] = "--device";
-		argv[++args] = devname;
-	}
-
-	argv[++args] = NULL;
-
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "read", NULL, opts, 0, &devs, &status)) {
 		log_error("Persistent reservation read failed: lvmpersist command error.");
 		return 0;
 	}
@@ -2020,36 +2050,13 @@ int persist_check(struct cmd_context *cmd, struct volume_group *vg)
 
 static int _run_stop(struct cmd_context *cmd, struct volume_group *vg, struct dm_list *devs, char *our_key_str, int cleanup)
 {
-	struct device_list *devl;
-	const char *devname;
-	const char **argv;
-	int args = 0;
-	int pv_count;
+	const char *opts[3] = { "--vg", vg->name, NULL };
 	int status;
 
-	if (!(pv_count = dm_list_size(devs)))
+	if (!dm_list_size(devs))
 		return_0;
 
-	if (!(argv = dm_pool_alloc(cmd->mem, (7 + pv_count*2) * sizeof(char *))))
-		return_0;
-
-	argv[0] = LVMPERSIST_PATH;
-	argv[++args] = "stop";
-	argv[++args] = "--ourkey";
-	argv[++args] = our_key_str;
-	argv[++args] = "--vg";
-	argv[++args] = vg->name;
-
-	dm_list_iterate_items(devl, devs) {
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
-			return_0;
-		argv[++args] = "--device";
-		argv[++args] = devname;
-	}
-
-	argv[++args] = NULL;
-
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "stop", our_key_str, opts, 0, devs, &status)) {
 		if (!cleanup)
 			log_error("Persistent reservation stop failed: lvmpersist command error.");
 		return 0;
@@ -2060,38 +2067,15 @@ static int _run_stop(struct cmd_context *cmd, struct volume_group *vg, struct dm
 
 static int _run_clear(struct cmd_context *cmd, struct volume_group *vg, struct dm_list *devs, char *our_key_str)
 {
-	struct device_list *devl;
-	const char *devname;
-	const char **argv;
-	int args = 0;
-	int pv_count;
+	const char *opts[3] = { "--vg", vg->name, NULL };
 	int status;
 
-	if (!(pv_count = dm_list_size(devs)))
+	if (!dm_list_size(devs))
 		return_0;
-
-	if (!(argv = dm_pool_alloc(cmd->mem, (7 + pv_count*2) * sizeof(char *))))
-		return_0;
-
-	argv[0] = LVMPERSIST_PATH;
-	argv[++args] = "clear";
-	argv[++args] = "--ourkey";
-	argv[++args] = our_key_str;
-	argv[++args] = "--vg";
-	argv[++args] = vg->name;
-
-	dm_list_iterate_items(devl, devs) {
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
-			return_0;
-		argv[++args] = "--device";
-		argv[++args] = devname;
-	}
-
-	argv[++args] = NULL;
 
 	/* lvmpersist clear verifies that the reservation and keys are gone. */
 
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "clear", our_key_str, opts, 0, devs, &status)) {
 		log_error("Persistent reservation clear failed: lvmpersist command error.");
 		return 0;
 	}
@@ -2280,17 +2264,14 @@ int persist_upgrade_stop(struct cmd_context *cmd, struct volume_group *vg, uint6
 int persist_upgrade_ex(struct cmd_context *cmd, struct volume_group *vg, uint64_t *our_key_held)
 {
 	DM_LIST_INIT(devs);
-	struct device_list *devl;
 	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
 	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	char new_key_buf[PR_KEY_BUF_SIZE] = { 0 };
+	const char *opts[5] = { "--access", "ex", "--vg", vg->name, NULL };
 	uint64_t our_key_val = 0;
 	uint64_t new_key_val = 0;
-	const char *devname;
-	const char **argv;
 	int pv_count;
-	int args;
 	int status;
 	int ret;
 
@@ -2332,35 +2313,7 @@ int persist_upgrade_ex(struct cmd_context *cmd, struct volume_group *vg, uint64_
 	log_debug("persist_upgrade_ex start PR on %d devs with local key %llx.",
 		  pv_count, (unsigned long long) new_key_val);
 
-	args = 9 + pv_count*2;
-	if (vg->pr & VG_PR_PTPL)
-		args += 1;
-
-	if (!(argv = dm_pool_alloc(cmd->mem, args * sizeof(char *))))
-		return_0;
-
-	args = 0;
-	argv[0] = LVMPERSIST_PATH;
-	argv[++args] = "start";
-	argv[++args] = "--ourkey";
-	argv[++args] = new_key_buf;
-	argv[++args] = "--access";
-	argv[++args] = "ex";
-	argv[++args] = "--vg";
-	argv[++args] = vg->name;
-	if (vg->pr & VG_PR_PTPL)
-		argv[++args] = "--ptpl";
-
-	dm_list_iterate_items(devl, &devs) {
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
-			return_0;
-		argv[++args] = "--device";
-		argv[++args] = devname;
-	}
-
-	argv[++args] = NULL;
-
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "start", new_key_buf, opts, (vg->pr & VG_PR_PTPL), &devs, &status)) {
 		log_error("Persistent reservation exclusive start failed: lvmpersist command error.");
 		log_error("(Use vgchange --persist stop to stop PR on other hosts).");
 		return 0;
@@ -2471,12 +2424,9 @@ static void _begin_pr_save(struct cmd_context *cmd, const char *key)
 int persist_vgcreate_begin(struct cmd_context *cmd, const char *vg_name,
 			   uint32_t set_flags, struct dm_list *devs)
 {
-	struct device_list *devl;
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
-	const char *devname;
-	const char **argv;
+	const char *opts[5] = { "--access", "ex", "--vg", vg_name, NULL };
 	int pv_count;
-	int args;
 	int status;
 
 	if (_persist_policy_none(cmd))
@@ -2491,35 +2441,7 @@ int persist_vgcreate_begin(struct cmd_context *cmd, const char *vg_name,
 
 	log_debug("Start PR on %d devs with local key %s.", pv_count, our_key_buf);
 
-	args = 9 + pv_count*2;
-	if (set_flags & SETPR_PTPL)
-		args += 1;
-
-	if (!(argv = dm_pool_alloc(cmd->mem, args * sizeof(char *))))
-		return_0;
-
-	args = 0;
-	argv[0] = LVMPERSIST_PATH;
-	argv[++args] = "start";
-	argv[++args] = "--ourkey";
-	argv[++args] = our_key_buf;
-	argv[++args] = "--access";
-	argv[++args] = "ex";
-	argv[++args] = "--vg";
-	argv[++args] = vg_name; /* vg doesn't exist yet, just used for log messages */
-	if (set_flags & SETPR_PTPL)
-		argv[++args] = "--ptpl";
-
-	dm_list_iterate_items(devl, devs) {
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
-			return_0;
-		argv[++args] = "--device";
-		argv[++args] = devname;
-	}
-
-	argv[++args] = NULL;
-
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "start", our_key_buf, opts, (set_flags & SETPR_PTPL), devs, &status)) {
 		log_error("Persistent reservation start failed: lvmpersist command error.");
 		return 0;
 	}
@@ -2592,21 +2514,14 @@ int persist_global_devices_supported(struct cmd_context *cmd, struct dm_list *de
  */
 int persist_global_devices(struct cmd_context *cmd, struct dm_list *devs)
 {
-	struct device_list *devl;
+	const char *opts[4] = { "--claim", "--access", "ex", NULL };
 	char key_buf[PR_KEY_BUF_SIZE] = { 0 };
-	const char *devname;
-	const char **argv;
-	int dev_count;
-	int args = 0;
 	int status;
 
-	if (!(dev_count = dm_list_size(devs)))
+	if (!dm_list_size(devs))
 		return_0;
 
 	if (!_get_global_pr_key(cmd, key_buf))
-		return_0;
-
-	if (!(argv = dm_pool_alloc(cmd->mem, (8 + dev_count * 2) * sizeof(char *))))
 		return_0;
 
 	/*
@@ -2626,24 +2541,7 @@ int persist_global_devices(struct cmd_context *cmd, struct dm_list *devs)
 	 * unregisters our key and exits with status 2 on a claim conflict.
 	 */
 
-	argv[args++] = LVMPERSIST_PATH;
-	argv[args++] = "start";
-	argv[args++] = "--ourkey";
-	argv[args++] = key_buf;
-	argv[args++] = "--claim";
-	argv[args++] = "--access";
-	argv[args++] = "ex";
-
-	dm_list_iterate_items(devl, devs) {
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
-			return_0;
-		argv[args++] = "--device";
-		argv[args++] = devname;
-	}
-
-	argv[args] = NULL;
-
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "start", key_buf, opts, 0, devs, &status)) {
 		if (status == 2) {
 			/* hosts may have failed while claiming leaving stale keys in place */
 			log_error("Cannot use devices for a new VG: PR keys from another host are registered.");
@@ -2694,38 +2592,16 @@ int persist_global_devices_lock(struct cmd_context *cmd, struct dm_list *devs, i
 
 int persist_global_devices_release(struct cmd_context *cmd, struct dm_list *devs)
 {
-	struct device_list *devl;
 	char key_buf[PR_KEY_BUF_SIZE] = { 0 };
-	const char *devname;
-	const char **argv;
-	int dev_count;
-	int args = 0;
 	int status;
 
-	if (!(dev_count = dm_list_size(devs)))
+	if (!dm_list_size(devs))
 		return_0;
 
 	if (!_get_global_pr_key(cmd, key_buf))
 		return_0;
 
-	if (!(argv = dm_pool_alloc(cmd->mem, (5 + dev_count * 2) * sizeof(char *))))
-		return_0;
-
-	argv[args++] = LVMPERSIST_PATH;
-	argv[args++] = "stop";
-	argv[args++] = "--ourkey";
-	argv[args++] = key_buf;
-
-	dm_list_iterate_items(devl, devs) {
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
-			return_0;
-		argv[args++] = "--device";
-		argv[args++] = devname;
-	}
-
-	argv[args] = NULL;
-
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "stop", key_buf, NULL, 0, devs, &status)) {
 		log_error("Global persistent reservation stop failed: lvmpersist command error.");
 		return 0;
 	}
@@ -2748,12 +2624,7 @@ int persist_global_devices_release(struct cmd_context *cmd, struct dm_list *devs
  */
 static int _persist_command_end(struct cmd_context *cmd, struct dm_list *devs)
 {
-	struct device_list *devl;
-	const char *devname;
-	const char **argv;
 	const char *key = cmd->global_devs.begin_key;
-	int dev_count;
-	int args = 0;
 	int status;
 
 	/* PR was not acquired by _begin, or was handed off to the VG. */
@@ -2763,27 +2634,10 @@ static int _persist_command_end(struct cmd_context *cmd, struct dm_list *devs)
 	if (!key || !key[0])
 		return 1;
 
-	if (!devs || !(dev_count = dm_list_size(devs)))
+	if (!devs || !dm_list_size(devs))
 		return 1;
 
-	if (!(argv = dm_pool_alloc(cmd->mem, (5 + dev_count * 2) * sizeof(char *))))
-		return_0;
-
-	argv[args++] = LVMPERSIST_PATH;
-	argv[args++] = "stop";
-	argv[args++] = "--ourkey";
-	argv[args++] = key;
-
-	dm_list_iterate_items(devl, devs) {
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
-			return_0;
-		argv[args++] = "--device";
-		argv[args++] = devname;
-	}
-
-	argv[args] = NULL;
-
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "stop", key, NULL, 0, devs, &status)) {
 		log_error("Persistent reservation stop failed: lvmpersist command error.");
 		log_error("PR key %s remains registered.", key);
 		log_error("See lvmpersist options read, stop.");
@@ -2838,17 +2692,14 @@ int persist_vgcreate_update(struct cmd_context *cmd, struct volume_group *vg,
 			    uint32_t set_flags, int start_pr)
 {
 	DM_LIST_INIT(devs);
-	struct device_list *devl;
 	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
 	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	char our_key_buf_stop[PR_KEY_BUF_SIZE] = { 0 };
+	const char *access = vg_is_shared(vg) ? "sh" : "ex";
+	const char *opts[5] = { "--access", access, "--vg", vg->name, NULL };
 	uint64_t our_key_val = 0;
 	uint64_t our_key_val_stop = 0;
-	const char *access = vg_is_shared(vg) ? "sh" : "ex";
-	const char *devname;
-	const char **argv;
-	int args = 0;
 	int pv_count;
 	int status;
 	int stop_done = 0;
@@ -2956,35 +2807,7 @@ int persist_vgcreate_update(struct cmd_context *cmd, struct volume_group *vg,
 	log_debug("Start PR on %d devs with local key %llx.",
 		  pv_count, (unsigned long long) our_key_val);
 
-	args = 9 + pv_count*2;
-	if (set_flags & SETPR_PTPL)
-		args += 1;
-
-	if (!(argv = dm_pool_alloc(cmd->mem, args * sizeof(char *))))
-		return_0;
-
-	args = 0;
-	argv[0] = LVMPERSIST_PATH;
-	argv[++args] = "start";
-	argv[++args] = "--ourkey";
-	argv[++args] = our_key_buf;
-	argv[++args] = "--access";
-	argv[++args] = access;
-	argv[++args] = "--vg";
-	argv[++args] = vg->name;
-	if (set_flags & SETPR_PTPL)
-		argv[++args] = "--ptpl";
-
-	dm_list_iterate_items(devl, &devs) {
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(devl->dev))))
-			return_0;
-		argv[++args] = "--device";
-		argv[++args] = devname;
-	}
-
-	argv[++args] = NULL;
-
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "start", our_key_buf, opts, (set_flags & SETPR_PTPL), &devs, &status)) {
 		log_error("Persistent reservation start failed: lvmpersist command error.");
 		return 0;
 	}
@@ -3030,10 +2853,8 @@ int persist_vgextend_begin(struct cmd_context *cmd, struct volume_group *vg,
 	uint64_t our_key_val = 0;
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	const char *access = vg_is_shared(vg) ? "sh" : "ex";
-	const char *devname;
-	const char **argv;
+	const char *opts[5] = { "--access", access, "--vg", vg->name, NULL };
 	int status;
-	int args = 0;
 	int pv_count = 0;
 	int errors = 0;
 	int found = 0;
@@ -3070,38 +2891,7 @@ int persist_vgextend_begin(struct cmd_context *cmd, struct volume_group *vg,
 	log_debug("Start PR on %d new devs with local key %llx.",
 		  pv_count, (unsigned long long) our_key_val);
 
-	args = 9 + pv_count*2;
-	if (vg->pr & VG_PR_PTPL)
-		args += 1;
-
-	if (!(argv = dm_pool_alloc(cmd->mem, args * sizeof(char *))))
-		return_0;
-
-	args = 0;
-	argv[0] = LVMPERSIST_PATH;
-	argv[++args] = "start";
-	argv[++args] = "--ourkey";
-	argv[++args] = our_key_buf;
-	argv[++args] = "--access";
-	argv[++args] = access;
-	argv[++args] = "--vg";
-	argv[++args] = vg->name;
-	if (vg->pr & VG_PR_PTPL)
-		argv[++args] = "--ptpl";
-
-	dm_list_iterate_items(devl, devs) {
-		dev = devl->dev;
-		if (dm_list_empty(&dev->aliases))
-			continue;
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(dev))))
-			return_0;
-		argv[++args] = "--device";
-		argv[++args] = devname;
-	}
-
-	argv[++args] = NULL;
-
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "start", our_key_buf, opts, (vg->pr & VG_PR_PTPL), devs, &status)) {
 		log_error("Persistent reservation start failed: lvmpersist command error.");
 		return 0;
 	}
@@ -3207,17 +2997,17 @@ int persist_start(struct cmd_context *cmd, struct volume_group *vg,
 	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
 	struct pv_list *pvl;
 	struct device *dev;
+	DM_LIST_INIT(devs);
 	uint64_t our_key_val = 0;
 	uint64_t rem_key_val = 0;
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	char rem_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	const char *access = vg_is_shared(vg) ? "sh" : "ex";
-	const char *devname;
-	const char **argv;
+	const char *opts[7];
 	uint64_t holder = 0;
 	int partial_reg = 0;
 	int prtype;
-	int args = 0;
+	int num_opts = 0;
 	int pv_count = 0;
 	int missing_count = 0;
 	int status;
@@ -3362,30 +3152,15 @@ int persist_start(struct cmd_context *cmd, struct volume_group *vg,
 	log_debug("Start PR on %d devs with local key %llx.",
 		  pv_count, (unsigned long long) our_key_val);
 
-	args = 9 + pv_count*2;
-	if (vg->pr & VG_PR_PTPL)
-		args += 1;
-	if (remkey)
-		args += 2;
-
-	if (!(argv = dm_pool_alloc(cmd->mem, args * sizeof(char *))))
-		return_0;
-
-	args = 0;
-	argv[0] = LVMPERSIST_PATH;
-	argv[++args] = "start";
-	argv[++args] = "--ourkey";
-	argv[++args] = our_key_buf;
-	argv[++args] = "--access";
-	argv[++args] = access;
-	argv[++args] = "--vg";
-	argv[++args] = vg->name;
-	if (vg->pr & VG_PR_PTPL)
-		argv[++args] = "--ptpl";
+	opts[num_opts++] = "--access";
+	opts[num_opts++] = access;
+	opts[num_opts++] = "--vg";
+	opts[num_opts++] = vg->name;
 	if (remkey) {
-		argv[++args] = "--removekey";
-		argv[++args] = rem_key_buf;
+		opts[num_opts++] = "--removekey";
+		opts[num_opts++] = rem_key_buf;
 	}
+	opts[num_opts] = NULL;
 
 	/*
 	 * The list of devices is already known here, so by supplying them,
@@ -3394,20 +3169,10 @@ int persist_start(struct cmd_context *cmd, struct volume_group *vg,
 	 * can use it in log messages.
 	 */
 
-	dm_list_iterate_items(pvl, &vg->pvs) {
-		if (!(dev = pvl->pv->dev))
-			continue;
-		if (dm_list_empty(&dev->aliases))
-			continue;
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(dev))))
-			return_0;
-		argv[++args] = "--device";
-		argv[++args] = devname;
-	}
+	if (!pv_list_to_dev_list(cmd->mem, &vg->pvs, &devs))
+		return_0;
 
-	argv[++args] = NULL;
-
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "start", our_key_buf, opts, (vg->pr & VG_PR_PTPL), &devs, &status)) {
 		log_error("Persistent reservation start failed: lvmpersist command error.");
 		return 0;
 	}
@@ -3481,14 +3246,13 @@ int persist_remove(struct cmd_context *cmd, struct volume_group *vg, const char 
 	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
 	struct pv_list *pvl;
 	struct device *dev;
+	DM_LIST_INIT(devs);
 	uint64_t our_key_val = 0;
 	uint64_t rem_key_val = 0;
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	char rem_key_buf[PR_KEY_BUF_SIZE] = { 0 };
 	const char *access = vg_is_shared(vg) ? "sh" : "ex";
-	const char *devname;
-	const char **argv;
-	int args = 0;
+	const char *opts[7] = { "--removekey", rem_key_buf, "--access", access, "--vg", vg->name, NULL };
 	int pv_count = 0;
 	int missing_count = 0;
 	int status;
@@ -3535,34 +3299,10 @@ int persist_remove(struct cmd_context *cmd, struct volume_group *vg, const char 
 		return_0;
 	}
 
-	if (!(argv = dm_pool_alloc(cmd->mem, (11 + pv_count*2) * sizeof(char *))))
+	if (!pv_list_to_dev_list(cmd->mem, &vg->pvs, &devs))
 		return_0;
 
-	argv[0] = LVMPERSIST_PATH;
-	argv[++args] = "remove";
-	argv[++args] = "--ourkey";
-	argv[++args] = our_key_buf;
-	argv[++args] = "--removekey";
-	argv[++args] = rem_key_buf;
-	argv[++args] = "--access";
-	argv[++args] = access;
-	argv[++args] = "--vg";
-	argv[++args] = vg->name;
-
-	dm_list_iterate_items(pvl, &vg->pvs) {
-		if (!(dev = pvl->pv->dev))
-			continue;
-		if (dm_list_empty(&dev->aliases))
-			continue;
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(dev))))
-			return_0;
-		argv[++args] = "--device";
-		argv[++args] = devname;
-	}
-
-	argv[++args] = NULL;
-
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "remove", our_key_buf, opts, 0, &devs, &status)) {
 		log_error("Persistent reservation remove failed: lvmpersist command error.");
 		return 0;
 	}
@@ -3582,14 +3322,10 @@ int persist_clear(struct cmd_context *cmd, struct volume_group *vg)
 {
 	char *local_key = (char *)find_config_tree_str(cmd, local_pr_key_CFG, NULL);
 	int local_host_id = find_config_tree_int(cmd, local_host_id_CFG, NULL);
-	struct pv_list *pvl;
-	struct device *dev;
+	const char *opts[3] = { "--vg", vg->name, NULL };
 	uint64_t our_key_val = 0;
 	char our_key_buf[PR_KEY_BUF_SIZE] = { 0 };
-	const char *devname;
-	const char **argv;
-	int args = 0;
-	int pv_count = 0;
+	DM_LIST_INIT(devs);
 	int status;
 
 	if (vg_is_sanlock(vg))
@@ -3598,40 +3334,13 @@ int persist_clear(struct cmd_context *cmd, struct volume_group *vg)
 	if (!_get_our_key(cmd, vg, local_key, local_host_id, our_key_buf, &our_key_val))
 		return_0;
 
-	dm_list_iterate_items(pvl, &vg->pvs) {
-		if (!(dev = pvl->pv->dev))
-			continue;
-		if (dm_list_empty(&dev->aliases))
-			continue;
-		pv_count++;
-	}
-	if (!pv_count)
+	if (!pv_list_to_dev_list(cmd->mem, &vg->pvs, &devs))
 		return_0;
 
-	if (!(argv = dm_pool_alloc(cmd->mem, (7 + pv_count*2) * sizeof(char *))))
+	if (!dm_list_size(&devs))
 		return_0;
 
-	argv[0] = LVMPERSIST_PATH;
-	argv[++args] = "clear";
-	argv[++args] = "--ourkey";
-	argv[++args] = our_key_buf;
-	argv[++args] = "--vg";
-	argv[++args] = vg->name;
-
-	dm_list_iterate_items(pvl, &vg->pvs) {
-		if (!(dev = pvl->pv->dev))
-			continue;
-		if (dm_list_empty(&dev->aliases))
-			continue;
-		if (!(devname = dm_pool_strdup(cmd->mem, dev_name(dev))))
-			return_0;
-		argv[++args] = "--device";
-		argv[++args] = devname;
-	}
-
-	argv[++args] = NULL;
-
-	if (!exec_cmd(cmd, argv, &status, 1)) {
+	if (!_run_lvmpersist(cmd, "clear", our_key_buf, opts, 0, &devs, &status)) {
 		log_error("Persistent reservation clear failed: lvmpersist command error.");
 		return 0;
 	}
