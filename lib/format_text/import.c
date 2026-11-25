@@ -118,7 +118,7 @@ int text_read_metadata_summary(const struct format_type *fmt,
 		if (!config_file_read_fd(cft, dev, reason, offset, size,
 					 offset2, size2, checksum_fn,
 					 vgsummary->mda_checksum,
-					 checksum_only, 1,
+					 checksum_only, 0,
 					 _vgsummary_filter, &fa)) {
 			log_warn("WARNING: Invalid metadata text from %s at %llu.",
 				 dev_name(dev), (unsigned long long)offset);

@@ -36,8 +36,6 @@
 
 #define SCSI_PR_BUF_SIZE 8192 /* space for 1024 keys */
 
-/* PR_KEY_BUF_SIZE is defined in persist.h */
-
 /* key format is 0x100000YYYYYYXXXX where XXXX=host_id, YYYYYY=generation */
 #define PR_KEY_HOST_ID(k)    ((int)((k) & 0xFFFF))
 #define PR_KEY_GEN(k)         ((uint32_t)(((k) & 0xFFFFFF0000) >> 16))
@@ -1554,7 +1552,7 @@ int persist_key_update(struct cmd_context *cmd, struct volume_group *vg, uint32_
 		return 1;
 	}
 
-	if (dm_snprintf(new_key_buf, PR_KEY_BUF_SIZE-1, "0x100000%06x%04x", want_gen, (unsigned) local_host_id) != 18) {
+	if (dm_snprintf(new_key_buf, sizeof(new_key_buf), "0x100000%06x%04x", want_gen, (unsigned) local_host_id) != 18) {
 		log_error("Failed to format key string for host_id %d gen %u.", local_host_id, want_gen);
 		return 0;
 	}
@@ -2749,12 +2747,12 @@ int persist_vgcreate_update(struct cmd_context *cmd, struct volume_group *vg,
 			log_error("Failed to parse local key %s.", local_key);
 			return 0;
 		}
-		if (dm_snprintf(our_key_buf_stop, PR_KEY_BUF_SIZE-1, "0x%llx",
+		if (dm_snprintf(our_key_buf_stop, sizeof(our_key_buf_stop), "0x%llx",
 				(unsigned long long) our_key_val_stop) < 0)
 			return_0;
 	} else if (local_host_id) {
 		/* The key used in persist_vgcreate_begin did not include gen 1. */
-		if (dm_snprintf(our_key_buf_stop, PR_KEY_BUF_SIZE-1, "0x100000000000%04x", (unsigned) local_host_id) != 18) {
+		if (dm_snprintf(our_key_buf_stop, sizeof(our_key_buf_stop), "0x100000000000%04x", (unsigned) local_host_id) != 18) {
 			log_error("Failed to format key string for host_id %d.", local_host_id);
 			return 0;
 		}
@@ -2851,12 +2849,12 @@ int persist_vgextend_begin(struct cmd_context *cmd, struct volume_group *vg,
 	int status;
 	int pv_count = 0;
 	int errors = 0;
+	int not_found = 0;
 	int found = 0;
 	int ret;
 
 	if (_persist_policy_none(cmd))
 		return 0;
-	int n = 0;
 
 	ret = _get_our_key_verified(cmd, vg, our_key_buf, &our_key_val);
 	if (ret <= 0) {
@@ -2910,10 +2908,10 @@ int persist_vgextend_begin(struct cmd_context *cmd, struct volume_group *vg,
 		}
 
 		if (!found)
-			n++;
+			not_found++;
 	}
 
-	if (n || errors)
+	if (not_found || errors)
 		return 0;
 
 	/*
@@ -3034,7 +3032,7 @@ int persist_start(struct cmd_context *cmd, struct volume_group *vg,
 			log_error("Invalid removekey value: %s.", remkey);
 			return 0;
 		}
-		if (dm_snprintf(rem_key_buf, PR_KEY_BUF_SIZE-1, "0x%llx",
+		if (dm_snprintf(rem_key_buf, sizeof(rem_key_buf), "0x%llx",
 				(unsigned long long) rem_key_val) < 0)
 			return_0;
 	}
@@ -3261,7 +3259,7 @@ int persist_remove(struct cmd_context *cmd, struct volume_group *vg, const char 
 		return 0;
 	}
 
-	if (dm_snprintf(rem_key_buf, PR_KEY_BUF_SIZE-1, "0x%llx",
+	if (dm_snprintf(rem_key_buf, sizeof(rem_key_buf), "0x%llx",
 			(unsigned long long) rem_key_val) < 0)
 		return_0;
 
