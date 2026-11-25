@@ -2149,6 +2149,16 @@ static int _lvmlock_lv_tag(struct logical_volume *lv, const char *tag, int add)
 	return lv_change_tag(lv, tag, add);
 }
 
+static int _vg_lockargs_minor(struct volume_group *vg)
+{
+	int minor = lockd_lockargs_minor(vg->lock_args);
+
+	if (minor < 0)
+		log_error("VG %s has invalid lock_args \"%s\".", vg->name, vg->lock_args ? vg->lock_args : "");
+
+	return minor;
+}
+
 static int _vgchange_global_mode_single(struct cmd_context *cmd, const char *vg_name,
 					 struct volume_group *vg,
 					 int global_mode)
@@ -2161,6 +2171,7 @@ static int _vgchange_global_mode_single(struct cmd_context *cmd, const char *vg_
 	int others_have_lock_1, others_have_lock_2;
 	int gm_none, gm1, gm2, ls_sanlock, ls_other;
 	int others_not_gm2;
+	int others_all_gm2;
 	int gl_owner = 0;
 	int gl1_enable = 0;
 	int gl_enabled = 0;
@@ -2188,13 +2199,14 @@ static int _vgchange_global_mode_single(struct cmd_context *cmd, const char *vg_
 
 	/* Other VGs that use global mode 1, or are untagged (old lvm, global mode 1.) */
 	lvmcache_get_global_mode(&gm_none, &gm1, &gm2, &ls_sanlock, &ls_other);
-	others_not_gm2 = (gm_none + gm1) - (has_mode_1 ? 1 : 0) - ((!has_mode_1 && !has_mode_2) ? 1 : 0);
 
-	minor = lockd_lockargs_minor(vg->lock_args);
-	if (minor < 0) {
-		log_error("VG %s has invalid lock_args \"%s\".", vg->name, vg->lock_args ? vg->lock_args : "");
+	/* The mode counts include this VG when it is not using global mode 2. */
+	others_not_gm2 = (gm_none + gm1) - (has_mode_1 || !has_mode_2);
+	others_all_gm2 = !others_not_gm2;
+
+	minor = _vg_lockargs_minor(vg);
+	if (minor < 0)
 		return ECMD_FAILED;
-	}
 
 	if (has_lock_2 && others_have_lock_2)
 		log_warn("WARNING: Multiple VGs have the %s tag.", LOCKD_GLOBAL_LOCK_2_TAG);
@@ -2219,7 +2231,7 @@ static int _vgchange_global_mode_single(struct cmd_context *cmd, const char *vg_
 	 * is always applied to refresh the tags.
 	 */
 	if (global_mode == LOCKD_GLOBAL_MODE_1)
-		gl1_enable = !others_have_lock_1 && !others_not_gm2;
+		gl1_enable = !others_have_lock_1 && others_all_gm2;
 
 	/*
 	 * lockd_set_global_mode gets exclusive PR (if the VG is using PR),
@@ -2292,7 +2304,6 @@ static int _vgchange_global_lock_single(struct cmd_context *cmd, const char *vg_
 	uint64_t our_key_held = 0;
 	int gl_enabled = 0;
 	int enable = (global_lock == LOCKD_GLOBAL_LOCK_ENABLE);
-	int minor;
 
 	if (!vg->lock_type || strcmp(vg->lock_type, "sanlock")) {
 		log_error("VG lock type sanlock is required for --locksettings.");
@@ -2327,11 +2338,8 @@ static int _vgchange_global_lock_single(struct cmd_context *cmd, const char *vg_
 	else
 		others_have_lock = (gl1 - has_lock_1) > 0;
 
-	minor = lockd_lockargs_minor(vg->lock_args);
-	if (minor < 0) {
-		log_error("VG %s has invalid lock_args \"%s\".", vg->name, vg->lock_args ? vg->lock_args : "");
+	if (_vg_lockargs_minor(vg) < 0)
 		return ECMD_FAILED;
-	}
 
 	if (enable) {
 		/* The GL may only be enabled in one VG at a time. */
