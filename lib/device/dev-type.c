@@ -1531,25 +1531,40 @@ static int _find_signature(struct cmd_context *cmd, struct device *dev, const ch
 	return 1;
 }
 
+/*
+ * Returns the allocation/use_blkid_wiping config value.  Warns when it is
+ * enabled but LVM was not built with blkid wiping support, in which case
+ * the callers fall back to native LVM signature detection.
+ */
+static int _blkid_wiping_enabled(struct cmd_context *cmd)
+{
+	int enabled = find_config_tree_bool(cmd, allocation_use_blkid_wiping_CFG, NULL);
+
+#ifndef BLKID_WIPING_SUPPORT
+	if (enabled) {
+		log_warn("WARNING: allocation/use_blkid_wiping=1 configuration setting is set "
+			 "while LVM is not compiled with blkid wiping support.");
+		log_warn("WARNING: Falling back to native LVM signature detection.");
+	}
+#endif
+
+	return enabled;
+}
+
 int wipe_known_signatures(struct cmd_context *cmd, struct device *dev,
 			  const char *name, uint32_t types_to_exclude,
 			  uint32_t types_no_prompt, int yes, force_t force,
 			  int *wiped)
 {
-	int blkid_wiping_enabled = find_config_tree_bool(cmd, allocation_use_blkid_wiping_CFG, NULL);
-
+	if (_blkid_wiping_enabled(cmd)) {
 #ifdef BLKID_WIPING_SUPPORT
-	if (blkid_wiping_enabled)
 		return _wipe_known_signatures_with_blkid(dev, name,
 							 types_to_exclude,
 							 types_no_prompt,
 							 yes, force, wiped);
 #endif
-	if (blkid_wiping_enabled) {
-		log_warn("WARNING: allocation/use_blkid_wiping=1 configuration setting is set "
-			 "while LVM is not compiled with blkid wiping support.");
-		log_warn("WARNING: Falling back to native LVM signature detection.");
 	}
+
 	return _wipe_known_signatures_with_lvm(cmd, dev, name,
 					       types_to_exclude,
 					       types_no_prompt,
@@ -1570,21 +1585,15 @@ int dev_find_known_signatures(struct cmd_context *cmd, struct device *dev,
 			      uint32_t types_no_prompt, force_t force,
 			      struct dm_list *sigs)
 {
-	int blkid_wiping_enabled = find_config_tree_bool(cmd, allocation_use_blkid_wiping_CFG, NULL);
-
 	dm_list_init(sigs);
 
+	if (_blkid_wiping_enabled(cmd)) {
 #ifdef BLKID_WIPING_SUPPORT
-	if (blkid_wiping_enabled)
 		return _find_known_signatures_with_blkid(cmd, dev, name,
 							 types_to_exclude,
 							 types_no_prompt,
 							 force, sigs);
 #endif
-	if (blkid_wiping_enabled) {
-		log_warn("WARNING: allocation/use_blkid_wiping=1 configuration setting is set "
-			 "while LVM is not compiled with blkid wiping support.");
-		log_warn("WARNING: Falling back to native LVM signature detection.");
 	}
 
 	if (!_find_signature(cmd, dev, "software RAID md superblock", name, sigs, dev_is_md_component) ||
