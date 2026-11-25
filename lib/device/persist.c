@@ -2816,8 +2816,12 @@ int persist_vgcreate_update(struct cmd_context *cmd, struct volume_group *vg,
 	/*
 	 * Unusual error case: the stop above failed, so the PR key that was
 	 * acquired from lock_global_dev or persist_vgcreate_begin may still
-	 * be registered.  If still registered, that key should be removed.
-	 * Should we check if it's still registered here?  Try again to stop it?
+	 * be registered.  It is left in place rather than checked and
+	 * retried: the stop just failed and a retry would most likely fail
+	 * the same way, and the key does not affect the VG PR that was just
+	 * started.  The user is warned to remove it, since a registered key
+	 * can block the devices from being claimed for a new VG (see
+	 * lvmpersist read, remove.)
 	 *
 	 * The key that failed to stop above was likely different from the VG PR
 	 * key that is now registered (although it could potentially have been the
