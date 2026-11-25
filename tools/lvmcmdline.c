@@ -2951,12 +2951,49 @@ static int _prepare_profiles(struct cmd_context *cmd)
 	return 1;
 }
 
+/*
+ * Validate the persistent_reservations policy for any command that
+ * processes metadata or devices.  The policy also applies without
+ * lvmlockd; the lvmlockd global mode is only parsed and checked
+ * against the policy when lvmlockd is used.
+ */
+static int _init_persist_policy(struct cmd_context *cmd)
+{
+	int use_lvmlockd = find_config_tree_bool(cmd, global_use_lvmlockd_CFG, NULL);
+	int global_mode = 0;
+	int policy;
+
+	if ((policy = persist_policy_get(cmd)) < 0)
+		return 0;
+
+	if (use_lvmlockd && ((global_mode = lockd_global_mode_parse(cmd)) < 0))
+		return 0;
+
+	if (use_lvmlockd && (policy == PR_POLICY_NONE) && (global_mode == LOCKD_GLOBAL_MODE_2)) {
+		log_error("persistent_reservations=none conflicts with lvmlockd_global=global_mode_2.");
+		return 0;
+	}
+
+	/*
+	 * Only full requires a key unconditionally: auto uses PR
+	 * automatically only with lvmlockd global mode 2, which
+	 * requires the sanlock host_id (already required for shared
+	 * sanlock VGs.)
+	 */
+	if ((policy == PR_POLICY_FULL) &&
+	    !find_config_tree_str(cmd, local_pr_key_CFG, NULL) &&
+	    !find_config_tree_int(cmd, local_host_id_CFG, NULL)) {
+		log_error("A local pr_key or host_id is required to use persistent reservations (see lvmlocal.conf).");
+		return 0;
+	}
+
+	return 1;
+}
+
 static int _init_lvmlockd(struct cmd_context *cmd)
 {
 	const char *lvmlockd_socket;
 	int use_lvmlockd = find_config_tree_bool(cmd, global_use_lvmlockd_CFG, NULL);
-	int global_mode = 0;
-	int policy;
 
 	if (cmd->command->command_enum == pvscan_cache_CMD) {
 		/* pvscan cache ignores shared vgs, it only activates local vgs. */
@@ -2995,41 +3032,6 @@ static int _init_lvmlockd(struct cmd_context *cmd)
 		cmd->lockd_vg_disable = 1;
 		cmd->lockd_lv_disable = 1;
 		return 1;
-	}
-
-	if (use_lvmlockd) {
-		if ((global_mode = lockd_global_mode_parse(cmd)) < 0)
-			return 0;
-	}
-
-	/*
-	 * Validate the persistent_reservations policy for any command that
-	 * processes metadata or devices (lvmlockd_global above is only
-	 * checked when use_lvmlockd is set; the PR policy also applies
-	 * without lvmlockd.)
-	 */
-	policy = persist_policy_get(cmd);
-	if (policy < 0)
-		return 0;
-
-	if (use_lvmlockd) {
-		if ((policy == PR_POLICY_NONE) && (global_mode == LOCKD_GLOBAL_MODE_2)) {
-			log_error("persistent_reservations=none conflicts with lvmlockd_global=global_mode_2.");
-			return 0;
-		}
-	}
-
-	/*
-	 * Only full requires a key unconditionally: auto uses PR
-	 * automatically only with lvmlockd global mode 2, which
-	 * requires the sanlock host_id (already required for shared
-	 * sanlock VGs.)
-	 */
-	if ((policy == PR_POLICY_FULL) &&
-	    !find_config_tree_str(cmd, local_pr_key_CFG, NULL) &&
-	    !find_config_tree_int(cmd, local_host_id_CFG, NULL)) {
-		log_error("A local pr_key or host_id is required to use persistent reservations (see lvmlocal.conf).");
-		return 0;
 	}
 
 	lvmlockd_disconnect(); /* start over when tool context is refreshed */
@@ -3331,6 +3333,11 @@ int lvm_run_command(struct cmd_context *cmd, int argc, char **argv)
 	_init_md_checks(cmd);
 
 	if (!dev_mpath_init(find_config_tree_str_allow_empty(cmd, devices_multipath_wwids_file_CFG, NULL))) {
+		ret = ECMD_FAILED;
+		goto_out;
+	}
+
+	if (!_cmd_no_meta_proc(cmd) && !_init_persist_policy(cmd)) {
 		ret = ECMD_FAILED;
 		goto_out;
 	}
