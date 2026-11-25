@@ -104,6 +104,70 @@ int setpersist_arg_flags(const char *str, uint32_t *flags)
 }
 
 /*
+ * Validate a config array setting that holds a single string value from
+ * the NULL-terminated set of valid values, and return the value.
+ * Returns NULL on error.
+ */
+static const char *_config_str_single(struct cmd_context *cmd, int cfg_id,
+				      const char *setting_name, const char **valid)
+{
+	const struct dm_config_node *cn;
+	const struct dm_config_value *cv;
+	const char *str = NULL;
+	int seen = 0;
+	int i;
+
+	if (!(cn = find_config_tree_array(cmd, cfg_id, NULL))) {
+		log_error("Invalid %s value (empty).", setting_name);
+		return NULL;
+	}
+
+	for (cv = cn->v; cv; cv = cv->next) {
+		if (cv->type == DM_CFG_EMPTY_ARRAY) {
+			log_error("Invalid %s value (empty).", setting_name);
+			return NULL;
+		}
+
+		if (cv->type != DM_CFG_STRING) {
+			log_error("Invalid %s value: string expected.", setting_name);
+			return NULL;
+		}
+
+		str = cv->v.str;
+
+		if (!str || !*str) {
+			log_error("Invalid %s value (empty).", setting_name);
+			return NULL;
+		}
+
+		for (i = 0; valid[i]; i++) {
+			if (!strcmp(str, valid[i]))
+				break;
+		}
+
+		if (!valid[i]) {
+			log_error("Unknown %s value: %s.", setting_name, str);
+			return NULL;
+		}
+
+		if (seen) {
+			log_error("Invalid %s value: \"%s\" conflicts with an earlier setting.",
+				  setting_name, str);
+			return NULL;
+		}
+
+		seen = 1;
+	}
+
+	if (!seen) {
+		log_error("Invalid %s value (empty).", setting_name);
+		return NULL;
+	}
+
+	return str;
+}
+
+/*
  * Parse the lvm.conf global/persistent_reservations value (a string
  * list in which a single value is currently used): auto (the
  * default), full or none.
@@ -112,54 +176,12 @@ int setpersist_arg_flags(const char *str, uint32_t *flags)
 
 int persist_policy_get(struct cmd_context *cmd)
 {
-	const struct dm_config_node *cn;
-	const struct dm_config_value *cv;
-	const char *str = NULL;
-	int seen = 0;
+	static const char *valid[] = { "auto", "full", "none", NULL };
+	const char *str;
 
-	if (!(cn = find_config_tree_array(cmd, global_persistent_reservations_CFG, NULL))) {
-		log_error("Invalid persistent_reservations value (empty).");
+	if (!(str = _config_str_single(cmd, global_persistent_reservations_CFG,
+				       "persistent_reservations", valid)))
 		return -1;
-	}
-
-	for (cv = cn->v; cv; cv = cv->next) {
-		if (cv->type == DM_CFG_EMPTY_ARRAY) {
-			log_error("Invalid persistent_reservations value (empty).");
-			return -1;
-		}
-
-		if (cv->type != DM_CFG_STRING) {
-			log_error("Invalid persistent_reservations value: string expected.");
-			return -1;
-		}
-
-		str = cv->v.str;
-
-		if (!str || !*str) {
-			log_error("Invalid persistent_reservations value (empty).");
-			return -1;
-		}
-
-		if (strcmp(str, "auto") &&
-		    strcmp(str, "full") &&
-		    strcmp(str, "none")) {
-			log_error("Unknown persistent_reservations value: %s.", str);
-			return -1;
-		}
-
-		if (seen) {
-			log_error("Invalid persistent_reservations value: \"%s\" conflicts with an earlier setting.",
-				  str);
-			return -1;
-		}
-
-		seen = 1;
-	}
-
-	if (!seen) {
-		log_error("Invalid persistent_reservations value (empty).");
-		return -1;
-	}
 
 	if (!strcmp(str, "full"))
 		return PR_POLICY_FULL;
@@ -182,64 +204,21 @@ int persist_policy_get(struct cmd_context *cmd)
 
 int lockd_global_mode_parse(struct cmd_context *cmd)
 {
-	const struct dm_config_node *cn;
-	const struct dm_config_value *cv;
-	int mode = 0;
-	int seen = 0;
+	static const char *valid[] = { "global_mode_1", "global_mode_2", "global_mode_auto", NULL };
+	const char *str;
 
-	if (!(cn = find_config_tree_array(cmd, global_lvmlockd_global_CFG, NULL))) {
-		log_error("Invalid global/lvmlockd_global value (empty).");
+	if (!(str = _config_str_single(cmd, global_lvmlockd_global_CFG,
+				       "global/lvmlockd_global", valid)))
 		return -1;
-	}
 
-	for (cv = cn->v; cv; cv = cv->next) {
-		const char *str;
+	if (!strcmp(str, "global_mode_1"))
+		return LOCKD_GLOBAL_MODE_1;
 
-		if (cv->type == DM_CFG_EMPTY_ARRAY) {
-			log_error("Invalid global/lvmlockd_global value (empty).");
-			return -1;
-		}
+	if (!strcmp(str, "global_mode_2"))
+		return LOCKD_GLOBAL_MODE_2;
 
-		if (cv->type != DM_CFG_STRING) {
-			log_error("Invalid global/lvmlockd_global value: string expected.");
-			return -1;
-		}
-
-		str = cv->v.str;
-
-		if (!str || !*str) {
-			log_error("Invalid global/lvmlockd_global value (empty).");
-			return -1;
-		}
-
-		if (strcmp(str, "global_mode_1") &&
-		    strcmp(str, "global_mode_2") &&
-		    strcmp(str, "global_mode_auto")) {
-			log_error("Invalid global/lvmlockd_global value: %s.", str);
-			return -1;
-		}
-
-		if (seen) {
-			log_error("Invalid global/lvmlockd_global value: \"%s\" conflicts with an earlier global mode setting.",
-				  str);
-			return -1;
-		}
-
-		seen = 1;
-
-		if (!strcmp(str, "global_mode_1"))
-			mode = LOCKD_GLOBAL_MODE_1;
-		else if (!strcmp(str, "global_mode_2"))
-			mode = LOCKD_GLOBAL_MODE_2;
-		/* global_mode_auto: mode 0 */
-	}
-
-	if (!seen) {
-		log_error("Invalid global/lvmlockd_global value (empty).");
-		return -1;
-	}
-
-	return mode;
+	/* global_mode_auto */
+	return 0;
 }
 
 /* PR is not permitted on this host (persistent_reservations=none). */
