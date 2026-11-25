@@ -105,8 +105,6 @@ int persist_vgextend_update(struct cmd_context *cmd, struct volume_group *vg, st
 int persist_vgextend_end(struct cmd_context *cmd, struct dm_list *devs);
 void persist_global_devs_hand_off(struct cmd_context *cmd);
 
-int persist_global_devices_supported(struct cmd_context *cmd, struct dm_list *devs,
-				     int *any_supported);
 int persist_global_devices(struct cmd_context *cmd, struct dm_list *devs);
 int persist_global_devices_lock(struct cmd_context *cmd, struct dm_list *devs, int *used_pr);
 int persist_global_devices_release(struct cmd_context *cmd, struct dm_list *devs);

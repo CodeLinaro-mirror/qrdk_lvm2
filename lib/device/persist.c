@@ -2431,35 +2431,36 @@ int persist_vgcreate_begin(struct cmd_context *cmd, const char *vg_name,
 }
 
 /*
- * Return 1 if all devices support PR.
- * Set *any_supported if any devices support PR.
+ * Check if the devs can be protected with PR.
+ * Returns 1 and sets *all_support if every dev supports PR and no PR key
+ * is registered on any of them.  Returns 1 with *all_support 0 if no dev
+ * supports PR.  Returns 0 on error: some but not all devs support PR, a
+ * dev's PR state cannot be read, or a PR key is registered.
  */
-int persist_global_devices_supported(struct cmd_context *cmd, struct dm_list *devs,
-				     int *any_supported)
+static int _persist_global_devices_check(struct cmd_context *cmd, struct dm_list *devs,
+					 int *all_support)
 {
 	struct device_list *devl;
-	int any_pr = 0;
-
-	if (any_supported)
-		*any_supported = 0;
+	uint64_t *keys = NULL;
+	int key_count = 0;
+	int any_support = 0;
+	int i;
 
 	dm_list_iterate_items(devl, devs) {
 		if (dev_allow_pr(cmd, devl->dev)) {
-			any_pr = 1;
-			if (any_supported)
-				*any_supported = 1;
+			any_support = 1;
 			break;
 		}
 	}
 
-	dm_list_iterate_items(devl, devs) {
-		uint64_t *keys = NULL;
-		int key_count = 0;
-		int i;
+	if (!any_support) {
+		*all_support = 0;
+		return 1;
+	}
 
+	dm_list_iterate_items(devl, devs) {
 		if (!dev_allow_pr(cmd, devl->dev)) {
-			if (any_pr)
-				log_error("Cannot protect devices: %s does not support persistent reservation, which all devices must support.", dev_name(devl->dev));
+			log_error("Cannot protect devices: %s does not support persistent reservation, which all devices must support.", dev_name(devl->dev));
 			return 0;
 		}
 
@@ -2475,16 +2476,22 @@ int persist_global_devices_supported(struct cmd_context *cmd, struct dm_list *de
 			log_error("The device may be in use by another host, or a key may remain");
 			log_error("from a host that failed while claiming the device.");
 			log_error("See lvmpersist options read, remove, clear.");
-			if (keys)
-				dm_pool_free(cmd->mem, keys);
-			return 0;
+			goto bad;
 		}
 
-		if (keys)
+		if (keys) {
 			dm_pool_free(cmd->mem, keys);
+			keys = NULL;
+		}
 	}
 
+	*all_support = 1;
 	return 1;
+
+bad:
+	if (keys)
+		dm_pool_free(cmd->mem, keys);
+	return 0;
 }
 
 /*
@@ -2543,30 +2550,34 @@ int persist_global_devices(struct cmd_context *cmd, struct dm_list *devs)
  */
 int persist_global_devices_lock(struct cmd_context *cmd, struct dm_list *devs, int *used_pr)
 {
-	int any_support = 0;
+	int all_support = 0;
 
 	*used_pr = 0;
 
 	if (!devs || dm_list_empty(devs))
 		return 1;
 
-	if (persist_global_devices_supported(cmd, devs, &any_support)) {
-		if (!persist_global_devices(cmd, devs)) {
-			/* lvmpersist start --claim unregisters our key on a claim
-			 * conflict or reserve failure, but not for every failure
-			 * mode (e.g. a failed register), so remove our key here.
-			 * This is benign when the key is not registered. */
-			if (!persist_global_devices_release(cmd, devs)) {
-				log_error("Failed to stop PR on devices after failed PR start.");
-				log_error("See lvmpersist options read, stop.");
-			}
-			return 0;
-		}
-		*used_pr = 1;
+	if (!_persist_global_devices_check(cmd, devs, &all_support))
+		return 0;
+
+	if (!all_support)
 		return 1;
+
+	if (!persist_global_devices(cmd, devs)) {
+		/* lvmpersist start --claim unregisters our key on a claim
+		 * conflict or reserve failure, but not for every failure
+		 * mode (e.g. a failed register), so remove our key here.
+		 * This is benign when the key is not registered. */
+		if (!persist_global_devices_release(cmd, devs)) {
+			log_error("Failed to stop PR on devices after failed PR start.");
+			log_error("See lvmpersist options read, stop.");
+		}
+		return 0;
 	}
 
-	return any_support ? 0 : 1;
+	*used_pr = 1;
+
+	return 1;
 }
 
 int persist_global_devices_release(struct cmd_context *cmd, struct dm_list *devs)
