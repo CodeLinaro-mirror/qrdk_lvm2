@@ -1609,7 +1609,21 @@ int label_read_pvid(struct device *dev, int *has_pvid)
 	if (has_pvid)
 		*has_pvid = 1;
 
-	pvh = (struct pv_header *)(buf + SECTOR_SIZE + sizeof(struct label_header));
+	/*
+	 * The pv_header is at the offset given in the label header.
+	 * label_check_pv_layout validates the offset and the label layout
+	 * and returns the pv_header, as in _text_read.  If the layout is
+	 * invalid, the dev still has a label, but nothing is known about
+	 * the pvid or the extension.
+	 */
+	if (!label_check_pv_layout(lh, dev, &pvh, &pvh_ext)) {
+		memset(dev->pvid, 0, sizeof(dev->pvid));
+		if (has_pvid)
+			*has_pvid = 0;
+		label_pv_flags_save(dev, NULL);
+		return 1;
+	}
+
 	memcpy(dev->pvid, pvh->pv_uuid, ID_LEN);
 
 	if (!id_valid((const struct id *)dev->pvid)) {
@@ -1621,13 +1635,6 @@ int label_read_pvid(struct device *dev, int *has_pvid)
 		label_scan_invalidate(dev);
 		return 1;
 	}
-
-	/*
-	 * If the pv_header layout is invalid, the dev still has a label,
-	 * but nothing is known about the extension.
-	 */
-	if (!label_check_pv_layout(lh, dev, NULL, &pvh_ext))
-		pvh_ext = NULL;
 
 	label_pv_flags_save(dev, pvh_ext);
 
