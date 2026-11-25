@@ -3934,7 +3934,8 @@ enum dm_config_section_action {
 	DM_CONFIG_SECTION_SKIP,		/* skip the section without creating nodes */
 	/*
 	 * Skip the section and the rest of the enclosing top-level section.
-	 * Only honoured at depth 1; at any other depth it acts as SKIP
+	 * Only honoured for a section written directly inside a top-level
+	 * section; at any other position it acts as SKIP
 	 * (see dm_config_parse_filtered).
 	 */
 	DM_CONFIG_SECTION_STOP
@@ -3947,7 +3948,8 @@ enum dm_config_section_action {
  * looked up by key, e.g. dm_config_find_str(parent->child, "lock_type", ...).
  * The order of parent's children is not defined during parsing; look
  * values up by key rather than walking the sibling list.  depth is 0 for
- * a top-level section, 1 for its subsections, and so on.  name is only
+ * a top-level section, 1 for its subsections, and so on, with each '/'
+ * in a section name nesting like a brace.  name is only
  * valid for the duration of the call and must be copied if it is needed
  * afterwards.
  */

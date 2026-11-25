@@ -789,7 +789,13 @@ static struct dm_config_node *_section(struct parser *p, struct dm_config_node *
 	}
 
 	if (p->filter && (p->t == TOK_SECTION_B)) {
-		switch (p->filter(parent, str, p->depth, p->filter_arg)) {
+		/*
+		 * A '/' in the section name nests like SECTION_B_CHAR, so
+		 * include it in the depth reported to the filter.
+		 */
+		switch (p->filter(parent, str,
+				  p->depth + dm_count_chars(str, strlen(str), '/'),
+				  p->filter_arg)) {
 		case DM_CONFIG_SECTION_STOP:
 			if (p->depth == 1) {
 				if (!_skip_to_top_section_end(p))
