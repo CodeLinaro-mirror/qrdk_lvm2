@@ -715,30 +715,30 @@ static int _skip_section(struct parser *p)
 }
 
 /*
- * Skip the rest of the enclosing top-level section by searching back from
- * the end of the buffer for its closing "\n}\n".  On success the current
- * token is that closing brace.  On failure the parser state is left
- * untouched, so that DM_CONFIG_SECTION_STOP can fall back to skipping only
- * the current section.
- *
- * The pattern being matched spans te[-2] through te[0], so the scan must
- * stop while te[-2] is still within the buffer.
+ * Skip to the closing brace of the enclosing top-level section by
+ * scanning tokens forward and counting section braces.  On success the
+ * current token is that closing brace, so the caller can match it.
+ * On failure (unexpected end of buffer) an error is logged.
  */
 static int _skip_to_top_section_end(struct parser *p)
 {
-	const char *te;
+	int level = 0;
 
-	for (te = p->fe - 1; te > p->tb + 2; --te) {
-		if ((te[-2] == '\n') &&
-		    (te[-1] == '}') &&
-		    (te[ 0] == '\n')) {
-			p->te = te;
-			p->t = TOK_SECTION_E;
-			return 1;
+	for (;;) {
+		if (p->t == TOK_SECTION_E) {
+			if (!level)
+				return 1;
+			level--;
+		} else if (p->t == TOK_SECTION_B)
+			level++;
+		else if (p->t == TOK_EOF) {
+			log_error("Parse error at byte %" PRIptrdiff_t " (line %d): "
+				  "unexpected end of section.",
+				  p->tb - p->fb + 1, p->line);
+			return 0;
 		}
+		_get_token(p, p->t);
 	}
-
-	return 0;
 }
 
 static struct dm_config_node *_section(struct parser *p, struct dm_config_node *parent)
@@ -791,8 +791,11 @@ static struct dm_config_node *_section(struct parser *p, struct dm_config_node *
 	if (p->filter && (p->t == TOK_SECTION_B)) {
 		switch (p->filter(parent, str, p->depth, p->filter_arg)) {
 		case DM_CONFIG_SECTION_STOP:
-			if ((p->depth == 1) && _skip_to_top_section_end(p))
+			if (p->depth == 1) {
+				if (!_skip_to_top_section_end(p))
+					return_NULL;
 				return parent;
+			}
 			/* fall through */
 		case DM_CONFIG_SECTION_SKIP:
 			if (!_skip_section(p))

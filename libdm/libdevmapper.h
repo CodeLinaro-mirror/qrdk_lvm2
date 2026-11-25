@@ -3959,12 +3959,11 @@ typedef enum dm_config_section_action (*dm_config_section_filter_fn)(const struc
  * Parse only the parts of the config that the filter selects.  Runs
  * without duplicate node checking.
  *
- * DM_CONFIG_SECTION_STOP finds the end of the enclosing top-level section
- * by searching back from the end of the buffer for the last "\n}\n" line.
- * This assumes that a single top-level section is the last thing in the
- * buffer, as in LVM metadata: if further top-level sections follow the
- * enclosing one, they are skipped as well, and if the buffer does not end
- * with a newline after the final '}', STOP degrades to SKIP.
+ * DM_CONFIG_SECTION_STOP skips forward to the closing brace of the
+ * enclosing top-level section, counting section braces, so everything
+ * from the stopped section through the end of that top-level section
+ * is skipped.  Top-level sections after the enclosing one are parsed
+ * normally.
  */
 int dm_config_parse_filtered(struct dm_config_tree *cft, const char *start, const char *end,
 			     dm_config_section_filter_fn filter, void *arg);
