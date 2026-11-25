@@ -39,27 +39,52 @@ static void _init_text_import(void)
  * and the physical_volumes section.  For a sanlock VG it also needs the
  * lvmlock LV in logical_volumes, which holds the lvmlockd global state tags.
  * The VG fields, including lock_type, precede the sections in the metadata
- * text, so lock_type has already been parsed when logical_volumes is reached.
- * Any other VG does not parse logical_volumes (or anything after
- * physical_volumes), and the LVs other than lvmlock are skipped without
- * creating nodes.
+ * text, so lock_type has already been parsed when the sections are reached.
+ * LVs other than lvmlock are skipped without creating nodes, as are
+ * logical_volumes and the historical LVs for VGs that are not sanlock.
+ * Once the wanted sections have been seen, the rest of the VG section is
+ * skipped; this does not depend on the order the sections appear in.
  */
+struct vgsummary_filter_arg {
+	int sanlock;		/* lock_type sanlock seen in the VG fields */
+	int seen_pv;		/* physical_volumes section seen */
+	int seen_lvmlock;	/* lvmlock LV seen (sanlock VGs) */
+};
+
 static enum dm_config_section_action _vgsummary_filter(const struct dm_config_node *parent,
 						       const char *name, unsigned depth,
 						       void *arg)
 {
+	struct vgsummary_filter_arg *fa = arg;
 	const char *lock_type;
 
-	if (depth == 1 && !strcmp(name, "logical_volumes")) {
+	if (depth == 1) {
 		lock_type = dm_config_find_str(parent->child, "lock_type", NULL);
-		if (lock_type && !strcmp(lock_type, "sanlock"))
-			return DM_CONFIG_SECTION_PARSE;
-		return DM_CONFIG_SECTION_STOP;
+		fa->sanlock = lock_type && !strcmp(lock_type, "sanlock");
 	}
 
-	if (depth == 2 && !strcmp(parent->key, "logical_volumes") &&
-	    strcmp(name, LOCKD_SANLOCK_LV_NAME))
+	if (depth == 1 && !strcmp(name, "physical_volumes")) {
+		fa->seen_pv = 1;
+		return DM_CONFIG_SECTION_PARSE;
+	}
+
+	if (depth == 2 && !strcmp(parent->key, "logical_volumes")) {
+		if (!strcmp(name, LOCKD_SANLOCK_LV_NAME)) {
+			fa->seen_lvmlock = 1;
+			return DM_CONFIG_SECTION_PARSE;
+		}
 		return DM_CONFIG_SECTION_SKIP;
+	}
+
+	if (depth == 1 && !strcmp(name, "logical_volumes")) {
+		if (fa->sanlock)
+			return DM_CONFIG_SECTION_PARSE;
+		return DM_CONFIG_SECTION_SKIP;
+	}
+
+	/* The wanted sections have been seen; skip the rest of the VG section. */
+	if (depth == 1 && fa->seen_pv && (!fa->sanlock || fa->seen_lvmlock))
+		return DM_CONFIG_SECTION_STOP;
 
 	return DM_CONFIG_SECTION_PARSE;
 }
@@ -76,6 +101,7 @@ int text_read_metadata_summary(const struct format_type *fmt,
 		       struct lvmcache_vgsummary *vgsummary)
 {
 	struct dm_config_tree *cft;
+	struct vgsummary_filter_arg fa = { 0 };
 	const struct text_vg_version_ops **vsn;
 	int r = 0;
 
@@ -93,7 +119,7 @@ int text_read_metadata_summary(const struct format_type *fmt,
 					 offset2, size2, checksum_fn,
 					 vgsummary->mda_checksum,
 					 checksum_only, 1,
-					 _vgsummary_filter, NULL)) {
+					 _vgsummary_filter, &fa)) {
 			log_warn("WARNING: Invalid metadata text from %s at %llu.",
 				 dev_name(dev), (unsigned long long)offset);
 			goto out;
