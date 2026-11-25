@@ -19,6 +19,7 @@
 struct vgextend_params {
 	struct pvcreate_params pp;
 	struct dm_list devs;
+	struct dm_list pr_devs;	/* devs that persist_vgextend_begin/update started PR on */
 };
 
 static int _restore_pv(struct volume_group *vg, const char *pv_name)
@@ -98,7 +99,6 @@ static int _vgextend_single(struct cmd_context *cmd, const char *vg_name,
 {
 	struct vgextend_params *vp = (struct vgextend_params *) handle->custom_handle;
 	struct pvcreate_params *pp = &vp->pp;
-	DM_LIST_INIT(pr_devs);
 	uint32_t mda_copies;
 	uint32_t mda_used;
 	int vg_pr_enabled = (vg->pr & VG_PR_REQUIRE) ? 1 : 0;
@@ -138,9 +138,9 @@ static int _vgextend_single(struct cmd_context *cmd, const char *vg_name,
 	 * the command fails before writing if PR cannot be started.
 	 */
 	if (vg_pr_enabled && !global_pr_held) {
-		if (!dev_args_to_device_list(cmd, &vp->devs, &pr_devs, 1))
+		if (!dev_args_to_device_list(cmd, &vp->devs, &vp->pr_devs, 1))
 			goto_out;
-		if (!persist_vgextend_begin(cmd, vg, &pr_devs)) {
+		if (!persist_vgextend_begin(cmd, vg, &vp->pr_devs)) {
 			log_error("Failed to start PR on new devices, VG not extended.");
 			goto out;
 		}
@@ -206,9 +206,9 @@ static int _vgextend_single(struct cmd_context *cmd, const char *vg_name,
 	 * been written, so another command won't try to use them.
 	 */
 	if (vg_pr_enabled && global_pr_held) {
-		if (!dev_args_to_device_list(cmd, &vp->devs, &pr_devs, 1))
+		if (!dev_args_to_device_list(cmd, &vp->devs, &vp->pr_devs, 1))
 			goto_out;
-		if (!persist_vgextend_update(cmd, vg, &pr_devs)) {
+		if (!persist_vgextend_update(cmd, vg, &vp->pr_devs)) {
 			log_error("Failed to update PR on new devices, VG is extended with limited functionality.");
 			goto out;
 		}
@@ -232,7 +232,6 @@ int vgextend_general(struct cmd_context *cmd, int argc, char **argv)
 	struct processing_handle *handle = NULL;
 	struct vgextend_params vp = { 0 };
 	struct pvcreate_params *pp = &vp.pp;
-	DM_LIST_INIT(devs);
 	const char *vg_name;
 	int repeat = 0;
 	int ret = ECMD_FAILED;
@@ -253,6 +252,7 @@ int vgextend_general(struct cmd_context *cmd, int argc, char **argv)
 	pp->force = PROMPT;
 
 	dm_list_init(&vp.devs);
+	dm_list_init(&vp.pr_devs);
 
 	if (!lockf_global(cmd, "ex"))
 		return_ECMD_FAILED;
@@ -344,9 +344,7 @@ out:
 	if (handle)
 		destroy_processing_handle(cmd, handle);
 
-	if (!dev_args_to_device_list(cmd, &vp.devs, &devs, 0))
-		ret = ECMD_FAILED;
-	if (!persist_vgextend_end(cmd, &devs))
+	if (!persist_vgextend_end(cmd, &vp.pr_devs))
 		ret = ECMD_FAILED;
 	if (!unlock_global_dev_args(cmd, &vp.devs))
 		ret = ECMD_FAILED;
