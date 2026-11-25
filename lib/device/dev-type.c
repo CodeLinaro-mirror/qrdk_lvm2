@@ -1560,7 +1560,10 @@ int wipe_known_signatures(struct cmd_context *cmd, struct device *dev,
  * List the signatures that wipe_known_signatures() would ask about, without
  * wiping anything, so that the questions can be asked before the devices are
  * protected.  Returns 0 on error, and in the same cases that
- * wipe_known_signatures() would fail before asking.
+ * wipe_known_signatures() would fail before asking.  A signature whose type
+ * blkid cannot determine also returns 0: wipe_known_signatures() refuses to
+ * wipe it and fails, so it is reported here before any questions are asked
+ * rather than after the devices are protected.
  */
 int dev_find_known_signatures(struct cmd_context *cmd, struct device *dev,
 			      const char *name, uint32_t types_to_exclude,
