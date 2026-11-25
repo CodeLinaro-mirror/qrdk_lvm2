@@ -76,12 +76,12 @@ static int vgcreate_persist_params_from_args(struct cmd_context *cmd, struct pvc
 	 * (--setpersist n is allowed to clear PR settings)
 	 */
 	if (pr_policy == PR_POLICY_NONE) {
-		if (pp->setpersist_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART | SETPR_PTPL)) {
-			log_error("Persistent reservations are disabled in lvm config (persistent_reservations=none).");
+		if (pp->setpersist_flags & SETPR_POLICY_MASK) {
+			log_error(PR_POLICY_NONE_MSG);
 			return 0;
 		}
 		if (arg_is_set(cmd, persist_ARG)) {
-			log_error("Persistent reservations are disabled in lvm config (persistent_reservations=none).");
+			log_error(PR_POLICY_NONE_MSG);
 			return 0;
 		}
 	}
@@ -97,7 +97,7 @@ static int vgcreate_persist_params_from_args(struct cmd_context *cmd, struct pvc
 		pp->setpersist_from_full = 1;
 	}
 
-	setpersist_on = (pp->setpersist_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART)) ? 1 : 0;
+	setpersist_on = (pp->setpersist_flags & SETPR_ON_MASK) ? 1 : 0;
 
 	/*
 	 * "start" is the only permitted option for --persist in vgcreate,

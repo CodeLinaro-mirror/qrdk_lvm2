@@ -1359,7 +1359,7 @@ int dev_args_accepted_for_vgcreate(struct cmd_context *cmd, struct dm_list *devs
 		}
 	}
 
-	setpersist_on = (pp->setpersist_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART)) ? 1 : 0;
+	setpersist_on = (pp->setpersist_flags & SETPR_ON_MASK) ? 1 : 0;
 
 	if ((pp->start_pr || setpersist_on) && !_dev_args_check_pr(cmd, devs)) {
 		_dev_args_fail_all(devs);

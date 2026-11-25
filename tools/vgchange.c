@@ -1897,11 +1897,11 @@ static int _vgchange_setpersist_single(struct cmd_context *cmd, const char *vg_n
 	if (!setpersist_arg_flags(arg_str_value(cmd, setpersist_ARG, NULL), &set_flags))
 		return_ECMD_FAILED;
 
-	on = (set_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART)) ? 1 : 0;
+	on = (set_flags & SETPR_ON_MASK) ? 1 : 0;
 
-	if (set_flags & (SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART | SETPR_PTPL)) {
+	if (set_flags & SETPR_POLICY_MASK) {
 		if (persist_policy_get(cmd) == PR_POLICY_NONE) {
-			log_error("Persistent reservations are not permitted on this host (persistent_reservations=none).");
+			log_error(PR_POLICY_NONE_MSG);
 			return ECMD_FAILED;
 		}
 	}

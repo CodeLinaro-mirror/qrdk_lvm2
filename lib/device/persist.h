@@ -43,6 +43,20 @@
 #define MAX_SETPR_ARGS		8
 
 /*
+ * setpersist flags that enable PR for the VG: y, require, autostart.
+ * (ptpl alone does not enable PR; it only sets the behavior of
+ * persisting reservations through power loss.)
+ */
+#define SETPR_ON_MASK		(SETPR_Y | SETPR_REQUIRE | SETPR_AUTOSTART)
+
+/*
+ * setpersist flags that require the host PR policy to allow PR: any flag
+ * that enables PR, and ptpl, which does not enable PR but still configures
+ * the VG to persist reservations.
+ */
+#define SETPR_POLICY_MASK	(SETPR_ON_MASK | SETPR_PTPL)
+
+/*
  * The host PR policy from lvm.conf global/persistent_reservations:
  *
  * auto (the default): use PR selectively as appropriate.  LVM uses PR
@@ -65,6 +79,8 @@
 #define PR_POLICY_AUTO		0
 #define PR_POLICY_FULL		1
 #define PR_POLICY_NONE		2
+
+#define PR_POLICY_NONE_MSG	"Persistent reservations are disabled in lvm config (persistent_reservations=none)."
 
 int persist_check(struct cmd_context *cmd, struct volume_group *vg);
 
